@@ -4,6 +4,8 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-292%20passed-2ea44f)](tests/)
+[![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
 一个给 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 用的 **QQ空间定时发布** 插件。
 
