@@ -515,11 +515,6 @@ ruff check . && ruff format --check .   # 代码检查与格式（配置见 ruff
 ## 🙏 致谢与许可
 
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot)：插件框架与配置面板机制。
-- [Zhalslar/astrbot_plugin_qzone](https://github.com/Zhalslar/astrbot_plugin_qzone)（GPL-3.0）：
-  QQ空间协议参数与接口调用方式的参考。
-- [muyouzhi6/astrbot_plugin_life_scheduler](https://github.com/muyouzhi6/astrbot_plugin_life_scheduler)（MIT）：
-  生活日程的提示词结构、创意池与「内在状态」注入文案的思路参考。
-  本插件**不读取、也不依赖该插件的数据**，日程完全由自己生成。
 
 完整的第三方许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
