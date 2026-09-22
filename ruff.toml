@@ -1,0 +1,28 @@
+# ruff 配置：显式声明规则集，保证不同 ruff 版本下本地与 CI 的结果一致
+# 用法：ruff check . && ruff format --check .
+
+line-length = 88
+target-version = "py310"
+extend-exclude = ["__pycache__", ".git"]
+
+[lint]
+# 只启用有明确价值的一组规则：
+#   E4/E7/E9  pycodestyle 错误类    F  pyflakes
+#   I         import 排序           UP 类型注解现代化
+#   B         bugbear 常见陷阱      SIM 可简化写法
+#   PIE/FURB  无意义写法            RUF ruff 自有规则
+#   TRY       异常处理规范
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "PIE", "FURB", "RUF", "TRY"]
+
+ignore = [
+  # 插件必须兜住所有异常，绝不能因为单个异常把宿主 Bot 带崩
+  "BLE001",
+  # 定时任务按本机时区计算即可，不需要 tz-aware
+  "DTZ",
+  # 插件里大量使用 except Exception 后降级/记日志，属于有意为之
+  "TRY003",
+  # 中文文档字符串与注释里的全角标点是正常写法，不是「歧义字符」
+  "RUF001",
+  "RUF002",
+  "RUF003",
+]

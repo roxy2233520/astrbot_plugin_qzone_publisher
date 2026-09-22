@@ -1,0 +1,553 @@
+{
+  "admin_uins": {
+    "description": "管理员 QQ 号（插件内）",
+    "hint": "填了就用这里的 QQ 号作为草稿确认、通知的接收人；留空则用 AstrBot 配置里的 admins_id。注意：指令权限始终由 AstrBot 的 admins_id 决定，插件不会绕过它。可用 /空间管理员 查看或修改",
+    "type": "list",
+    "default": []
+  },
+  "auto_publish_enabled": {
+    "description": "启用定时自动发布",
+    "type": "bool",
+    "hint": "默认关闭，避免与其他 QQ空间插件重复发说说。确认好发布时间后用 /空间开关 on 打开",
+    "default": false
+  },
+  "publish_cron": {
+    "description": "自动发布时间",
+    "hint": "支持两种写法：① HH:MM，例如 08:30；② 5 段 Cron 表达式，例如 30 8 * * *（分 时 日 月 周）。留空表示不自动发布",
+    "type": "string",
+    "default": "30 8 * * *"
+  },
+  "publish_jitter": {
+    "description": "发布时间的随机抖动（秒）",
+    "hint": "在触发时间上随机延后 0~N 秒，使发布节奏更像真人。0 表示精确触发",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 3600,
+      "step": 1
+    },
+    "default": 600
+  },
+  "content_source": {
+    "description": "自动发布的内容来源",
+    "hint": "pool=从文案池随机取；file=从文本文件随机取一行；llm=调用 AI 生成",
+    "type": "string",
+    "options": [
+      "pool",
+      "file",
+      "llm"
+    ],
+    "labels": [
+      "文案池（随机取一条）",
+      "文本文件（随机取一行）",
+      "AI 生成（按人设写）"
+    ],
+    "default": "pool"
+  },
+  "text_pool": {
+    "description": "文案池",
+    "hint": "content_source 为 pool 时，每次随机抽取一条发布",
+    "type": "list",
+    "default": [
+      "今天也是元气满满的一天～",
+      "云很好看，风也很温柔。",
+      "记录一下此刻的心情。"
+    ]
+  },
+  "content_file": {
+    "description": "文案文件路径",
+    "hint": "content_source 为 file 时生效。UTF-8 文本，一行一条，# 开头的行会被忽略",
+    "type": "string",
+    "default": ""
+  },
+  "llm_provider_id": {
+    "description": "AstrBot 的 LLM 提供商",
+    "hint": "留空则使用 AstrBot 当前默认提供商。密钥与模型都在 AstrBot「服务提供商」里维护，插件不保存密钥、也不自己发请求",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "llm_life_provider_id": {
+    "description": "生成生活日程用的提供商（可选）",
+    "hint": "想给日程单独用一个更便宜的模型就选这里；留空则沿用上面的提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "llm_comment_provider_id": {
+    "description": "生成评论用的提供商（可选）",
+    "hint": "想给评论单独指定模型就选这里；留空则沿用上面的提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "llm_greet_provider_id": {
+    "description": "生成问候语用的提供商（可选）",
+    "hint": "greet_use_ai 开启时生效；留空则沿用上面的提供商",
+    "type": "string",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "llm_prompt": {
+    "description": "写说说的提示词",
+    "hint": "建议根据 Bot 人设改写，效果更好",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs-dark",
+    "default": "请以第一人称写一条发在QQ空间的说说，内容贴近你的日常与心情，简短自然，不要出现“说说”“动态”等词，不要加引号、标题或解释。"
+  },
+  "llm_use_persona": {
+    "description": "生成时注入 Bot 人设",
+    "type": "bool",
+    "default": true
+  },
+  "llm_use_life_context": {
+    "description": "生成时参考今日生活日程",
+    "hint": "把当日穿搭与日程作为素材交给 AI，让说说和 Bot 的“生活”保持一致",
+    "type": "bool",
+    "default": true
+  },
+  "llm_life_must_reference": {
+    "description": "要求说说必须引用今日行程细节",
+    "hint": "开启后，AI 会先自己确认人设与今日日程，再在正文里自然带出至少一个具体细节（正在做的事、去过的地方、穿搭等）。关掉则只作为语气参考",
+    "type": "bool",
+    "default": true
+  },
+  "llm_reference_chat": {
+    "description": "参考最近聊天记录生成",
+    "hint": "开启后会读取指定会话的最近聊天记录作为素材",
+    "type": "bool",
+    "default": false
+  },
+  "llm_chat_umo": {
+    "description": "参考的会话 UMO",
+    "hint": "留空则使用最近一次触发指令的会话。可用 /sid 指令查询 UMO",
+    "type": "string",
+    "default": ""
+  },
+  "llm_chat_count": {
+    "description": "参考的聊天记录条数",
+    "type": "int",
+    "slider": {
+      "min": 5,
+      "max": 200,
+      "step": 5
+    },
+    "default": 30
+  },
+  "llm_max_chars": {
+    "description": "生成内容最大字数",
+    "type": "int",
+    "slider": {
+      "min": 20,
+      "max": 1000,
+      "step": 10
+    },
+    "default": 200
+  },
+  "web_search_enabled": {
+    "description": "写说说时使用联网素材",
+    "hint": "使用 AstrBot 自带的「联网搜索」（服务商与密钥在 AstrBot 面板里维护，插件不重复要 key）。开启后会先联网查一点资料，再让 AI 结合资料写说说；搜索不可用或失败时自动退回普通生成",
+    "type": "bool",
+    "default": false
+  },
+  "web_search_query_mode": {
+    "description": "搜什么",
+    "hint": "ai=让 AI 结合当日生活日程自己想一个搜索词；fixed=从下面的关键词池随机取一个",
+    "type": "string",
+    "options": [
+      "ai",
+      "fixed"
+    ],
+    "labels": [
+      "AI 自己想搜索词（结合当日日程）",
+      "关键词池随机取一个"
+    ],
+    "default": "ai"
+  },
+  "web_search_query_pool": {
+    "description": "搜索关键词池",
+    "hint": "fixed 模式下随机取一个；ai 模式下作为「可参考的方向」提示给 AI",
+    "type": "list",
+    "default": [
+      "今日热点",
+      "科技新闻",
+      "生活小技巧"
+    ]
+  },
+  "web_search_query_prompt": {
+    "description": "生成搜索词的提示词",
+    "hint": "web_search_query_mode 为 ai 时生效。要求 AI 只输出一句搜索关键词",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs-dark",
+    "default": "结合你此刻的生活状态，想一个你真心好奇、适合搜一下的话题，只输出一句搜索关键词（不要引号、不要解释、不要标点结尾）。"
+  },
+  "web_search_count": {
+    "description": "每次搜几条",
+    "hint": "不同服务商的参数名与上限不同，插件会自动适配；AstrBot 未提供该参数的服务商则用其默认值",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "default": 5
+  },
+  "life_inject_enabled": {
+    "description": "把生活日程注入 system prompt",
+    "hint": "默认关闭：只有本插件负责注入时才打开，避免和其他也在注入生活状态的插件重复，让 Bot 出现两套矛盾状态",
+    "type": "bool",
+    "default": false
+  },
+  "life_reference_days": {
+    "description": "生成日程时参考的历史天数",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 7,
+      "step": 1
+    },
+    "default": 3
+  },
+  "life_prompt": {
+    "description": "日程生成提示词模板",
+    "hint": "可用占位符：{date_str} {weekday} {holiday} {persona_desc} {daily_theme} {mood_color} {outfit_style} {schedule_type} {history_schedules}",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs-dark",
+    "default": "# Role: 生活日程规划\n请为自己规划今天的生活安排。\n\n## Context\n- 日期：{date_str} {weekday} {holiday}\n- 人设：{persona_desc}\n\n## 🎲 今日创意约束（必须遵循）\n- 今日主题：【{daily_theme}】\n- 心情色彩：【{mood_color}】\n- 推荐穿搭风格：【{outfit_style}】\n- 日程类型：【{schedule_type}】\n\n## 🚫 最近几天已经安排过（避免重复）\n{history_schedules}\n\n## Tasks\n1. outfit: 今日穿搭描述（从里到外、从上到下，含衣裤鞋袜与配饰，符合天气和心情）\n2. schedule: 今日日程，按时间段描述，像真人一样自然\n\n## Output Format\n只返回 JSON，不要任何解释：\n{{\n  \"outfit\": \"...\",\n  \"schedule\": \"...\"\n}}"
+  },
+  "life_pool": {
+    "description": "日程创意池",
+    "hint": "生成日程时每个池随机抽一项并入提示词",
+    "type": "object",
+    "items": {
+      "daily_themes": {
+        "description": "今日主题池",
+        "type": "list",
+        "default": [
+          "探索日",
+          "社交日",
+          "宅家日",
+          "工作日",
+          "自我提升日",
+          "休闲放松日",
+          "创意日",
+          "运动日",
+          "整理日",
+          "美食日",
+          "文艺日",
+          "随性漫游日"
+        ]
+      },
+      "mood_colors": {
+        "description": "心情色彩池",
+        "type": "list",
+        "default": [
+          "慵懒",
+          "活力",
+          "优雅",
+          "俏皮",
+          "温柔",
+          "随性",
+          "知性",
+          "浪漫"
+        ]
+      },
+      "outfit_styles": {
+        "description": "穿搭风格池",
+        "type": "list",
+        "default": [
+          "知性学院风",
+          "街头休闲风",
+          "温柔淑女风",
+          "慵懒居家风",
+          "运动活力风",
+          "日系森女风",
+          "法式优雅风",
+          "极简都市风"
+        ]
+      },
+      "schedule_types": {
+        "description": "日程类型池",
+        "type": "list",
+        "default": [
+          "户外活动型",
+          "社交聚会型",
+          "独处充电型",
+          "技能学习型",
+          "随性漫游型",
+          "家务整理型",
+          "工作专注型",
+          "休闲娱乐型",
+          "健身运动型",
+          "美食探索型"
+        ]
+      }
+    }
+  },
+  "interact_enabled": {
+    "description": "启用定时读说说",
+    "hint": "默认只读：只拉取关注对象的最近说说并记录，不点赞不评论。点赞/评论需另外开启下面两项",
+    "type": "bool",
+    "default": true
+  },
+  "interact_cron": {
+    "description": "读说说的巡检时间",
+    "hint": "支持 HH:MM 或 5 段 Cron；留空表示不巡检",
+    "type": "string",
+    "default": "0 21 * * *"
+  },
+  "interact_jitter": {
+    "description": "巡检时间的随机抖动（秒）",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 3600,
+      "step": 1
+    },
+    "default": 600
+  },
+  "interact_uins": {
+    "description": "关注的 QQ 号列表",
+    "hint": "要读谁的空间就填谁的 QQ 号，例如 [\"123456\", \"654321\"]。留空则巡检不做任何事",
+    "type": "list",
+    "default": []
+  },
+  "interact_count": {
+    "description": "每个对象读取几条说说",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
+    "default": 3
+  },
+  "interact_skip_self": {
+    "description": "跳过自己发的说说",
+    "type": "bool",
+    "default": true
+  },
+  "interact_like": {
+    "description": "自动点赞",
+    "hint": "默认关闭。开启后会给新说说点赞；同一条说说只会处理一次",
+    "type": "bool",
+    "default": false
+  },
+  "interact_comment": {
+    "description": "自动评论",
+    "hint": "默认关闭。开启后用 AI 生成评论并发布；若 draft_for_comment 为真，则先进入草稿箱等确认",
+    "type": "bool",
+    "default": false
+  },
+  "interact_comment_prompt": {
+    "description": "评论生成的提示词",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs-dark",
+    "default": "生成一句简短、直接、贴题的评论，不要解释、不做自我描述、不分选项。"
+  },
+  "interact_comment_max_chars": {
+    "description": "评论最大字数",
+    "type": "int",
+    "slider": {
+      "min": 10,
+      "max": 200,
+      "step": 5
+    },
+    "default": 60
+  },
+  "interact_notify": {
+    "description": "互动结束后发送汇总通知",
+    "hint": "发给下面的 notify_umo",
+    "type": "bool",
+    "default": false
+  },
+  "draft_enabled": {
+    "description": "定时发布走草稿确认",
+    "hint": "开启后定时发布不会直接发出，而是先发给你确认（/空间确认 发布，/空间放弃 丢弃，/空间重写 让 AI 再写一版）",
+    "type": "bool",
+    "default": false
+  },
+  "draft_admin": {
+    "description": "草稿私聊管理员",
+    "hint": "发给上面 admin_uins 里的管理员；admin_uins 留空时用 AstrBot 配置里的 admins_id",
+    "type": "bool",
+    "default": true
+  },
+  "draft_umo": {
+    "description": "草稿额外发送到的会话 UMO",
+    "hint": "格式为 平台ID:消息类型:会话ID，例如 aiocqhttp:FriendMessage:123456（平台ID 就是面板里那个平台适配器的 ID，消息类型可用 FriendMessage / GroupMessage）。留空则只发管理员",
+    "type": "string",
+    "default": ""
+  },
+  "draft_for_comment": {
+    "description": "自动评论也走草稿确认",
+    "hint": "开启后 interact_comment 生成的评论会先进草稿箱，不会直接发出去",
+    "type": "bool",
+    "default": true
+  },
+  "draft_for_greet": {
+    "description": "定时问候也走草稿确认",
+    "hint": "开启后问候不会按时直接发出，而是先进入草稿箱，由你确认后再发给问候对象",
+    "type": "bool",
+    "default": false
+  },
+  "draft_timeout_minutes": {
+    "description": "草稿超时自动放行（分钟）",
+    "hint": "设为 0 表示必须人工处理；大于 0 时，草稿在这么多分钟内没有被确认或放弃，就自动执行（并通知你）",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 720,
+      "step": 5
+    },
+    "default": 0
+  },
+  "greet_enabled": {
+    "description": "启用定时问候",
+    "hint": "按下面的时间，给 greet_users 里的每个人私聊发送问候；默认关闭",
+    "type": "bool",
+    "default": false
+  },
+  "greet_users": {
+    "description": "问候对象（QQ 号）",
+    "hint": "要问候谁的 QQ 号，例如 [\"123456\"]。留空则不会发送，/空间状态 里会提示",
+    "type": "list",
+    "default": []
+  },
+  "greet_morning_cron": {
+    "description": "早安时间",
+    "hint": "支持 HH:MM 或 5 段 Cron；留空表示不发早安",
+    "type": "string",
+    "default": "0 8 * * *"
+  },
+  "greet_night_cron": {
+    "description": "晚安时间",
+    "hint": "支持 HH:MM 或 5 段 Cron；留空表示不发晚安",
+    "type": "string",
+    "default": "0 23 * * *"
+  },
+  "greet_jitter": {
+    "description": "问候时间的随机抖动（秒）",
+    "hint": "在触发时间上随机延后 0~N 秒，让问候不像定时机器人",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 3600,
+      "step": 1
+    },
+    "default": 600
+  },
+  "greet_use_ai": {
+    "description": "用 AI 生成问候语",
+    "hint": "开启后用 AI 结合人设与当日生活日程生成；关闭则从下面的文案池随机取。AI 不可用时自动回退文案池",
+    "type": "bool",
+    "default": false
+  },
+  "greet_prompt": {
+    "description": "问候语提示词",
+    "hint": "greet_use_ai 开启时生效。可用 {slot} 表示时段名（早安 / 晚安）",
+    "type": "text",
+    "editor_mode": true,
+    "editor_language": "markdown",
+    "editor_theme": "vs-dark",
+    "default": "用你自己的说话风格，给一个你很在意的人写一句{slot}问候，一到两句话，自然、有温度，不要解释、不要加引号。"
+  },
+  "greet_morning_pool": {
+    "description": "早安文案池",
+    "hint": "greet_use_ai 关闭时生效，每次随机取一条",
+    "type": "list",
+    "default": [
+      "早呀，今天也要好好吃饭。",
+      "起床啦，外面天气不错。",
+      "早上好，新的一天开始了。"
+    ]
+  },
+  "greet_night_pool": {
+    "description": "晚安文案池",
+    "hint": "greet_use_ai 关闭时生效，每次随机取一条",
+    "type": "list",
+    "default": [
+      "早点睡，晚安。",
+      "今天辛苦了，晚安。",
+      "晚安，做个好梦。"
+    ]
+  },
+  "cookie": {
+    "description": "手动 Cookie（可选）",
+    "hint": "留空时自动向 OneBot 平台获取 user.qzone.qq.com 的 Cookie。仅当自动获取失败时填写，需包含 uin、skey、p_skey",
+    "type": "text",
+    "default": ""
+  },
+  "cookie_ttl": {
+    "description": "Cookie 缓存时长（秒）",
+    "hint": "超过该时长后，下次请求前会重新获取 Cookie。0 表示不主动刷新",
+    "type": "int",
+    "slider": {
+      "min": 0,
+      "max": 86400,
+      "step": 60
+    },
+    "default": 600
+  },
+  "timeout": {
+    "description": "QQ空间请求超时（秒）",
+    "type": "int",
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 1
+    },
+    "default": 15
+  },
+  "max_images": {
+    "description": "单条说说最多图片数",
+    "type": "int",
+    "slider": {
+      "min": 1,
+      "max": 9,
+      "step": 1
+    },
+    "default": 9
+  },
+  "notify_enabled": {
+    "description": "发布后发送通知",
+    "type": "bool",
+    "default": true
+  },
+  "notify_render_image": {
+    "description": "通知/草稿附带渲染图",
+    "hint": "用 AstrBot 自带的文转图把通知与草稿渲染成一张回执图一起发出（不引入额外字体或依赖）。渲染失败会自动降级为纯文本",
+    "type": "bool",
+    "default": false
+  },
+  "notify_render_network": {
+    "description": "回执图走网络 t2i 服务",
+    "hint": "关闭（默认）时用本地渲染，内容不出本机；开启后走 AstrBot 面板配置的 t2i 端点，失败会自动回退本地",
+    "type": "bool",
+    "default": false
+  },
+  "notify_umo": {
+    "description": "通知发送到的会话 UMO",
+    "hint": "格式为 平台ID:消息类型:会话ID，例如 aiocqhttp:FriendMessage:123456；留空则不发送通知",
+    "type": "string",
+    "default": ""
+  },
+  "history_limit": {
+    "description": "发布历史保留条数",
+    "type": "int",
+    "slider": {
+      "min": 20,
+      "max": 1000,
+      "step": 10
+    },
+    "default": 200
+  }
+}

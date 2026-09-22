@@ -1,0 +1,34 @@
+# 上传 GitHub 前请修改下面两行：把 your-github-name 换成你的 GitHub 用户名
+name: astrbot_plugin_qzone_publisher
+display_name: QQ空间定时发布
+short_desc: 免抓包发说说：定时发布、AI 写文案、生活日程、草稿确认。
+desc: |
+  对接 QQ 空间的轻量插件，复用 AstrBot 里 aiocqhttp(OneBot) 的登录态自动获取 Cookie，
+  不需要手动抓包。
+
+  主要能力：
+  - 手动 / 定时发说说，支持附带图片（自动上传相册，最多 9 张）
+  - 内容来源可选：文案池随机、文本文件随机一行、AI 按人设生成
+  - AI 只使用 AstrBot 已配置的 LLM 提供商，插件不保存密钥、不自己发请求
+  - 生成前由 AI 自己确认全局人格与当日日程，并把行程细节自然引用进正文
+  - 联网素材：接入 AstrBot 自带的联网搜索，先查资料再让 AI 结合资料写
+  - 一体化生活日程：自己生成穿搭+日程，可注入 system prompt
+  - 定时问候：按时间给指定用户私聊发早安 / 晚安，支持文案池或 AI 生成
+  - 自动读好友说说（默认只读），可选点赞与 AI 评论，同一条说说只处理一次
+  - 审核限制可选：草稿确认（说说 / 评论 / 问候分别开关）+ 超时自动放行
+  - Token 用量估算：/空间状态 与 /空间用量 可看，草稿与通知里也会附上
+  - 管理员名单可在插件内维护（/空间管理员），也可沿用 AstrBot 的 admins_id
+  - 发布历史、失败通知、按 tid 删除说说
+version: 2.3.1
+author: roxy2233520
+repo: https://github.com/roxy2233520/astrbot_plugin_qzone_publisher
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+tags:
+  - qq
+  - qzone
+  - publish
+  - scheduler
+  - greeting
+  - ai

@@ -1,0 +1,7 @@
+{
+  "metadata": {
+    "display_name": "QZone Publisher",
+    "short_desc": "Schedule QQ Zone posts with AI-written captions and draft approval.",
+    "desc": "A lightweight QQ Zone (Qzone) plugin for AstrBot. It reuses the OneBot login session to fetch cookies automatically, and supports manual or scheduled posts with images, AI-written captions, an integrated daily-life schedule, optional reading/liking/commenting on friends' posts (read-only by default), and a draft-approval mode."
+  }
+}

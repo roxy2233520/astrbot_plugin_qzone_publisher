@@ -1,0 +1,1330 @@
+"""AstrBot QQ空间定时发布插件入口。
+
+功能概览：
+- 复用 OneBot 登录态自动获取 QQ空间 Cookie，无需手动抓包；
+- 手动指令发布说说（支持附带图片）；
+- 定时自动发布，内容来自文案池、文本文件或 AI 生成；
+- 草稿确认模式：自动发布前先发给管理员/指定会话确认；
+- 自动读好友说说（默认只读），可选点赞与 AI 评论；
+- 一体化生活日程：自己生成或读取 life_scheduler 的数据，供写说说与提示词使用；
+- 联网素材：接入 AstrBot 自带的「联网搜索」，把搜到的资料作为写说说的素材。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import time
+from datetime import datetime
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.star.filter.command import GreedyStr
+
+from .core.config import PluginConfig
+from .core.content import ContentGenerator
+from .core.draft import Draft, DraftBox
+from .core.greet import GreetingService
+from .core.interact import InteractService
+from .core.life import LifeManager, time_desc
+from .core.llm import AIClient
+from .core.qzone import QzoneAPI, QzoneSession
+from .core.render import ReceiptRenderer
+from .core.scheduler import CronTask, normalize_cron
+from .core.store import PublishRecord, PublishStore
+from .core.web import WebSearchBridge
+
+_ON_FLAGS = {"on", "开", "开启", "true", "1", "yes"}
+_OFF_FLAGS = {"off", "关", "关闭", "false", "0", "no", "none", "disable"}
+_RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"}
+_PUBLISH_TASK = "qzone_auto_publish"
+_INTERACT_TASK = "qzone_interact"
+_GREET_MORNING_TASK = "qzone_greet_morning"
+_GREET_NIGHT_TASK = "qzone_greet_night"
+
+
+class QzonePublisherPlugin(Star):
+    """QQ空间定时发布插件。"""
+
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        """初始化插件组件。
+
+        Args:
+            context: AstrBot 插件上下文。
+            config: 插件配置对象。
+        """
+        super().__init__(context)
+        self.context = context
+        self.cfg = PluginConfig(config, context)
+
+        self.store = PublishStore(
+            self.cfg.history_file, limit=int(self.cfg.history_limit or 200)
+        )
+        self.drafts = DraftBox(self.cfg.draft_file)
+        self.session = QzoneSession(self.cfg, self._get_onebot_client)
+        self.api = QzoneAPI(self.session, timeout=int(self.cfg.timeout or 15))
+        self.ai = AIClient(self.cfg, context)
+        self.life = LifeManager(self.cfg, context, self.ai)
+        self.web = WebSearchBridge(self.cfg, context)
+        self.content = ContentGenerator(self.cfg, self.ai, self.life, self.web)
+        self.interact = InteractService(self.cfg, self.ai, self.api, self.drafts)
+        self.render = ReceiptRenderer(self.cfg)
+        self.greet = GreetingService(
+            self.cfg,
+            self.ai,
+            self._platform_id,
+            life_context_provider=self.life.prompt_context,
+        )
+
+        self.publish_task = CronTask.from_config(
+            self.cfg,
+            name=_PUBLISH_TASK,
+            job=self._auto_publish,
+            cron_key="publish_cron",
+            jitter_key="publish_jitter",
+            enabled_key="auto_publish_enabled",
+        )
+        self.interact_task = CronTask.from_config(
+            self.cfg,
+            name=_INTERACT_TASK,
+            job=self._auto_interact,
+            cron_key="interact_cron",
+            jitter_key="interact_jitter",
+            enabled_key="interact_enabled",
+        )
+        self.greet_morning_task = CronTask.from_config(
+            self.cfg,
+            name=_GREET_MORNING_TASK,
+            job=self._greet_morning,
+            cron_key="greet_morning_cron",
+            jitter_key="greet_jitter",
+            enabled_key="greet_enabled",
+        )
+        self.greet_night_task = CronTask.from_config(
+            self.cfg,
+            name=_GREET_NIGHT_TASK,
+            job=self._greet_night,
+            cron_key="greet_night_cron",
+            jitter_key="greet_jitter",
+            enabled_key="greet_enabled",
+        )
+        self._client: Any = None
+        self._draft_timer: asyncio.Task | None = None
+
+    async def initialize(self) -> None:
+        """插件加载时启动所有定时任务，并接上未处理完的草稿计时。"""
+        self.publish_task.start()
+        self.interact_task.start()
+        self.greet_morning_task.start()
+        self.greet_night_task.start()
+        await self._resume_pending_draft()
+
+    async def _resume_pending_draft(self) -> None:
+        """重启后处理遗留草稿：超过超时时间就立即放行，否则补上剩余计时。"""
+        draft = self.drafts.pending
+        if draft is None:
+            return
+
+        minutes = int(self.cfg.draft_timeout_minutes or 0)
+        if minutes <= 0:
+            return
+
+        age_minutes = (time.time() - draft.created_time) / 60
+        if age_minutes >= minutes:
+            logger.info(f"发现已超时 {age_minutes:.0f} 分钟的草稿，立即放行")
+            self.drafts.pop()
+            try:
+                message = await self._confirm_draft(draft)
+            except Exception as e:
+                self.drafts.put(draft)
+                await self._notify(f"遗留草稿自动执行失败：{e}\n草稿已保留")
+                return
+            await self._notify(f"⏰ 重启后处理了超时草稿\n{message}")
+            return
+
+        remaining = max(int(minutes - age_minutes), 1)
+        self._draft_timer = asyncio.create_task(
+            self._draft_timeout_watch(draft, remaining)
+        )
+        logger.info(f"遗留草稿还剩约 {remaining} 分钟自动放行")
+
+    async def terminate(self) -> None:
+        """插件卸载时停止定时任务并释放连接。"""
+        self._cancel_draft_timer()
+        self.publish_task.stop()
+        self.interact_task.stop()
+        self.greet_morning_task.stop()
+        self.greet_night_task.stop()
+        await self.api.close()
+
+    # ------------------------------------------------------------------
+    # 平台客户端
+    # ------------------------------------------------------------------
+
+    def _find_platform(self) -> Any | None:
+        """找到 aiocqhttp(OneBot) 平台适配器实例。"""
+        try:
+            manager = self.context.platform_manager
+            getter = getattr(manager, "get_insts", None)
+            platforms = getter() if callable(getter) else manager.platform_insts
+            for platform in platforms:
+                meta = platform.meta()
+                if getattr(meta, "name", "") == "aiocqhttp":
+                    return platform
+        except Exception as e:
+            logger.warning(f"查找 OneBot 平台实例失败: {e}")
+        return None
+
+    def _get_onebot_client(self) -> Any | None:
+        """获取 OneBot 客户端实例。
+
+        Returns:
+            客户端实例；未找到时返回 None。
+        """
+        if self._client is not None:
+            return self._client
+
+        platform = self._find_platform()
+        bot = getattr(platform, "bot", None) if platform is not None else None
+        if bot is not None:
+            self._client = bot
+        return self._client
+
+    def _platform_id(self) -> str:
+        """取平台实例 id，用于拼装 UMO。"""
+        platform = self._find_platform()
+        if platform is None:
+            return ""
+        try:
+            return str(platform.meta().id or "")
+        except Exception:
+            return ""
+
+    def _remember_client(self, event: AstrMessageEvent) -> None:
+        """缓存 OneBot 客户端与当前会话标识，避免重复查找。
+
+        会话标识会同步给联网搜索桥，用于读取按会话覆盖的 AstrBot 配置。
+        """
+        bot = getattr(event, "bot", None)
+        if bot is not None:
+            self._client = bot
+        umo = getattr(event, "unified_msg_origin", "")
+        if umo:
+            self.web.remember_umo(str(umo))
+
+    # ------------------------------------------------------------------
+    # 发布
+    # ------------------------------------------------------------------
+
+    async def _publish(
+        self,
+        text: str,
+        images: list[bytes] | None = None,
+        *,
+        source: str = "manual",
+    ) -> PublishRecord:
+        """发布说说并写入发布历史。
+
+        Args:
+            text: 说说正文。
+            images: 图片二进制内容列表。
+            source: 来源标识，用于历史记录。
+
+        Returns:
+            发布记录。
+
+        Raises:
+            RuntimeError: 发布失败时抛出。
+        """
+        uin = 0
+        try:
+            uin = await self.session.get_uin()
+        except Exception as e:
+            logger.debug(f"获取登录 QQ 号失败: {e}")
+
+        record = PublishRecord(
+            time=int(time.time()),
+            text=text,
+            uin=uin,
+            source=source,
+            images=len(images or []),
+        )
+
+        try:
+            resp = await self.api.publish(text, images or [])
+        except Exception as e:
+            record.ok = False
+            record.error = str(e)
+            self.store.append(record)
+            raise
+
+        if not resp.ok:
+            record.ok = False
+            record.error = str(resp.message or resp.code)
+            self.store.append(record)
+            raise RuntimeError(record.error)
+
+        record.tid = str(resp.data.get("tid") or "")
+        record.time = int(resp.data.get("now") or record.time)
+        self.store.append(record)
+        logger.info(f"说说发布成功: tid={record.tid}")
+        return record
+
+    async def _auto_publish(self) -> None:
+        """定时发布任务：生成内容 -> 直接发布或转草稿。"""
+        try:
+            text, source = await self.content.generate()
+        except Exception as e:
+            logger.error(f"自动发布内容生成失败: {e}")
+            await self._notify(f"定时发布失败：内容生成异常\n{e}")
+            return
+        await self._dispatch_post(text, source=source, prefix="定时发布")
+
+    async def _auto_interact(self) -> None:
+        """定时互动任务：按开关读/赞/评好友说说。"""
+        if not self.interact.targets:
+            logger.info("未配置 interact_uins，跳过本轮互动巡检")
+            return
+
+        result = await self.interact.run_once()
+        if bool(self.cfg.interact_notify):
+            await self._notify(f"说说互动完成：{result.summary()}")
+
+        pending = self.drafts.pending
+        if pending is not None and pending.kind == "comment":
+            await self._send_draft(pending)
+            await self._arm_draft_timer(pending)
+
+    async def _greet_morning(self) -> None:
+        """定时任务：群发早安问候。"""
+        await self._run_greet("morning")
+
+    async def _greet_night(self) -> None:
+        """定时任务：群发晚安问候。"""
+        await self._run_greet("night")
+
+    async def _run_greet(self, slot_key: str) -> None:
+        """执行一次问候：草稿确认开启时先转草稿，否则直接发送。
+
+        Args:
+            slot_key: 时段标识（morning / night）。
+        """
+        slot = self.greet.slot_of(slot_key)
+        slot_name = slot.name if slot else slot_key
+
+        if not self.greet.targets:
+            logger.info("未配置 greet_users，跳过本次问候")
+            return
+
+        if bool(self.cfg.draft_for_greet):
+            try:
+                text = await self.greet.build_text(slot)
+            except Exception as e:
+                logger.error(f"问候内容生成失败: {e}")
+                await self._notify(f"{slot_name}问候失败：内容生成异常\n{e}")
+                return
+            draft = self.drafts.put(
+                Draft(
+                    kind="greet",
+                    text=text,
+                    source=f"greet:{slot_key}",
+                    targets=list(self.greet.targets),
+                )
+            )
+            await self._send_draft(draft)
+            await self._arm_draft_timer(draft)
+            return
+
+        try:
+            result = await self.greet.send(slot_key)
+        except Exception as e:
+            logger.error(f"问候发送失败: {e}")
+            return
+
+        if bool(self.cfg.notify_enabled):
+            await self._notify(
+                f"{slot_name}问候已发送：{result.summary()}\n内容：{result.text}"
+                + self._usage_note(),
+            )
+
+    async def _dispatch_post(self, text: str, *, source: str, prefix: str) -> None:
+        """统一的自动发布出口：草稿模式先转人工确认。
+
+        Args:
+            text: 待发布正文。
+            source: 内容来源标识。
+            prefix: 通知文案前缀。
+        """
+        if bool(self.cfg.draft_enabled):
+            draft = self.drafts.put(Draft(kind="post", text=text, source=source))
+            sent = await self._send_draft(draft)
+            await self._arm_draft_timer(draft)
+            if sent == 0:
+                logger.warning("草稿模式已开启，但没有可用的通知会话，说说未发布")
+            else:
+                logger.info(f"已生成说说草稿并发出确认请求（{sent} 个会话）")
+            return
+
+        try:
+            record = await self._publish(text, source=source)
+        except Exception as e:
+            await self._notify(f"{prefix}失败：{e}" + self._usage_note())
+            return
+        await self._notify(
+            self._format_record(record, prefix=f"{prefix}成功") + self._usage_note()
+        )
+
+    async def _confirm_draft(self, draft: Draft) -> str:
+        """执行草稿：说说走发布接口，评论走评论接口，问候走私聊。
+
+        Args:
+            draft: 待执行的草稿。
+
+        Returns:
+            给管理员看的结果文本。
+
+        Raises:
+            RuntimeError: 执行失败时抛出。
+        """
+        if draft.kind == "comment":
+            if not draft.target_tid:
+                raise RuntimeError("草稿缺少目标说说 ID，无法评论")
+            resp = await self.api.comment(
+                draft.target_uin, draft.target_tid, draft.text
+            )
+            if not resp.ok:
+                raise RuntimeError(str(resp.message or resp.code))
+            return f"评论已发布（{draft.title()}）：{draft.text}"
+
+        if draft.kind == "greet":
+            result = await self.greet.send_text(draft.text, draft.targets or None)
+            if result.sent == 0:
+                raise RuntimeError(f"问候没有发出去：{result.summary()}")
+            return f"问候已发送：{result.summary()}\n内容：{draft.text}"
+
+        record = await self._publish(draft.text, source=draft.source or "draft")
+        return self._format_record(record, prefix="草稿已发布")
+
+    @staticmethod
+    def _format_record(record: PublishRecord, prefix: str = "发布成功") -> str:
+        """把发布记录格式化为可读文本。"""
+        lines = [prefix]
+        if record.tid:
+            lines.append(f"tid: {record.tid}")
+            if record.uin:
+                lines.append(
+                    f"链接: https://user.qzone.qq.com/{record.uin}/mood/{record.tid}"
+                )
+        if record.images:
+            lines.append(f"图片: {record.images} 张")
+        if record.text:
+            lines.append(f"内容: {record.text}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_time(timestamp: int) -> str:
+        """时间戳转可读时间。"""
+        try:
+            return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return "-"
+
+    async def _extract_images(self, event: AstrMessageEvent) -> list[bytes]:
+        """提取消息中附带的图片。
+
+        Args:
+            event: 消息事件。
+
+        Returns:
+            图片二进制内容列表，最多 max_images 张。
+        """
+        limit = max(int(self.cfg.max_images or 9), 1)
+        images: list[bytes] = []
+
+        for component in getattr(event.message_obj, "message", None) or []:
+            if not isinstance(component, Image):
+                continue
+            try:
+                encoded = await component.convert_to_base64()
+                images.append(base64.b64decode(encoded))
+            except Exception as e:
+                logger.warning(f"读取消息图片失败，已跳过: {e}")
+                continue
+            if len(images) >= limit:
+                break
+
+        return images
+
+    # ------------------------------------------------------------------
+    # 通知与草稿投递
+    # ------------------------------------------------------------------
+
+    def _admin_qqs(self) -> tuple[list[str], str]:
+        """解析管理员 QQ 号列表。
+
+        优先用插件配置里的 ``admin_uins``；留空时回退到 AstrBot 配置里的
+        ``admins_id``（也就是决定指令权限的那份名单）。
+
+        Returns:
+            二元组 (QQ 号列表, 来源说明)。
+        """
+        own = [
+            str(item).strip()
+            for item in (self.cfg.admin_uins or [])
+            if str(item).strip()
+        ]
+        if own:
+            return own, "插件配置 admin_uins"
+
+        try:
+            admins = self.context.get_config().get("admins_id", []) or []
+        except Exception as e:
+            logger.warning(f"读取 AstrBot 的 admins_id 失败: {e}")
+            return [], "读取失败"
+
+        qqs = [str(item).strip() for item in admins if str(item).strip().isdigit()]
+        return qqs, "AstrBot 配置 admins_id"
+
+    def _admin_umos(self) -> list[str]:
+        """拼出管理员私聊 UMO（草稿确认、通知用）。"""
+        if not bool(self.cfg.draft_admin):
+            return []
+        platform_id = self._platform_id()
+        if not platform_id:
+            return []
+        qqs, _ = self._admin_qqs()
+        return [f"{platform_id}:FriendMessage:{qq}" for qq in qqs]
+
+    @staticmethod
+    def _build_chain(message: str, image: str | None = None) -> MessageChain:
+        """构造消息链：文本 +（可选）回执图。
+
+        Args:
+            message: 文本内容。
+            image: 图片本地路径或 URL；为空则只发文本。
+
+        Returns:
+            可直接发送的消息链。图片构造失败时自动只发文本。
+        """
+        components: list[Any] = [Plain(message)]
+        if image:
+            try:
+                if image.startswith(("http://", "https://")):
+                    components.append(Image.fromURL(image))
+                else:
+                    components.append(Image.fromFileSystem(image))
+            except Exception as e:
+                logger.warning(f"回执图构造失败，改为只发文本: {e}")
+        return MessageChain(components)
+
+    async def _send_to(
+        self, umos: list[str], message: str, *, image: str | None = None
+    ) -> int:
+        """向指定会话列表发送同一条消息。
+
+        Args:
+            umos: 目标会话列表。
+            message: 消息内容。
+            image: 可选的回执图（本地路径或 URL）。
+
+        Returns:
+            成功发送的会话数。
+        """
+        sent = 0
+        for target in umos:
+            try:
+                await StarTools.send_message(target, self._build_chain(message, image))
+                sent += 1
+            except Exception as e:
+                logger.warning(f"消息发送到 {target} 失败: {e}")
+        return sent
+
+    async def _notify(
+        self,
+        message: str,
+        extra_umos: list[str] | None = None,
+        *,
+        render: bool = True,
+    ) -> int:
+        """向配置的会话发送通知。
+
+        Args:
+            message: 通知内容。
+            extra_umos: 额外接收者。
+            render: 是否尝试把通知渲染成回执图。默认尝试；
+                渲染器自身会在「未开启渲染」或「文本过短」时直接跳过，
+                渲染失败也会自动降级为纯文本。
+
+        Returns:
+            成功发送的会话数。
+        """
+        umos: list[str] = []
+        if bool(self.cfg.notify_enabled):
+            umo = str(self.cfg.notify_umo or "").strip()
+            if umo:
+                umos.append(umo)
+        for item in extra_umos or []:
+            if item and item not in umos:
+                umos.append(item)
+
+        image = await self.render.render(message) if render else None
+        return await self._send_to(umos, message, image=image)
+
+    async def _send_draft(self, draft: Draft) -> int:
+        """把草稿发给管理员私聊与 draft_umo 指定会话。
+
+        草稿只发给显式配置的确认对象，不会顺带发到 notify_umo，
+        免得确认请求出现在群里。
+
+        Args:
+            draft: 待确认草稿。
+
+        Returns:
+            成功发送的会话数。
+        """
+        umos = self._admin_umos()
+        draft_umo = str(self.cfg.draft_umo or "").strip()
+        if draft_umo and draft_umo not in umos:
+            umos.append(draft_umo)
+
+        text = draft.describe() + self._usage_note()
+        image = await self.render.render(text)
+        return await self._send_to(umos, text, image=image)
+
+    # ------------------------------------------------------------------
+    # Token 用量提示
+    # ------------------------------------------------------------------
+
+    def _usage_note(self) -> str:
+        """附在草稿/通知后面的 token 用量提示（估算）。"""
+        item = self.ai.last_call
+        if not item:
+            return ""
+        return (
+            f"\n\n📊 本次生成约用 {item.get('total', 0)} tokens"
+            f"（输入 {item.get('prompt', 0)} + 输出 {item.get('completion', 0)}，"
+            f"功能：{item.get('feature', '未知')}，估算值）"
+        )
+
+    # ------------------------------------------------------------------
+    # 草稿超时自动放行
+    # ------------------------------------------------------------------
+
+    def _cancel_draft_timer(self) -> None:
+        """取消当前的草稿超时计时。"""
+        task = getattr(self, "_draft_timer", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._draft_timer = None
+
+    async def _arm_draft_timer(self, draft: Draft) -> None:
+        """按配置给草稿安排超时自动放行。
+
+        Args:
+            draft: 刚生成的草稿。
+        """
+        self._cancel_draft_timer()
+        minutes = int(self.cfg.draft_timeout_minutes or 0)
+        if minutes <= 0:
+            return
+        self._draft_timer = asyncio.create_task(
+            self._draft_timeout_watch(draft, minutes)
+        )
+        logger.info(f"草稿将在 {minutes} 分钟无人处理后自动放行")
+
+    async def _draft_timeout_watch(self, draft: Draft, minutes: int) -> None:
+        """等待超时后，若草稿仍未处理则自动执行。"""
+        try:
+            await asyncio.sleep(minutes * 60)
+        except asyncio.CancelledError:
+            return
+
+        current = self.drafts.pending
+        if current is None or current.created_time != draft.created_time:
+            return  # 已被人工处理，或已经换成新草稿
+
+        logger.info(f"草稿超过 {minutes} 分钟未处理，自动放行")
+        self.drafts.pop()
+        try:
+            message = await self._confirm_draft(draft)
+        except Exception as e:
+            self.drafts.put(draft)
+            await self._notify(f"草稿超时自动执行失败：{e}\n草稿已保留")
+            return
+        await self._notify(f"⏰ 草稿超过 {minutes} 分钟未处理，已自动执行\n{message}")
+
+    # ------------------------------------------------------------------
+    # system prompt 注入
+    # ------------------------------------------------------------------
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
+        """把当日生活状态注入 system prompt（默认关闭）。"""
+        if not bool(self.cfg.life_inject_enabled):
+            return
+        try:
+            text = await self.life.injection_text()
+        except Exception as e:
+            logger.warning(f"注入生活状态失败: {e}")
+            return
+        if text:
+            req.system_prompt += text
+
+    # ------------------------------------------------------------------
+    # 指令：发布
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间发布", alias={"space post", "qz post"})
+    async def cmd_publish(self, event: AstrMessageEvent, text: GreedyStr):
+        """立即发布一条说说，可附带图片"""
+        self._remember_client(event)
+        self.content.remember_umo(event.unified_msg_origin)
+        self.ai.remember_umo(event.unified_msg_origin)
+
+        content = str(text).strip()
+        images = await self._extract_images(event)
+
+        if not content and not images:
+            yield event.plain_result("用法：/空间发布 说说内容（可同时附带图片）")
+            return
+
+        yield event.plain_result("正在发布到 QQ空间...")
+        try:
+            record = await self._publish(content, images, source="manual")
+        except Exception as e:
+            yield event.plain_result(f"发布失败：{e}")
+            return
+
+        yield event.plain_result(self._format_record(record))
+
+    @filter.command("空间状态", alias={"space status", "qz status", "空间登录"})
+    async def cmd_status(self, event: AstrMessageEvent):
+        """查看登录态、AI 接入、日程与各定时任务状态"""
+        self._remember_client(event)
+
+        lines = ["【QQ空间插件状态】"]
+        try:
+            nickname = await self.session.get_nickname()
+            uin = await self.session.get_uin()
+            lines.append(
+                f"登录态: 正常（{nickname} / {uin}，Cookie 来源: "
+                f"{self.session.source or '未知'}）"
+            )
+        except Exception as e:
+            lines.append(f"登录态: 异常（{e}）")
+
+        admin_qqs, admin_source = self._admin_qqs()
+        lines.append(
+            f"管理员: {'、'.join(admin_qqs) if admin_qqs else '未识别到'}"
+            f"（来源: {admin_source}）"
+        )
+        if not admin_qqs:
+            lines.append(
+                "　⚠️ 没有管理员名单，草稿确认发不出去；"
+                "可在插件配置 admin_uins 填写，或用 /空间管理员 add <QQ号>"
+            )
+
+        overrides = self.ai.overrides_text()
+        lines.append(
+            f"AI 接入: {self.ai.describe()}"
+            + (f"｜单独指定: {overrides}" if overrides else "")
+        )
+
+        cached = self.life.cached(datetime.now().date())
+        if cached and cached.status == "ok":
+            life_text = f"已就绪｜{cached.to_line()[:60]}"
+        else:
+            life_text = "今日尚未生成"
+        lines.append(
+            f"生活日程: {life_text}｜注入提示词: {'开' if self.cfg.life_inject_enabled else '关'}"
+        )
+
+        lines.append(f"联网素材: {self.web.status_text()}")
+        lines.append(f"回执图渲染: {self.render.status_text()}")
+
+        basis = self.content.last_generation
+        if basis:
+            lines.append(
+                f"上次生成依据: 人设={basis.get('persona') or '未取到'}"
+                f"｜日程={'已引用' if basis.get('life') else '未引用'}"
+                f"｜联网素材={'有' if basis.get('web') else '无'}"
+                f"｜聊天记录={'有' if basis.get('chat') else '无'}"
+            )
+            for warning in basis.get("warnings") or []:
+                lines.append(f"　⚠️ {warning}")
+
+        usage_first_line = self.ai.usage.format_summary(1).splitlines()[0]
+        lines.append(f"Token 用量（估算）: {usage_first_line}")
+        if self.ai.last_call:
+            lines.append(f"　最近一次: {self.ai.last_call_text()}")
+
+        lines.append(
+            f"定时发布: {'开启' if self.publish_task.running else '关闭'}"
+            f"（{self.publish_task.cron or '未设置'}，抖动 {self.publish_task.jitter} 秒）"
+        )
+        lines.append(f"　内容来源: {self.cfg.content_source}")
+        lines.append(f"　下次执行: {self.publish_task.next_run_time}")
+        if self.publish_task.error:
+            lines.append(f"　⚠️ 时间配置错误: {self.publish_task.error}")
+
+        lines.append(
+            f"说说互动: {self.interact.mode_text()}"
+            f"（{self.interact_task.cron or '未设置'}，"
+            f"关注 {len(self.interact.targets)} 个 QQ）"
+        )
+        lines.append(f"　下次巡检: {self.interact_task.next_run_time}")
+        if not self.interact.targets:
+            lines.append("　⚠️ 还没配置 interact_uins，巡检不会做任何事")
+
+        lines.append(
+            f"草稿确认: {'开启' if self.cfg.draft_enabled else '关闭'}"
+            f"｜评论也确认: {'开' if self.cfg.draft_for_comment else '关'}"
+        )
+        pending = self.drafts.pending
+        if pending is not None:
+            lines.append(
+                f"　待确认: {pending.title()}（{self._format_time(pending.created_time)}）"
+            )
+
+        morning = self.greet.slot_of("morning")
+        night = self.greet.slot_of("night")
+        lines.append(
+            f"定时问候: {'开启' if bool(self.cfg.greet_enabled) else '关闭'}"
+            f"｜对象 {len(self.greet.targets)} 人"
+            f"｜内容 {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
+        )
+        if morning is not None:
+            lines.append(
+                f"　{morning.name}: {self.greet_morning_task.cron or '未设置'}"
+                f"（下次 {self.greet_morning_task.next_run_time}）"
+                f"｜今日已发 {self.greet.sent_today(morning.key)} 人"
+            )
+        if night is not None:
+            lines.append(
+                f"　{night.name}: {self.greet_night_task.cron or '未设置'}"
+                f"（下次 {self.greet_night_task.next_run_time}）"
+                f"｜今日已发 {self.greet.sent_today(night.key)} 人"
+            )
+        if bool(self.cfg.greet_enabled) and not self.greet.targets:
+            lines.append("　⚠️ 还没配置 greet_users，问候不会发出")
+
+        last = self.store.last_success()
+        if last:
+            lines.append(f"上次发布: {self._format_time(last.time)}（tid {last.tid}）")
+        else:
+            lines.append("上次发布: 暂无记录")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间重登", alias={"space relogin", "qz relogin"})
+    async def cmd_relogin(self, event: AstrMessageEvent):
+        """强制重新获取 QQ空间登录态"""
+        self._remember_client(event)
+        try:
+            ctx = await self.session.refresh()
+        except Exception as e:
+            yield event.plain_result(f"重新登录失败：{e}")
+            return
+        yield event.plain_result(
+            f"重新登录成功：uin={ctx.uin}（Cookie 来源: {self.session.source}）"
+        )
+
+    # ------------------------------------------------------------------
+    # 指令：定时与开关
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间定时", alias={"space cron", "qz cron"})
+    async def cmd_schedule(self, event: AstrMessageEvent, spec: GreedyStr = ""):
+        """查看或设置自动发布时间，支持 HH:MM 与 Cron"""
+        self._remember_client(event)
+        text = str(spec).strip()
+
+        if not text:
+            yield event.plain_result(
+                "当前自动发布时间: "
+                f"{self.cfg.publish_cron or '未设置'}\n"
+                f"下次执行: {self.publish_task.next_run_time}\n"
+                "用法: /空间定时 08:30 或 /空间定时 30 8 * * * 或 /空间定时 off"
+            )
+            return
+
+        if text.lower() in _OFF_FLAGS:
+            self.cfg.set("publish_cron", "")
+            self.publish_task.reconfigure(cron="")
+            yield event.plain_result("已清空发布时间，定时自动发布已关闭")
+            return
+
+        try:
+            normalized = normalize_cron(text)
+        except ValueError as e:
+            yield event.plain_result(f"设置失败：{e}")
+            return
+
+        if normalized is None:
+            yield event.plain_result("设置失败：时间不能为空")
+            return
+
+        self.cfg.set("publish_cron", normalized)
+        if not bool(self.cfg.auto_publish_enabled):
+            self.cfg.set("auto_publish_enabled", True)
+
+        effective = self.publish_task.reconfigure(cron=normalized, enabled=True)
+        if effective is None:
+            reason = self.publish_task.error or "调度器未能启动，请查看 AstrBot 日志"
+            yield event.plain_result(f"设置失败：{reason}")
+            return
+
+        yield event.plain_result(
+            f"已将自动发布时间设置为 {effective}\n下次执行: {self.publish_task.next_run_time}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间开关", alias={"space toggle", "qz toggle"})
+    async def cmd_toggle(self, event: AstrMessageEvent, state: GreedyStr = ""):
+        """开关定时自动发布"""
+        self._remember_client(event)
+        flag = str(state).strip().lower()
+
+        if not flag:
+            yield event.plain_result(
+                f"定时自动发布当前为: "
+                f"{'开启' if self.publish_task.running else '关闭'}\n"
+                "用法: /空间开关 on 或 /空间开关 off"
+            )
+            return
+
+        if flag in _ON_FLAGS:
+            self.cfg.set("auto_publish_enabled", True)
+            cron = self.publish_task.reconfigure(enabled=True)
+            if cron is None:
+                yield event.plain_result(
+                    "已开启定时发布，但没有可用的发布时间，请用 /空间定时 设置"
+                )
+                return
+            yield event.plain_result(
+                f"定时自动发布已开启：{cron}\n下次执行: {self.publish_task.next_run_time}"
+            )
+            return
+
+        if flag in _OFF_FLAGS:
+            self.cfg.set("auto_publish_enabled", False)
+            self.publish_task.reconfigure(enabled=False)
+            yield event.plain_result("定时自动发布已关闭")
+            return
+
+        yield event.plain_result("参数无效，用法: /空间开关 on 或 /空间开关 off")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间互动", alias={"space interact", "qz interact"})
+    async def cmd_interact(self, event: AstrMessageEvent, state: GreedyStr = ""):
+        """查看或开关「定时读说说」任务（点赞/评论在插件配置里单独开）"""
+        self._remember_client(event)
+        flag = str(state).strip().lower()
+
+        if not flag:
+            yield event.plain_result(
+                f"说说互动当前为: {self.interact.mode_text()}\n"
+                f"巡检时间: {self.interact_task.cron or '未设置'}"
+                f"｜下次: {self.interact_task.next_run_time}\n"
+                f"关注对象: {', '.join(self.interact.targets) or '（未配置 interact_uins）'}\n"
+                "用法: /空间互动 on 或 /空间互动 off；立即跑一轮用 /空间读说说"
+            )
+            return
+
+        if flag in _ON_FLAGS:
+            self.cfg.set("interact_enabled", True)
+            cron = self.interact_task.reconfigure(enabled=True)
+            if cron is None:
+                yield event.plain_result(
+                    "已开启互动巡检，但没有可用的时间配置，请设置 interact_cron"
+                )
+                return
+            yield event.plain_result(
+                f"说说互动巡检已开启：{cron}\n下次执行: {self.interact_task.next_run_time}"
+            )
+            return
+
+        if flag in _OFF_FLAGS:
+            self.cfg.set("interact_enabled", False)
+            self.interact_task.reconfigure(enabled=False)
+            yield event.plain_result("说说互动巡检已关闭")
+            return
+
+        yield event.plain_result("参数无效，用法: /空间互动 on 或 /空间互动 off")
+
+    # ------------------------------------------------------------------
+    # 指令：联网搜索（接入 AstrBot 自带能力）/ 日程 / 读说说
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间搜索", alias={"space search", "qz search"})
+    async def cmd_search(self, event: AstrMessageEvent, query: GreedyStr = ""):
+        """用 AstrBot 自带的联网搜索测一条；不带参数只看状态"""
+        self._remember_client(event)
+        text = str(query).strip()
+
+        if not text:
+            _, reason = self.web.readiness()
+            yield event.plain_result(
+                f"联网素材开关: {'开' if self.cfg.web_search_enabled else '关'}\n"
+                f"AstrBot 联网搜索: {reason}\n"
+                "用法: /空间搜索 关键词 —— 直接用 AstrBot 的联网搜索跑一条，"
+                "用来确认接入是否正常（不会发说说）"
+            )
+            return
+
+        yield event.plain_result(f"正在联网搜索：{text}")
+        outcome = await self.web.search(
+            text,
+            count=int(self.cfg.web_search_count or 5),
+            umo=event.unified_msg_origin,
+        )
+        if not outcome:
+            yield event.plain_result(
+                f"搜索失败：{outcome.error}\n"
+                "（提示：服务商与密钥都在 AstrBot 面板的「联网搜索」里配置，"
+                "插件只负责调用）"
+            )
+            return
+        yield event.plain_result(
+            f"搜到 {len(outcome.hits)} 条：\n{self.web.format_hits(outcome.hits)}"
+        )
+
+    @filter.command("空间日程", alias={"space life", "qz life"})
+    async def cmd_life(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """查看今日生活日程；带 renew 参数可重新生成"""
+        self._remember_client(event)
+        force = str(action).strip().lower() in _RENEW_FLAGS
+
+        if force and not bool(self.cfg.life_inject_enabled):
+            logger.info("重新生成生活日程（注入提示词为关闭状态）")
+
+        try:
+            state = await self.life.get_state(force=force)
+        except Exception as e:
+            yield event.plain_result(f"获取生活日程失败：{e}")
+            return
+
+        if state is None:
+            yield event.plain_result(
+                "没有拿到今日日程：请先检查 AstrBot 里是否配置了可用的 LLM 提供商"
+            )
+            return
+
+        if state.status != "ok":
+            yield event.plain_result(
+                "今日日程生成失败（通常是 AI 不可用），详情见 AstrBot 日志"
+            )
+            return
+
+        yield event.plain_result(
+            f"【{state.date} 生活状态】（当前时段: {time_desc()}）\n"
+            f"穿搭：{state.outfit}\n"
+            f"日程：{state.schedule}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间读说说", alias={"space read", "qz read"})
+    async def cmd_read(self, event: AstrMessageEvent, force: GreedyStr = ""):
+        """立即巡检一轮好友说说（默认只读；force 忽略去重）"""
+        self._remember_client(event)
+        if not self.interact.targets:
+            yield event.plain_result(
+                "还没配置关注对象：请在插件配置的 interact_uins 里填 QQ 号"
+            )
+            return
+
+        yield event.plain_result("正在巡检好友说说...")
+        result = await self.interact.run_once(force=bool(str(force).strip()))
+        yield event.plain_result(f"巡检完成：{result.summary()}")
+
+        pending = self.drafts.pending
+        if pending is not None and pending.kind == "comment":
+            yield event.plain_result(pending.describe())
+
+    # ------------------------------------------------------------------
+    # 指令：管理员名单
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间管理员", alias={"space admin", "qz admin"})
+    async def cmd_admin(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """查看或修改插件内的管理员 QQ 名单"""
+        self._remember_client(event)
+        args = str(action).split()
+        qqs, source = self._admin_qqs()
+
+        if not args:
+            yield event.plain_result(
+                f"管理员名单: {'、'.join(qqs) if qqs else '（空）'}\n"
+                f"来源: {source}\n"
+                "用法: /空间管理员 add 123456 或 /空间管理员 remove 123456\n"
+                "说明: 这里只影响草稿确认与通知发给谁；"
+                "指令权限由 AstrBot 配置里的 admins_id 决定（插件不绕过它）"
+            )
+            return
+
+        sub = args[0].lower()
+        targets = [item for item in args[1:] if item.strip()]
+        if sub not in {"add", "remove", "del", "delete", "加", "删"} or not targets:
+            yield event.plain_result(
+                "用法: /空间管理员 add 123456 或 /空间管理员 remove 123456"
+            )
+            return
+
+        current = [
+            str(item).strip()
+            for item in (self.cfg.admin_uins or [])
+            if str(item).strip()
+        ]
+        bad = [item for item in targets if not item.isdigit()]
+        if bad:
+            yield event.plain_result(f"这些不是纯数字 QQ 号：{'、'.join(bad)}")
+            return
+
+        if sub in {"add", "加"}:
+            added = [item for item in targets if item not in current]
+            current.extend(added)
+            message = (
+                f"已添加管理员：{'、'.join(added)}" if added else "这些 QQ 号已在名单里"
+            )
+        else:
+            removed = [item for item in targets if item in current]
+            current = [item for item in current if item not in targets]
+            message = (
+                f"已移除管理员：{'、'.join(removed)}"
+                if removed
+                else "这些 QQ 号不在名单里"
+            )
+
+        self.cfg.set("admin_uins", current)
+        yield event.plain_result(
+            f"{message}\n当前名单: {'、'.join(current) or '（空，将回退用 AstrBot 的 admins_id）'}"
+        )
+
+    # ------------------------------------------------------------------
+    # 指令：定时问候
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间问候", alias={"space greet", "qz greet"})
+    async def cmd_greet(self, event: AstrMessageEvent, args: GreedyStr = ""):
+        """立即发一次问候用于测试；也支持 /空间问候 on|off 开关定时问候"""
+        self._remember_client(event)
+        parts = str(args).split()
+
+        if not parts:
+            morning = self.greet.slot_of("morning")
+            night = self.greet.slot_of("night")
+            yield event.plain_result(
+                f"问候开关: {'开' if bool(self.cfg.greet_enabled) else '关'}"
+                f"｜内容来源: {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}\n"
+                f"问候对象: {'、'.join(self.greet.targets) or '（未配置 greet_users）'}\n"
+                f"{morning.name if morning else '早安'}: {self.greet_morning_task.cron or '未设置'}"
+                f"（下次 {self.greet_morning_task.next_run_time}）"
+                f"｜{night.name if night else '晚安'}: {self.greet_night_task.cron or '未设置'}"
+                f"（下次 {self.greet_night_task.next_run_time}）\n"
+                "用法: /空间问候 on|off 开关定时问候；"
+                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试（忽略当日去重）"
+            )
+            return
+
+        flag = parts[0].lower()
+        if flag in _ON_FLAGS or flag in _OFF_FLAGS:
+            enabled = flag in _ON_FLAGS
+            self.cfg.set("greet_enabled", enabled)
+            if enabled:
+                morning_cron = self.greet_morning_task.reconfigure(enabled=True)
+                night_cron = self.greet_night_task.reconfigure(enabled=True)
+                if not morning_cron and not night_cron:
+                    yield event.plain_result(
+                        "已开启，但 greet_morning_cron / greet_night_cron 都是空的，"
+                        "请先设置时间"
+                    )
+                    return
+                yield event.plain_result(
+                    f"定时问候已开启\n"
+                    f"早安: {morning_cron or '未设置'}（下次 {self.greet_morning_task.next_run_time}）\n"
+                    f"晚安: {night_cron or '未设置'}（下次 {self.greet_night_task.next_run_time}）\n"
+                    f"对象: {'、'.join(self.greet.targets) or '（还没配置 greet_users）'}"
+                )
+                return
+
+            self.greet_morning_task.reconfigure(enabled=False)
+            self.greet_night_task.reconfigure(enabled=False)
+            yield event.plain_result("定时问候已关闭")
+            return
+
+        slot = self.greet.slot_of(flag)
+        if slot is None:
+            yield event.plain_result(
+                "用法: /空间问候 on|off，或 /空间问候 morning 123456"
+            )
+            return
+
+        targets = [item for item in parts[1:] if item.isdigit()]
+        if not targets and not self.greet.targets:
+            yield event.plain_result(
+                "没指定 QQ 号，且 greet_users 也是空的："
+                "请用 /空间问候 morning 123456 指定一个"
+            )
+            return
+
+        yield event.plain_result(
+            f"正在发送{slot.name}问候给 {'、'.join(targets) if targets else '配置里的对象'}..."
+        )
+        try:
+            result = await self.greet.send(
+                slot.key, targets=targets or None, force=True
+            )
+        except Exception as e:
+            yield event.plain_result(f"发送失败：{e}")
+            return
+
+        yield event.plain_result(
+            f"{slot.name}问候：{result.summary()}\n内容：{result.text}"
+        )
+
+    # ------------------------------------------------------------------
+    # 指令：草稿确认
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间用量", alias={"space usage", "qz usage"})
+    async def cmd_usage(self, event: AstrMessageEvent, days: GreedyStr = ""):
+        """查看 AI token 用量估算（可按天数，如 /空间用量 7）"""
+        self._remember_client(event)
+        try:
+            span = int(str(days).strip() or 1)
+        except ValueError:
+            yield event.plain_result("用法: /空间用量 [天数]，例如 /空间用量 7")
+            return
+        span = min(max(span, 1), 60)
+
+        yield event.plain_result(
+            "【AI 用量估算】\n"
+            + self.ai.usage.format_summary(span, indent="　")
+            + "\n\n说明：按文本长度粗估（中文约 0.7 token/字），"
+            "与实际计费存在 ±20% 左右误差，仅供心里有数。"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间确认", alias={"space ok", "qz ok"})
+    async def cmd_confirm(self, event: AstrMessageEvent):
+        """确认并发布当前草稿"""
+        self._remember_client(event)
+        self._cancel_draft_timer()
+        draft = self.drafts.pop()
+        if draft is None:
+            yield event.plain_result("当前没有待确认的草稿")
+            return
+
+        yield event.plain_result(f"正在发布{draft.title()}...")
+        try:
+            message = await self._confirm_draft(draft)
+        except Exception as e:
+            self.drafts.put(draft)
+            yield event.plain_result(f"发布失败：{e}\n草稿已保留，修正后可再 /空间确认")
+            return
+
+        yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间放弃", alias={"space drop", "qz drop"})
+    async def cmd_drop(self, event: AstrMessageEvent):
+        """丢弃当前草稿"""
+        self._cancel_draft_timer()
+        if not self.drafts.clear():
+            yield event.plain_result("当前没有待确认的草稿")
+            return
+        yield event.plain_result("草稿已丢弃")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间重写", alias={"space redo", "qz redo"})
+    async def cmd_redo(self, event: AstrMessageEvent):
+        """让 AI 按同一目标重写一版草稿"""
+        self._remember_client(event)
+        draft = self.drafts.pending
+        if draft is None:
+            yield event.plain_result("当前没有待确认的草稿")
+            return
+
+        yield event.plain_result("正在让 AI 重写草稿...")
+        try:
+            if draft.kind == "comment":
+                text = await self.interact.rewrite_comment(draft)
+                new_draft = Draft(
+                    kind="comment",
+                    text=text,
+                    source="interact",
+                    target_uin=draft.target_uin,
+                    target_tid=draft.target_tid,
+                    target_name=draft.target_name,
+                    target_text=draft.target_text,
+                )
+            else:
+                text = await self.content.rewrite(previous=draft.text)
+                new_draft = Draft(
+                    kind="post", text=text, source="rewrite", images=draft.images
+                )
+        except Exception as e:
+            yield event.plain_result(f"重写失败：{e}\n原草稿仍保留")
+            return
+
+        self.drafts.put(new_draft)
+        yield event.plain_result(new_draft.describe())
+
+    # ------------------------------------------------------------------
+    # 指令：历史与删除
+    # ------------------------------------------------------------------
+
+    @filter.command("空间历史", alias={"space history", "qz history"})
+    async def cmd_history(self, event: AstrMessageEvent, count: int = 5):
+        """查看最近的发布记录"""
+        size = min(max(int(count or 5), 1), 20)
+        records = self.store.recent(size)
+
+        if not records:
+            yield event.plain_result("还没有发布记录")
+            return
+
+        lines = [f"【最近 {len(records)} 条发布记录】"]
+        for record in records:
+            state = "成功" if record.ok else "失败"
+            summary = (record.text or "").replace("\n", " ")[:40]
+            lines.append(
+                f"[{self._format_time(record.time)}] {state} "
+                f"来源={record.source} tid={record.tid or '-'} {summary}"
+            )
+            if not record.ok and record.error:
+                lines.append(f"    失败原因: {record.error}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间删除", alias={"space delete", "qz delete"})
+    async def cmd_delete(self, event: AstrMessageEvent, tid: GreedyStr):
+        """删除指定说说，tid 可通过 /空间历史 查看"""
+        self._remember_client(event)
+        target = str(tid).strip()
+        if not target:
+            yield event.plain_result("用法：/空间删除 <tid>（可用 /空间历史 查看 tid）")
+            return
+
+        try:
+            resp = await self.api.delete(target)
+        except Exception as e:
+            yield event.plain_result(f"删除失败：{e}")
+            return
+
+        if resp.ok:
+            yield event.plain_result(f"已删除说说 {target}")
+        else:
+            yield event.plain_result(f"删除失败：{resp.message or resp.code}")
