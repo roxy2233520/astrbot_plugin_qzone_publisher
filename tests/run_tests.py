@@ -3115,16 +3115,16 @@ async def main() -> int:
 
     plugin.greet._sent = {}
     StarTools.sent.clear()
-    out = await collect(plugin.cmd_greet(FakeEvent(), "morning 1611729294"))
+    out = await collect(plugin.cmd_greet(FakeEvent(), "morning 10003"))
     check(
         "手动指令不占用今日自动问候名额，并回报发送地址",
-        plugin.greet._already_sent("morning", "1611729294") is False
+        plugin.greet._already_sent("morning", "10003") is False
         and any("发送地址" in item for item in out),
         str(out)[:160],
     )
     check(
         "手动指令用真实私聊会话地址",
-        "aiocqhttp:FriendMessage:1611729294" in str(out),
+        "aiocqhttp:FriendMessage:10003" in str(out),
         str(out)[:160],
     )
     plugin.greet._sent = {}
