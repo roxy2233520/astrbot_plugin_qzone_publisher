@@ -14,10 +14,12 @@ from astrbot.api import logger
 
 from .constants import (
     QZONE_CODE_LOGIN_REQUIRED,
+    QZONE_CODE_UNEXPECTED_PAGE,
     QZONE_CODE_UNKNOWN,
     QZONE_MSG_EMPTY_RESPONSE,
     QZONE_MSG_LOGIN_REQUIRED,
     QZONE_MSG_NON_OBJECT_RESPONSE,
+    QZONE_MSG_UNEXPECTED_PAGE,
     QZONE_MSG_UNKNOWN_FORMAT,
 )
 from .model import FeedComment, FeedPost
@@ -28,12 +30,8 @@ _JSONP_PATTERN = re.compile(r"^[^(){]{0,64}\(\s*(\{.*\})\s*\)\s*;?\s*$", re.DOTA
 _UNQUOTED_KEY_PATTERN = re.compile(r"([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)")
 # 尾逗号：,] 或 ,}
 _TRAILING_COMMA_PATTERN = re.compile(r",(\s*[}\]])")
-# 判定「这不是数据，而是登录页 / 风控页」的特征
+# 判定「登录态真的失效了」的特征：只有命中这些才值得重新获取 Cookie 并重试
 _LOGIN_PAGE_HINTS = (
-    "<html",
-    "<!doctype",
-    "<head",
-    "<body",
     "ptlogin",
     "请先登录",
     "请登录",
@@ -41,6 +39,22 @@ _LOGIN_PAGE_HINTS = (
     "验证",
     "安全",
     "风控",
+    "login",
+)
+# 判定「返回的是页面而不是数据」的特征：JSONP / h5 框架页。
+# 这些特征不会出现在登录页上，因此优先按「页面」处理，不触发重登。
+_FRAMEWORK_PAGE_HINTS = (
+    "frameelement.callback",
+    "document.domain",
+    "cb=",
+    "<script",
+)
+# 普通的 HTML 页面（没有登录特征也没有框架特征）
+_PAGE_HINTS = (
+    "<html",
+    "<!doctype",
+    "<head",
+    "<body",
     "forbidden",
     "blocked",
 )
@@ -62,6 +76,19 @@ class QzoneParser:
             统一响应体。
         """
         return {"code": code, "message": message, "data": {}}
+
+    @staticmethod
+    def error_payload(message: str, code: int = QZONE_CODE_UNKNOWN) -> dict[str, Any]:
+        """构造带错误信息的统一响应体（供传输层改写失败原因使用）。
+
+        Args:
+            message: 给用户看的失败原因。
+            code: 合成返回码。
+
+        Returns:
+            统一响应体。
+        """
+        return QzoneParser._error_payload(message, code)
 
     @staticmethod
     def visible_snippet(text: str, limit: int = 300) -> str:
@@ -168,6 +195,34 @@ class QzoneParser:
         lowered = str(text or "").lower()
         return any(hint in lowered for hint in _LOGIN_PAGE_HINTS)
 
+    @staticmethod
+    def is_framework_page(text: str) -> bool:
+        """判断响应是否是 JSONP / h5 框架页（不是数据，也不是登录页）。
+
+        Args:
+            text: 原始响应文本。
+
+        Returns:
+            命中框架页特征时返回 True。
+        """
+        lowered = str(text or "").lower()
+        return any(hint in lowered for hint in _FRAMEWORK_PAGE_HINTS)
+
+    @staticmethod
+    def is_page_response(text: str) -> bool:
+        """判断响应是否「是页面而不是数据」（JSONP / h5 框架页 / HTML）。
+
+        这类响应不该触发重新获取登录态：多半是接口地址或参数不对。
+
+        Args:
+            text: 原始响应文本。
+
+        Returns:
+            命中页面特征时返回 True。
+        """
+        lowered = str(text or "").lower()
+        return any(hint in lowered for hint in _PAGE_HINTS)
+
     @classmethod
     def parse_response(cls, text: str) -> dict[str, Any]:
         """把原始响应文本解析为字典。
@@ -177,8 +232,9 @@ class QzoneParser:
         1. 直接 ``json.loads``；
         2. 剥离 JS 包裹（``_Callback(...)`` / ``frameElement.callback(...)``、多余分号与空白）；
         3. 放宽写法后再解析（单引号字符串、无引号键、尾逗号）；
-        4. 仍失败时：像登录页 / 风控页就返回可操作的登录态提示，
-           否则返回「响应格式无法识别」；两种情况都会把响应前 300 字符写进日志。
+        4. 仍失败时按原因分流：登录特征 → 登录态失效（可自动重登重试）；
+           JSONP / 框架页 / HTML → 返回的是页面（不重登）；
+           都不是 → 「响应格式无法识别」。三种都会把响应前 300 字符写进日志。
 
         Args:
             text: 接口返回的原始文本，可能是 JSON 或 JSONP。
@@ -222,6 +278,15 @@ class QzoneParser:
     def _fail(cls, raw: str, *, missing_fragment: bool = False) -> dict[str, Any]:
         """解析彻底失败时的统一处理：写日志并给出可操作的原因。
 
+        判定顺序（顺序很重要）：
+
+        1. 命中 JSONP / h5 框架页特征（``frameElement.callback``、``document.domain``…）→
+           判定为「返回的是页面而不是数据」，**不**触发重登；
+        2. 命中明确登录特征（``ptlogin`` / 请先登录…）→ 判定为登录态失效，
+           传输层会重新获取 Cookie 并重试一次；
+        3. 其它 HTML 页面 → 同样按「返回的是页面」处理；
+        4. 都不是 → 报「响应格式无法识别」。
+
         Args:
             raw: 原始响应文本。
             missing_fragment: 是否连 JSON 片段都没有找到。
@@ -230,13 +295,29 @@ class QzoneParser:
             带 message 的错误响应体。
         """
         snippet = cls.visible_snippet(raw)
+        if cls.is_framework_page(raw):
+            logger.error(
+                "QQ空间接口返回的是 JSONP / h5 框架页而不是数据（未重新获取登录态），"
+                f"响应片段: {snippet}｜多为接口地址或参数不对，可先升级插件版本"
+            )
+            return cls._error_payload(
+                QZONE_MSG_UNEXPECTED_PAGE, code=QZONE_CODE_UNEXPECTED_PAGE
+            )
         if cls.is_login_page(raw):
             logger.error(
-                "QQ空间返回的像是登录页 / 风控页（不是数据），响应片段: "
+                "QQ空间返回的像是登录页（不是数据），响应片段: "
                 f"{snippet}｜建议用 /空间重登 重取登录态或稍后重试"
             )
             return cls._error_payload(
                 QZONE_MSG_LOGIN_REQUIRED, code=QZONE_CODE_LOGIN_REQUIRED
+            )
+        if cls.is_page_response(raw):
+            logger.error(
+                "QQ空间接口返回的是页面而不是数据（未重新获取登录态），响应片段: "
+                f"{snippet}｜多为接口地址或参数不对，可先升级插件版本"
+            )
+            return cls._error_payload(
+                QZONE_MSG_UNEXPECTED_PAGE, code=QZONE_CODE_UNEXPECTED_PAGE
             )
         reason = "缺少 JSON 片段" if missing_fragment else "JSON 解析失败"
         logger.error(f"QQ空间响应{reason}，格式无法识别，响应片段: {snippet}")

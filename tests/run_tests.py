@@ -14,6 +14,7 @@ import asyncio
 import base64
 import importlib
 import json
+import re
 import sys
 import tempfile
 import time
@@ -612,8 +613,8 @@ async def main() -> int:
     check("undefined 替换为 null", parsed.get("msg") is None, str(parsed))
     parsed = QzoneParser.parse_response("<html>403 Forbidden</html>")
     check(
-        "HTML 页面判定为登录态 / 风控而非普通错误",
-        parsed.get("code") == -3001 and "登录态" in str(parsed.get("message")),
+        "普通 HTML 页面判定为「返回页面」而不是登录失效",
+        parsed.get("code") == -3002 and "页面" in str(parsed.get("message")),
         str(parsed),
     )
     parsed = QzoneParser.parse_response("")
@@ -1369,6 +1370,49 @@ async def main() -> int:
             text="这不是数据，只是一段没有结构的返回", content_type="text/plain"
         )
 
+    reply_calls: dict = {}
+
+    def _bump(key: str) -> int:
+        reply_calls[key] = reply_calls.get(key, 0) + 1
+        return reply_calls[key]
+
+    async def handle_reply_h5_page(request):
+        """模拟 h5 域的 JSONP 框架页：不是数据，也不该被当成登录失效。"""
+        _bump("h5_page")
+        return web.Response(
+            text=(
+                "<html><head></head><body>"
+                '<script type="text/javascript"> var cb;'
+                'try{document.domain="h5.qzone.qq.com";cb=frameElement.callback;}'
+                "catch(e){}</script></body></html>"
+            ),
+            content_type="text/html",
+        )
+
+    async def handle_reply_ptlogin(request):
+        """第一次返回登录页（登录特征），第二次返回正常数据。"""
+        if _bump("ptlogin") == 1:
+            return web.Response(
+                text="<html><body>ptlogin2.qq.com 请先登录</body></html>",
+                content_type="text/html",
+            )
+        return web.json_response({"code": 0})
+
+    async def handle_reply_forbidden(request):
+        """始终返回 403。"""
+        _bump("forbidden")
+        return web.Response(
+            text="<html><head><title>403 Forbidden</title></head><body>openresty</body></html>",
+            status=403,
+            content_type="text/html",
+        )
+
+    async def handle_reply_unauthorized(request):
+        """第一次 401，第二次正常。"""
+        if _bump("unauthorized") == 1:
+            return web.Response(text="", status=401)
+        return web.json_response({"code": 0})
+
     app2 = web.Application()
     app2.router.add_post("/v1/chat/completions", handle_ai)
     app2.router.add_get("/feeds", handle_feeds)
@@ -1379,6 +1423,10 @@ async def main() -> int:
     app2.router.add_post("/publish_login_page", handle_publish_login_page)
     app2.router.add_post("/publish_login_page_always", handle_publish_login_page_always)
     app2.router.add_post("/publish_garbage", handle_publish_garbage)
+    app2.router.add_post("/reply_h5_page", handle_reply_h5_page)
+    app2.router.add_post("/reply_ptlogin", handle_reply_ptlogin)
+    app2.router.add_post("/reply_forbidden", handle_reply_forbidden)
+    app2.router.add_post("/reply_unauthorized", handle_reply_unauthorized)
     app2.router.add_post("/reply", handle_reply)
     app2.router.add_get("/detail", handle_detail)
     runner2 = web.AppRunner(app2)
@@ -6401,6 +6449,194 @@ async def main() -> int:
         "会暴露内部信息的两条指令已限管理员",
         "空间状态" in admin_commands and "空间历史" in admin_commands,
         f"管理员指令: {sorted(admin_commands)}",
+    )
+
+    # ==================================================================
+    print("\n[41] 回复接口域名与失败分类")
+
+    _const2 = _imp("core.qzone.constants")
+
+    # 上面几节为了打桩把 REPLY_URL 指向了本地假服务，这里回到源码里核对真实取值。
+    _api_source = (REPO_ROOT / "core" / "qzone" / "api.py").read_text(encoding="utf-8")
+
+    def _api_const(name: str) -> str:
+        found = re.search(
+            rf'^\s*{name} = \(\n((?:\s*"[^"]*"\n)+)\s*\)',
+            _api_source,
+            re.MULTILINE,
+        )
+        if not found:
+            return ""
+        return "".join(re.findall(r'"([^"]*)"', found.group(1)))
+
+    _src_reply = _api_const("REPLY_URL")
+    _src_comment = _api_const("COMMENT_URL")
+    check(
+        "回复接口走 user.qzone.qq.com 域（不再用 h5 域）",
+        _src_reply.startswith("https://user.qzone.qq.com/") and _src_reply,
+        _src_reply or "未在源码中找到 REPLY_URL",
+    )
+    check(
+        "回复与评论使用同一个 CGI 路径",
+        bool(_src_reply) and _src_reply == _src_comment,
+        f"{_src_reply} / {_src_comment}",
+    )
+
+    invalidated = {"count": 0}
+    real_invalidate = plugin.session.invalidate
+
+    async def spy_invalidate() -> None:
+        invalidated["count"] += 1
+        await real_invalidate()
+
+    plugin.session.invalidate = spy_invalidate
+
+    _stub_logger = sys.modules["astrbot.api"].logger
+    real_error = _stub_logger.error
+    real_warning = _stub_logger.warning
+    error_lines: list[str] = []
+    warning_lines: list[str] = []
+    _stub_logger.error = lambda *args, **kwargs: error_lines.append(
+        str(args[0]) if args else ""
+    )
+    _stub_logger.warning = lambda *args, **kwargs: warning_lines.append(
+        str(args[0]) if args else ""
+    )
+    try:
+        # 1) h5 框架页：判定为「返回页面」，不重登、不重试
+        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_h5_page"
+        reply_calls.clear()
+        invalidated["count"] = 0
+        error_lines.clear()
+        page_resp = await plugin.api.reply(123456, "TID_A", "CID_A", 10001, "测试回复")
+        check(
+            "h5 框架页判为「返回页面」而不是登录失效",
+            (not page_resp.ok)
+            and page_resp.code == _const2.QZONE_CODE_UNEXPECTED_PAGE
+            and "页面" in str(page_resp.message),
+            f"{page_resp.code}/{page_resp.message}",
+        )
+        check(
+            "页面响应不触发重新获取登录态",
+            invalidated["count"] == 0,
+            str(invalidated["count"]),
+        )
+        check(
+            "页面响应只请求一次（不重试）",
+            reply_calls.get("h5_page") == 1,
+            str(reply_calls),
+        )
+        check(
+            "回复失败日志含 URL、topicId、commentId、commentUin 与响应片段",
+            any(
+                "reply_h5_page" in item
+                and "topicId=123456_TID_A__1" in item
+                and "commentId=CID_A" in item
+                and "commentUin=10001" in item
+                and "frameElement" in item
+                for item in error_lines
+            ),
+            str(error_lines)[-240:],
+        )
+
+        # 2) 登录页：仍走「自动重登 + 重试一次」
+        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_ptlogin"
+        reply_calls.clear()
+        invalidated["count"] = 0
+        login_resp = await plugin.api.reply(123456, "TID_B", "CID_B", 10001, "测试回复")
+        check(
+            "登录页仍判定为登录态失效并重登重试一次",
+            login_resp.ok
+            and reply_calls.get("ptlogin") == 2
+            and invalidated["count"] == 1,
+            f"{login_resp.ok}/{reply_calls}/{invalidated['count']}",
+        )
+
+        # 3) HTTP 401：同样自动重登重试一次
+        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_unauthorized"
+        reply_calls.clear()
+        invalidated["count"] = 0
+        unauth_resp = await plugin.api.reply(
+            123456, "TID_C", "CID_C", 10001, "测试回复"
+        )
+        check(
+            "HTTP 401 走自动重登并重试一次",
+            unauth_resp.ok
+            and reply_calls.get("unauthorized") == 2
+            and invalidated["count"] == 1,
+            f"{unauth_resp.ok}/{reply_calls}/{invalidated['count']}",
+        )
+
+        # 4) HTTP 403：单独文案，且不重登、不重试
+        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_forbidden"
+        reply_calls.clear()
+        invalidated["count"] = 0
+        forbidden_resp = await plugin.api.reply(
+            123456, "TID_D", "CID_D", 10001, "测试回复"
+        )
+        check(
+            "HTTP 403 给出单独文案",
+            (not forbidden_resp.ok)
+            and forbidden_resp.code == _const2.QZONE_CODE_FORBIDDEN
+            and "403" in str(forbidden_resp.message),
+            f"{forbidden_resp.code}/{forbidden_resp.message}",
+        )
+        check(
+            "HTTP 403 不重登也不重试",
+            reply_calls.get("forbidden") == 1 and invalidated["count"] == 0,
+            f"{reply_calls}/{invalidated['count']}",
+        )
+    finally:
+        _stub_logger.error = real_error
+        _stub_logger.warning = real_warning
+        plugin.session.invalidate = real_invalidate
+        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
+
+    # 5) 评论 id 校验
+    check(
+        "空评论 id 被挡下",
+        plugin.interact.comment_id_problem("S1", "") != "",
+        plugin.interact.comment_id_problem("S1", ""),
+    )
+    check(
+        "极短纯数字评论 id 被挡下",
+        plugin.interact.comment_id_problem("S1", "1") != ""
+        and plugin.interact.comment_id_problem("S1", "23") != "",
+        plugin.interact.comment_id_problem("S1", "1"),
+    )
+    check(
+        "与说说 id 相同的评论 id 被挡下",
+        "说说 id 相同" in plugin.interact.comment_id_problem("S1", "S1"),
+        plugin.interact.comment_id_problem("S1", "S1"),
+    )
+    check(
+        "正常评论 id 通过校验",
+        plugin.interact.comment_id_problem("S1", "C1") == ""
+        and plugin.interact.comment_id_problem("S1", "8f0a1b2c3d") == ""
+        and plugin.interact.comment_id_problem("S1", "123456789") == "",
+        "正常 id",
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [my_post("S_BAD", 1, [comment_item("1", "可疑 id 的评论")])]
+    warning_lines.clear()
+    _stub_logger.warning = lambda *args, **kwargs: warning_lines.append(
+        str(args[0]) if args else ""
+    )
+    try:
+        bad_res = await plugin.interact.run_replies_once()
+    finally:
+        _stub_logger.warning = real_warning
+    check(
+        "可疑评论 id 被跳过且不发出请求",
+        bad_res.replied == 0 and bad_res.skipped == 1 and not replies,
+        f"{bad_res.summary()}/{replies}",
+    )
+    check(
+        "跳过可疑 id 时写明原因",
+        any("疑似不是真实评论 id" in item for item in warning_lines),
+        str(warning_lines)[-200:],
     )
 
     plugin.publish_task.stop()

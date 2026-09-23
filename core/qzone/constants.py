@@ -10,6 +10,11 @@ QZONE_CODE_IMAGE_EXPIRED = -100
 # 解析层判定的「登录态失效 / 被风控」：接口没返回业务码，而是回了一整页 HTML 或
 # 校验页面。用独立的合成码，便于传输层据此自动重取登录态后重试一次。
 QZONE_CODE_LOGIN_REQUIRED = -3001
+# 返回的是页面（JSONP / h5 框架页 / HTML），不是数据：多半是接口地址或参数不对，
+# 重取登录态没有意义，因此**不触发**重登重试。
+QZONE_CODE_UNEXPECTED_PAGE = -3002
+# HTTP 403：请求被拒绝，常见原因是频率过高或参数不被接受，同样不盲目重登。
+QZONE_CODE_FORBIDDEN = -3003
 
 # HTTP 状态码别名
 HTTP_STATUS_UNAUTHORIZED = int(HTTPStatus.UNAUTHORIZED)
@@ -28,6 +33,14 @@ QZONE_MSG_PERMISSION_DENIED = "权限不足"
 # 判定为登录 / 风控页面时的可操作提示（写进回执，指引用 /空间重登 重取登录态）
 QZONE_MSG_LOGIN_REQUIRED = (
     "登录态可能已失效或被风控拦截，请用 /空间重登 重取登录态，或稍后重试"
+)
+# 返回的是页面而不是数据：接口地址或参数不对，升级插件版本通常即可解决
+QZONE_MSG_UNEXPECTED_PAGE = (
+    "接口返回的是页面而不是数据（可能接口地址或参数不对），可先升级插件版本后重试"
+)
+# HTTP 403：不盲目重登，提示稍后重试
+QZONE_MSG_FORBIDDEN = (
+    "请求被拒绝（403）：可能是访问频率过高或接口参数不被接受，可稍后重试"
 )
 # 既不是 JSON、也不像登录 / 风控页面：只说明格式无法识别（响应片段已进日志）
 QZONE_MSG_UNKNOWN_FORMAT = "响应格式无法识别（已记录响应片段，详见日志）"

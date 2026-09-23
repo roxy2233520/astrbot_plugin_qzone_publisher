@@ -412,6 +412,29 @@ class InteractService:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def comment_id_problem(post_tid: str, comment_tid: str) -> str:
+        """检查评论 id 是否像是真实 id。
+
+        日志里出现过 ``/1``、``/2`` 这种极短 id，多半是把序号或索引当成了评论 id；
+        拿可疑 id 去请求只会拿到错误响应，因此先在这里挡下来。
+
+        Args:
+            post_tid: 所在说说的 tid。
+            comment_tid: 从接口解析出来的评论 id。
+
+        Returns:
+            有问题时返回原因说明；正常时返回空串。
+        """
+        value = str(comment_tid or "").strip()
+        if not value:
+            return "评论缺少 id，已跳过"
+        if value == str(post_tid or "").strip():
+            return f"评论 id（{value}）与说说 id 相同，疑似把序号当成评论 id，已跳过"
+        if value.isdigit() and len(value) < 6:
+            return f"评论 id（{value}）是过短的纯数字，疑似不是真实评论 id，已跳过"
+        return ""
+
+    @staticmethod
     def _reply_key(post_tid: str, comment_tid: str) -> str:
         """回复去重键：说说 tid + 评论 tid。"""
         return f"{post_tid}_{comment_tid}"
@@ -596,6 +619,13 @@ class InteractService:
                     continue
                 if not comment.content.strip():
                     result.skipped += 1
+                    continue
+                # 评论 id 可疑时先挡下来：拿错 id 去请求只会浪费一次请求并拿到错误响应
+                problem = self.comment_id_problem(post.tid, comment.tid)
+                if problem:
+                    result.skipped += 1
+                    reason = problem
+                    logger.warning(f"[reply] {post.tid} 下的{problem}")
                     continue
                 if self.replied(post.tid, comment.tid):
                     result.skipped += 1

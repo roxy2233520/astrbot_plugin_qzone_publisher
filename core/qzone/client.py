@@ -6,17 +6,23 @@ import aiohttp
 from astrbot.api import logger
 
 from .constants import (
+    HTTP_STATUS_FORBIDDEN,
     HTTP_STATUS_UNAUTHORIZED,
+    QZONE_CODE_FORBIDDEN,
     QZONE_CODE_LOGIN_EXPIRED,
     QZONE_CODE_LOGIN_REQUIRED,
     QZONE_INTERNAL_HTTP_STATUS_KEY,
     QZONE_INTERNAL_META_KEY,
+    QZONE_MSG_FORBIDDEN,
 )
 from .parser import QzoneParser
 from .session import QzoneSession
 
-# 判定为登录态失效 / 被风控的返回码（业务码 + 解析层的合成码）
+# 只有这些才算「登录态真的失效了」，值得重新获取 Cookie 并重试一次；
+# 「返回的是页面」（-3002）与 403（-3003）都不在其中：重登帮不上忙，只会多打一次请求。
 _LOGIN_REQUIRED_CODES = (QZONE_CODE_LOGIN_EXPIRED, QZONE_CODE_LOGIN_REQUIRED)
+# 失败时保留在 meta 里的原始响应片段长度（供上层日志诊断）
+_SNIPPET_LIMIT = 300
 
 
 class QzoneHttpClient:
@@ -93,9 +99,24 @@ class QzoneHttpClient:
             meta = {}
             parsed[QZONE_INTERNAL_META_KEY] = meta
         meta[QZONE_INTERNAL_HTTP_STATUS_KEY] = status
+        # 失败时把原始响应片段留在 meta 里，供上层日志诊断（成功时不写，避免噪音）
+        if parsed.get("message"):
+            meta["snippet"] = QzoneParser.visible_snippet(text, _SNIPPET_LIMIT)
 
-        # 明确登录失效（401 / -3000）或响应被判定为登录页、风控页（-3001）时，
+        # HTTP 403 单独判定：请求被拒绝，重取登录态解决不了，也不该被误当成登录失效
+        if status == HTTP_STATUS_FORBIDDEN:
+            logger.warning(
+                f"QQ空间请求被拒绝（403）: {method} {url}｜响应片段: {meta.get('snippet')}"
+            )
+            denied = QzoneParser.error_payload(
+                QZONE_MSG_FORBIDDEN, code=QZONE_CODE_FORBIDDEN
+            )
+            denied[QZONE_INTERNAL_META_KEY] = meta
+            return denied
+
+        # 明确登录失效（401 / -3000 / 解析层判定的登录页 -3001）时，
         # 重新获取 Cookie 并重试一次；发布、点赞、评论、回复等路径都由这里统一覆盖。
+        # 注意「返回的是页面」（-3002）不在这里：重登帮不上忙。
         if (
             status == HTTP_STATUS_UNAUTHORIZED
             or parsed.get("code") in _LOGIN_REQUIRED_CODES

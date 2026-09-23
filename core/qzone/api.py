@@ -13,7 +13,11 @@ from typing import Any
 from astrbot.api import logger
 
 from .client import QzoneHttpClient
-from .constants import QZONE_CODE_IMAGE_EXPIRED, QZONE_CODE_UNKNOWN
+from .constants import (
+    QZONE_CODE_IMAGE_EXPIRED,
+    QZONE_CODE_UNKNOWN,
+    QZONE_INTERNAL_META_KEY,
+)
 from .model import USER_AGENT, ApiResponse
 from .parser import QzoneParser
 
@@ -43,8 +47,11 @@ class QzoneAPI(QzoneHttpClient):
         "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
         "/cgi-bin/emotion_cgi_re_feeds"
     )
+    # 回复评论用与评论相同的 user 域 CGI（只多了 commentId / commentUin）。
+    # 曾用 h5.qzone.qq.com：那里返回的是 h5 的 JS 框架页而不是数据，会被误判成登录失效
+    # 并触发无用的重登重试，因此固定走 user 域这条已验证可用的路径。
     REPLY_URL = (
-        "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
+        "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
         "/cgi-bin/emotion_cgi_re_feeds"
     )
     DETAIL_URL = (
@@ -320,12 +327,13 @@ class QzoneAPI(QzoneHttpClient):
             统一响应对象。
         """
         ctx = await self.session.get_ctx()
+        topic_id = f"{uin}_{tid}__1"
         raw = await self.request(
             "POST",
             self.REPLY_URL,
             params={"g_tk": ctx.gtk},
             data={
-                "topicId": f"{uin}_{tid}__1",
+                "topicId": topic_id,
                 "uin": ctx.uin,
                 "hostUin": uin,
                 "feedsType": 100,
@@ -345,9 +353,20 @@ class QzoneAPI(QzoneHttpClient):
                 "paramstr": 2,
                 "qzreferrer": f"{self.BASE_URL}/{ctx.uin}/main",
             },
-            headers=self._h5_headers(),
         )
-        return ApiResponse.from_raw(raw)
+        resp = ApiResponse.from_raw(raw)
+        if not resp.ok:
+            # 评论 id 属于公开数据：把实际请求参数与响应片段写进日志，便于下次一眼判断
+            meta = raw.get(QZONE_INTERNAL_META_KEY)
+            snippet = ""
+            if isinstance(meta, dict):
+                snippet = str(meta.get("snippet") or "")
+            logger.error(
+                f"回复评论失败: url={self.REPLY_URL}｜topicId={topic_id}"
+                f"｜commentId={comment_tid}｜commentUin={comment_uin}"
+                f"｜原因={resp.message or resp.code}｜响应片段: {snippet}"
+            )
+        return resp
 
     async def get_detail(self, tid: str) -> ApiResponse:
         """取一条说说的详情，用于拿列表接口没带全的评论明细。
