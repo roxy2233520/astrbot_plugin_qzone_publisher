@@ -5733,7 +5733,7 @@ async def main() -> int:
     plugin.api.FEEDS_URL = "http://127.0.0.1:8792/feeds"
     plugin.api.DETAIL_URL = "http://127.0.0.1:8792/detail"
     plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
-    plugin.cfg.set("interact_reply_cron", "0,30 12-13,20-22 * * *")
+    plugin.cfg.set("interact_reply_cron", "0,30 12-13,20-23 * * *")
     plugin.cfg.set("interact_reply_jitter", 120)
     plugin.cfg.set("interact_reply_days", 7)
     plugin.cfg.set("interact_cron", "0 21 * * *")
@@ -5742,7 +5742,7 @@ async def main() -> int:
     check(
         "回复巡检按自己的时间配置调度",
         plugin.reply_task.name == "qzone_reply"
-        and cron == "0,30 12-13,20-22 * * *"
+        and cron == "0,30 12-13,20-23 * * *"
         and plugin.reply_task.running,
         f"{plugin.reply_task.name}/{cron}/{plugin.reply_task.running}",
     )
@@ -5761,7 +5761,7 @@ async def main() -> int:
     check(
         "巡检间隔的人话说明含时段、下一轮与最坏延迟",
         "每 30 分钟一轮" in plugin.interact_reply_interval_text()
-        and "时段：每天 12:00-14:00、20:00-23:00"
+        and "时段：每天 12:00-14:00、20:00-24:00"
         in plugin.interact_reply_interval_text()
         and "下一轮" in plugin.interact_reply_interval_text()
         and "最坏延迟：时段内 30 分钟 + 抖动 120 秒"
@@ -5778,8 +5778,8 @@ async def main() -> int:
         f"{fresh_cfg.interact_reply_days}/{fresh_cfg.interact_days}",
     )
     check(
-        "回复巡检默认只在中午与晚上两个时段、每 30 分钟一轮",
-        fresh_cfg.interact_reply_cron == "0,30 12-13,20-22 * * *"
+        "回复巡检默认只在中午与晚上两个时段、每 30 分钟一轮（晚上到 24:00）",
+        fresh_cfg.interact_reply_cron == "0,30 12-13,20-23 * * *"
         and fresh_cfg.interact_reply_jitter == 120,
         f"{fresh_cfg.interact_reply_cron}/{fresh_cfg.interact_reply_jitter}",
     )
@@ -5876,7 +5876,7 @@ async def main() -> int:
         and plugin.reply_task.running
         and any("下次巡检" in item for item in out)
         and any("每 30 分钟一轮" in item for item in out)
-        and any("时段：每天 12:00-14:00、20:00-23:00" in item for item in out)
+        and any("时段：每天 12:00-14:00、20:00-24:00" in item for item in out)
         and any("最坏延迟" in item for item in out),
         str(out)[:240],
     )
@@ -5892,7 +5892,7 @@ async def main() -> int:
         "状态里的评论回复行含巡检间隔与窗口",
         any(
             "评论回复" in item
-            and "巡检 0,30 12-13,20-22 * * *" in item
+            and "巡检 0,30 12-13,20-23 * * *" in item
             and "窗口 7 天" in item
             for item in out
         ),
@@ -5942,7 +5942,7 @@ async def main() -> int:
     reply_cron = plugin.reply_task.cron or ""
     check(
         "默认巡检时段归纳为中午与晚上两段",
-        _window_text(reply_cron) == "每天 12:00-14:00、20:00-23:00",
+        _window_text(reply_cron) == "每天 12:00-14:00、20:00-24:00",
         _window_text(reply_cron),
     )
 
@@ -5951,7 +5951,7 @@ async def main() -> int:
         hour, minute = (int(item) for item in text.split(":"))
         return datetime(2026, 9, 24, hour, minute, tzinfo=tz) - timedelta(minutes=1)
 
-    for hit in ("12:00", "13:30", "20:00", "22:30"):
+    for hit in ("12:00", "13:30", "20:00", "23:30"):
         got = _next_moment(reply_cron, _moment_before(hit))
         check(
             f"{hit} 是巡检时刻",
@@ -5963,7 +5963,7 @@ async def main() -> int:
         ("11:30", "12:00"),
         ("14:30", "20:00"),
         ("19:30", "20:00"),
-        ("23:30", "次日 12:00"),
+        ("00:00", "12:00"),
     ):
         base = _moment_before(miss)
         got = _next_moment(reply_cron, base)
@@ -5986,14 +5986,14 @@ async def main() -> int:
         plugin.next_reply_run_text(now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)),
     )
     check(
-        "23:40 的下一轮是次日中午 12:00",
+        "23:40（已过最后一轮 23:30）的下一轮是次日中午 12:00",
         plugin.next_reply_run_text(now=datetime(2026, 9, 24, 23, 40, tzinfo=tz))
         == "次日 12:00",
         plugin.next_reply_run_text(now=datetime(2026, 9, 24, 23, 40, tzinfo=tz)),
     )
     check(
         "间隔说明里也会给出时段与下一轮",
-        "时段：每天 12:00-14:00、20:00-23:00"
+        "时段：每天 12:00-14:00、20:00-24:00"
         in plugin.interact_reply_interval_text(
             now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)
         )
