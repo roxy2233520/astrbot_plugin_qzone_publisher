@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-478%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-493%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -36,9 +36,9 @@
 | 说说互动 | 定时读取关注 QQ 号**最近 N 天内最新的一条**说说（`interact_days`，**默认只读**）；最新一条超出窗口就整体跳过，不去评论几天前的老说说。可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
 | 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限，默认先转草稿确认 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
-| 定时问候 | 按时间给指定用户**私聊**发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
-| 节日祝福 | 节日当天给指定用户**私聊**发一条祝福（`holiday_enabled`，**默认关闭**）：支持除夕、春节、元宵、情人节、七夕、中秋、国庆共 7 个节日，当天不是节日不发，同一节日只发一次 |
-| 用户同意 | 主动消息默认**需要对方同意**：用户第一次私聊会收到一条简短说明，可用 `/私聊开` 与 `/私聊关` 开启、关闭（也可只针对某一项）；未接受的人不会被主动打扰 |
+| 定时问候 | 按时间给**已同意接收的用户**私聊发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
+| 节日祝福 | 节日当天给**已同意接收节日祝福的用户**私聊发一条祝福（`holiday_enabled`，**默认关闭**）：支持除夕、春节、元宵、情人节、七夕、中秋、国庆共 7 个节日，当天不是节日不发，同一节日只发一次 |
+| 用户同意 | 主动消息默认**需要对方同意**：用户第一次私聊会收到一条简短说明，可用 `/私聊开` 与 `/私聊关` 开启、关闭（也可只针对某一项）；未接受的人不会被主动打扰。早安、晚安、节日祝福的收件人口径完全一致 |
 | 运维 | 发布历史、失败通知、`/空间状态` 一屏看全、`/空间删除` 按 tid 删说说 |
 
 ---
@@ -171,7 +171,7 @@
 | `active_msg_require_optin` | `true` | 主动消息需要用户同意：开启时只有接受过的用户会收到，见本节末尾 |
 | `greet_enabled` | `false` | 早安 / 晚安总开关，也可用 `/空间问候 on` 打开 |
 | `holiday_enabled` | `false` | 节日祝福总开关（默认关闭） |
-| `greet_users` | `[]` | 问候与祝福对象的 QQ 号，例如 `["123456"]` |
+| `greet_users` | `[]` | 早安 / 晚安的收件人 QQ 号，例如 `["123456"]`；**仅当 `active_msg_require_optin` 关闭时生效**（开启时改为发给已同意接收的用户，见本节末尾） |
 | `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
 | `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
 | `holiday_cron` | `0 9 * * *` | 节日祝福时间；当天不是内置节日则不发送 |
@@ -279,7 +279,7 @@
 | `active_msg_require_optin` | `true` | 主动消息需要用户同意：**开启时只有用 `/私聊开` 明确接受过的用户才会收到**早安、晚安与节日祝福；未接受的人被跳过并计入「因未接受主动消息跳过」 |
 | `greet_enabled` | `false` | 早安 / 晚安总开关，也可用 `/空间问候 on` 打开 |
 | `holiday_enabled` | `false` | 节日祝福总开关（默认关闭，见下方说明） |
-| `greet_users` | `[]` | **早安 / 晚安**的对象 QQ 号，例如 `["123456"]`；节日祝福不依赖它，见下方说明 |
+| `greet_users` | `[]` | 早安 / 晚安的收件人 QQ 号，例如 `["123456"]`；**仅当 `active_msg_require_optin` 关闭时生效**，见下方说明 |
 | `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
 | `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
 | `holiday_cron` | `0 9 * * *` | 节日祝福的发送时间；当天不是内置节日则不发送 |
@@ -300,9 +300,13 @@
   超出范围的年份会写 warning 日志提醒更新，不会静默失效（农历节日在表外年份不触发）。
 - 固定公历节日 2 个：情人节（2 月 14 日）、国庆（10 月 1 日），任何年份都生效。
 
-**收件人口径**：早安 / 晚安发给 `greet_users` 里配置的对象；**节日祝福发给「已同意接收节日祝福」的用户**
-（即偏好记录里 `opted_in` 为真、且没有单独关掉「节日」的人），不依赖 `greet_users`。
-`active_msg_require_optin` 关闭时，节日祝福退回按 `greet_users` 发送。
+**收件人口径（早安 / 晚安 / 节日祝福统一）**：
+
+- `active_msg_require_optin` **开启**（默认）时，收件人 = **已在 `/私聊开` 接受过、且没有单独关掉该项的用户**
+  （早安看 `早安` 开关、晚安看 `晚安` 开关、节日祝福看 `节日` 开关）；此时**不读 `greet_users`**。
+- `active_msg_require_optin` **关闭**时，退回按 `greet_users` 发送，不检查偏好。
+- 管理员手动测试（`/空间问候 morning <QQ>`、`/空间问候 holiday [QQ]`）是**显式指定对象**的动作，
+  不受偏好限制，可直接发给指定的 QQ。
 
 是否先转草稿确认沿用 `draft_for_greet`。
 
@@ -405,7 +409,7 @@
 | `/私聊关 [早安\|晚安\|节日]` | 所有人 | 关闭主动私聊消息：不带参数关闭全部，带参数只关该项 |
 | `/空间用量 [天数]` | 管理员 | 查看 AI token 用量估算（按功能分组） |
 | `/空间管理员 [add\|remove] <QQ>` | 管理员 | 查看或维护插件内管理员名单 |
-| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` / `/空间问候 holiday [QQ]` | 管理员 | 开关定时问候 / 立刻测试发一条（**不占用当日定时名额**，回报实际发送地址）/ 测试节日祝福（忽略当天是否节日与当日去重） |
+| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` / `/空间问候 holiday [QQ]` | 管理员 | 开关定时问候 / 立刻测试发一条（**不占用当日定时名额**，**指定 QQ 时不受主动消息偏好限制**，回报实际发送地址）/ 测试节日祝福（忽略当天是否节日与当日去重） |
 | `/空间重登` | 管理员 | 强制重取 Cookie |
 | `/空间定时 [时间点…]` | 管理员 | 查看或设置发布时间：`08:30,12:30,21:00`（多个时间点）、`每天 2 08:30,12:30`（只发前 2 个）、`30 8 * * *`（单个 Cron）、`off`（关闭） |
 | `/空间开关 [on\|off]` | 管理员 | 定时发布开关 |
@@ -523,10 +527,10 @@ A：先看 `/空间状态` 的「管理员」那一行。两边都没配就会�
 **Q：开了定时问候但没收到？**
 A：按这个顺序查：
 
-1. `/空间状态` 看「定时问候」那几行：开关是否为开、有没有配 `greet_users`、
-   **今日已发几人**（如果是 1，说明这个时段已经发过了，今天不会再发），
+1. `/空间状态` 看「定时问候」那几行：开关是否为开、**收件人来源**（已同意的用户 / `greet_users`）、
+   **本次将发给几人（已同意）**、**今日已发几人**（如果是 1，说明这个时段已经发过了，今天不会再发），
    以及「发送地址」这一行——它应该形如 `睦:FriendMessage:你的QQ`（`睦` 是你在 AstrBot 里
-   给这个 OneBot 平台实例起的 id）。
+   给这个 OneBot 平台实例起的 id）。人数为 0 时会直接提示原因。
 2. 看插件日志里 `[greet]` 那几行：`已发送给 xxx（umo=…）` 才是真的发出去了；
    出现 `未发出：AstrBot 没有找到平台会话` 或 `发送异常` 就是失败，会写明原因。
 3. 如果日志说发送成功、你却没收到：那是**协议端（NapCat / Lagrange）或 QQ 侧**的问题，
@@ -572,7 +576,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 478 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 493 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

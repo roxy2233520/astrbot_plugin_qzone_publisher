@@ -419,6 +419,7 @@ class GreetingService:
         force: bool = False,
         record: bool = True,
         feature: str = "",
+        check_optin: bool = True,
     ) -> GreetResult:
         """生成并发送一次问候。
 
@@ -429,6 +430,7 @@ class GreetingService:
             record: 是否写入「今日已问候」记录。手动测试应传 False，
                 否则会把当天的自动问候名额用掉，定时任务到点会直接跳过。
             feature: 用于用户偏好检查的功能标识；留空表示不检查偏好。
+            check_optin: 为 False 时跳过偏好检查（管理员手动指定对象时使用）。
 
         Returns:
             GreetResult 汇总。
@@ -454,6 +456,7 @@ class GreetingService:
             force=force,
             record=record,
             feature=feature or slot.key,
+            check_optin=check_optin,
         )
         return result
 
@@ -494,6 +497,7 @@ class GreetingService:
         targets: list[str] | None = None,
         force: bool = False,
         record: bool = True,
+        check_optin: bool = True,
     ) -> GreetResult:
         """发送一次传统节日祝福。
 
@@ -502,6 +506,7 @@ class GreetingService:
             targets: 覆盖本次目标；缺省用配置里的 greet_users。
             force: 为 True 时忽略「今天不是节日」与当日去重（手动测试用）。
             record: 是否写入当日记录。
+            check_optin: 为 False 时跳过偏好检查（管理员手动指定对象时使用）。
 
         Returns:
             GreetResult 汇总；当天不是节日且未 force 时，结果里只有一条说明。
@@ -531,6 +536,7 @@ class GreetingService:
             force=force,
             record=record,
             feature=HOLIDAY_KEY,
+            check_optin=check_optin,
         )
         return result
 
@@ -577,8 +583,19 @@ class GreetingService:
         force: bool,
         record: bool = True,
         feature: str = "",
+        check_optin: bool = True,
     ) -> None:
-        """逐个私聊发送并记录去重状态。"""
+        """逐个私聊发送并记录去重状态。
+
+        Args:
+            result: 本次汇总。
+            watch: 收件人列表。
+            slot_key: 去重用的时段标识。
+            force: 为 True 时忽略当日去重。
+            record: 是否写入当日记录。
+            feature: 用于偏好检查的功能标识；留空表示不检查。
+            check_optin: 为 False 时跳过偏好检查（管理员手动指定对象时使用）。
+        """
         platform_id = str(self._platform_id_provider() or "").strip()
         if not platform_id and self._umo_resolver is None:
             result.errors.append(
@@ -588,7 +605,7 @@ class GreetingService:
             return
 
         for qq in watch:
-            if feature and not self._allowed(qq, feature):
+            if check_optin and feature and not self._allowed(qq, feature):
                 result.blocked += 1
                 logger.info(f"[greet] {qq} 未接受主动消息（{feature}），本次跳过")
                 continue

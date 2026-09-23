@@ -69,8 +69,8 @@
         "default": false
       },
       "greet_users": {
-        "description": "问候对象（QQ 号）",
-        "hint": "要问候谁的 QQ 号，例如 [\"123456\"]。留空则不会发送，/空间状态 里会提示",
+        "description": "早安 / 晚安对象（仅同意机制关闭时生效）",
+        "hint": "只在「主动消息需要用户同意」（active_msg_require_optin）关闭时生效；开启时改为发给已在 /私聊开 接受过、且没有单独关掉该项的用户",
         "type": "list",
         "default": []
       },

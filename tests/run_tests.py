@@ -2557,8 +2557,8 @@ async def main() -> int:
 
     out = await collect(plugin.cmd_greet(FakeEvent(), ""))
     check(
-        "问候指令显示开关与对象",
-        any("问候开关" in item and "问候对象" in item for item in out),
+        "问候指令显示开关与收件人来源",
+        any("问候开关" in item and "收件人" in item for item in out),
         str(out)[:140],
     )
     out = await collect(plugin.cmd_greet(FakeEvent(), "afternoon"))
@@ -2941,6 +2941,7 @@ async def main() -> int:
     plugin.cfg.set("admin_uins", ["20001"])  # 管理员与问候对象分开，便于区分发给谁
     plugin.cfg.set("greet_users", ["10001"])
     plugin.prefs.set_opted_in("10001", True)  # 草稿模式同样只在对方接受后才发
+    plugin.prefs.set_feature("10002", "morning", False)  # 让早安收件人只剩 10001
     plugin.cfg.set("greet_use_ai", False)
     plugin.cfg.set("greet_morning_pool", ["早上好呀"])
     plugin.drafts.clear()
@@ -4281,21 +4282,21 @@ async def main() -> int:
     plugin.prefs.set_opted_in("10032", False)
     check(
         "节日收件人只含已同意且未关掉节日的用户",
-        plugin._holiday_targets() == ["10030"],
-        str(plugin._holiday_targets()),
+        plugin._feature_targets("holiday") == ["10030"],
+        str(plugin._feature_targets("holiday")),
     )
     check(
         "未回答与已拒绝都不在收件人里",
-        "10032" not in plugin._holiday_targets()
-        and "10033" not in plugin._holiday_targets(),
-        str(plugin._holiday_targets()),
+        "10032" not in plugin._feature_targets("holiday")
+        and "10033" not in plugin._feature_targets("holiday"),
+        str(plugin._feature_targets("holiday")),
     )
 
     plugin.greet._sent.clear()
     StarTools.sent.clear()
     holiday_targets = await plugin.greet.send_holiday(
         value_date=date(2026, 9, 25),
-        targets=plugin._holiday_targets(),
+        targets=plugin._feature_targets("holiday"),
         force=True,
         record=False,
     )
@@ -4315,8 +4316,90 @@ async def main() -> int:
     plugin.cfg.set("active_msg_require_optin", False)
     check(
         "关闭同意机制时节日祝福退回 greet_users",
-        plugin._holiday_targets() == ["10030", "10031", "10032", "10033"],
-        str(plugin._holiday_targets()),
+        plugin._feature_targets("holiday") == ["10030", "10031", "10032", "10033"],
+        str(plugin._feature_targets("holiday")),
+    )
+    plugin.cfg.set("active_msg_require_optin", True)
+
+    # 早安 / 晚安与节日祝福统一口径
+    plugin.cfg.set("greet_enabled", True)
+    plugin.cfg.set("greet_use_ai", False)
+    plugin.cfg.set("greet_morning_pool", ["早上好呀"])
+    plugin.cfg.set("greet_users", ["10030", "10031", "10032", "10033"])
+    plugin.cfg.set("active_msg_require_optin", True)
+
+    def greet_recipients() -> list[str]:
+        """只取发给 1003x 这些测试对象的私聊，排除给管理的通知。"""
+        return [item[0] for item in StarTools.sent if "FriendMessage:1003" in item[0]]
+
+    check(
+        "早安收件人 = 已同意且未关掉早安的用户",
+        plugin._feature_targets("morning") == ["10030", "10031"],
+        str(plugin._feature_targets("morning")),
+    )
+    check(
+        "晚安收件人单独计算（可被单独关掉）",
+        plugin._feature_targets("night") == ["10030", "10031"],
+        str(plugin._feature_targets("night")),
+    )
+    plugin.prefs.set_feature("10031", "night", False)
+    check(
+        "关掉晚安后晚安收件人随之减少",
+        plugin._feature_targets("night") == ["10030"],
+        str(plugin._feature_targets("night")),
+    )
+    plugin.prefs.set_feature("10031", "night", True)
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._run_greet("morning")
+    morning_recipients = greet_recipients()
+    check(
+        "早安只发给已同意的人",
+        morning_recipients
+        == ["aiocqhttp:FriendMessage:10030", "aiocqhttp:FriendMessage:10031"],
+        str(morning_recipients),
+    )
+    check(
+        "即使 greet_users 里填了该人也不发",
+        "aiocqhttp:FriendMessage:10032" not in morning_recipients
+        and "aiocqhttp:FriendMessage:10033" not in morning_recipients,
+        str(morning_recipients),
+    )
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._run_greet("night")
+    night_recipients = greet_recipients()
+    check(
+        "晚安发给已同意且未关掉晚安的人",
+        night_recipients
+        == [
+            "aiocqhttp:FriendMessage:10030",
+            "aiocqhttp:FriendMessage:10031",
+        ],
+        str(night_recipients),
+    )
+
+    plugin.cfg.set("active_msg_require_optin", False)
+    check(
+        "关闭同意机制时早安退回 greet_users",
+        plugin._feature_targets("morning") == ["10030", "10031", "10032", "10033"],
+        str(plugin._feature_targets("morning")),
+    )
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._run_greet("morning")
+    check(
+        "退回后按 greet_users 全发（含未同意者）",
+        greet_recipients()
+        == [
+            "aiocqhttp:FriendMessage:10030",
+            "aiocqhttp:FriendMessage:10031",
+            "aiocqhttp:FriendMessage:10032",
+            "aiocqhttp:FriendMessage:10033",
+        ],
+        str(greet_recipients()),
     )
     plugin.cfg.set("active_msg_require_optin", True)
 
@@ -4326,21 +4409,71 @@ async def main() -> int:
         any("本次将发给 1 人（已同意）" in item for item in out),
         str(out)[:260],
     )
+    check(
+        "状态里显示早安与晚安的将发人数",
+        any("本次将发给 1 人（已同意）" in item for item in out)
+        and any("本次将发给 2 人（已同意）" in item for item in out),
+        str(out)[:300],
+    )
+    check(
+        "状态里写明收件人来源",
+        any("收件人 已同意的用户" in item for item in out),
+        str(out)[:260],
+    )
     out = await collect(plugin.cmd_greet(FakeEvent(), ""))
     check(
         "问候状态里也显示将发给几人",
-        any("将发给 1 人（已同意）" in item for item in out),
-        str(out)[:260],
+        any(
+            "将发给 1 人（已同意）" in item and "将发给 2 人（已同意）" in item
+            for item in out
+        ),
+        str(out)[:300],
+    )
+
+    # 管理员手动指定 QQ 时不受偏好限制
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    out = await collect(plugin.cmd_greet(FakeEvent(), "morning 10033"))
+    check(
+        "手动测试可直接发给未同意的 QQ",
+        "aiocqhttp:FriendMessage:10033" in [item[0] for item in StarTools.sent]
+        and any("成功 1 人" in item for item in out),
+        f"{str(out)[:120]}/{StarTools.sent}",
     )
 
     saved_users = plugin.prefs._users
     plugin.prefs._users = {}
     plugin.cfg.set("holiday_enabled", True)
+    plugin.cfg.set("greet_enabled", True)
     out = await collect(plugin.cmd_status(FakeEvent()))
     check(
         "无人同意时状态明确提示",
         any("目前没有已同意接收节日祝福的用户" in item for item in out),
         str(out)[:260],
+    )
+    check(
+        "无人同意时早安晚安也有提示",
+        any("目前没有已同意接收早安的用户" in item for item in out)
+        and any("目前没有已同意接收晚安的用户" in item for item in out),
+        str(out)[:300],
+    )
+    check(
+        "提示里给出 /私聊开 的引导",
+        any("/私聊开 接受" in item for item in out),
+        str(out)[:300],
+    )
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._run_greet("morning")
+    check(
+        "无人同意时定时问候不发给任何人",
+        greet_recipients() == [],
+        str(greet_recipients()),
+    )
+    check(
+        "无人同意时给管理员发提示",
+        "aiocqhttp:FriendMessage:123456" in [item[0] for item in StarTools.sent],
+        str([item[0] for item in StarTools.sent]),
     )
     check(
         "无人同意时人数为 0",

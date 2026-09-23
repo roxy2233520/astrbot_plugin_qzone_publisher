@@ -371,42 +371,43 @@ class QzonePublisherPlugin(Star):
             return True
         return self.prefs.allowed(qq, feature)
 
-    def _allowed_targets(self, feature: str) -> tuple[list[str], int]:
-        """按「主动消息需要同意」过滤问候目标（草稿模式使用）。
+    def _feature_targets(self, feature: str) -> list[str]:
+        """取某个主动消息功能的收件人（早安 / 晚安 / 节日祝福共用一份口径）。
 
-        草稿模式不经过发送服务的逐个校验，所以要在这里先过滤，
-        否则未接受主动消息的人会在确认草稿后收到消息。
+        ``active_msg_require_optin`` 开启时：收件人 = 已接受、且没有单独关掉该功能的用户
+        （不再读 ``greet_users``）；关闭时：退回按 ``greet_users`` 发送，不检查偏好。
 
         Args:
-            feature: 功能标识。
+            feature: 功能标识（morning / night / holiday）。
 
         Returns:
-            (允许发送的 QQ 列表, 因未接受而跳过的人数)。
-        """
-        if feature == HOLIDAY_KEY:
-            # 节日祝福的收件人本来就只有「已同意且没关掉节日」的人
-            return self._holiday_targets(), 0
-
-        targets = list(self.greet.targets)
-        if not bool(self.cfg.active_msg_require_optin):
-            return targets, 0
-        allowed = [qq for qq in targets if self.prefs.allowed(qq, feature)]
-        return allowed, len(targets) - len(allowed)
-
-    def _holiday_targets(self) -> list[str]:
-        """节日祝福的收件人：已同意接收、且没有单独关掉「节日」的用户。
-
-        ``active_msg_require_optin`` 关闭时退回按 ``greet_users`` 发送（与旧版一致）。
-
-        Returns:
-            收件人 QQ 列表。
+            收件人 QQ 列表；没有可发送对象时返回空列表。
         """
         if not bool(self.cfg.active_msg_require_optin):
             return list(self.greet.targets)
-        return self.prefs.allowed_users(HOLIDAY_KEY)
+        return self.prefs.allowed_users(feature)
+
+    def _no_consent_note(self, slot_name: str, feature: str) -> str:
+        """开关为开但无人同意时的提示文案。
+
+        Args:
+            slot_name: 展示名（早安 / 晚安 / 节日祝福）。
+            feature: 功能标识。
+
+        Returns:
+            可直接展示与通知的提示文本。
+        """
+        label = FEATURE_LABELS.get(feature, slot_name)
+        return f"目前没有已同意接收{label}的用户，可在私聊里回复 /私聊开 接受"
 
     async def _draft_greet(
-        self, *, slot_key: str, slot_name: str, feature: str, text: str
+        self,
+        *,
+        slot_key: str,
+        slot_name: str,
+        feature: str,
+        text: str,
+        targets: list[str],
     ) -> None:
         """把问候或节日祝福转成待确认草稿。
 
@@ -415,12 +416,16 @@ class QzonePublisherPlugin(Star):
             slot_name: 展示名（早安 / 晚安 / 节日祝福）。
             feature: 用于用户偏好检查的功能标识。
             text: 已生成好的内容。
+            targets: 收件人列表（已按口径算好）。
         """
-        allowed, blocked = self._allowed_targets(feature)
-        if not allowed:
-            logger.info(f"{slot_name}：{blocked} 人未接受主动消息，没有可发送对象")
-            if bool(self.cfg.notify_enabled) and blocked:
-                await self._notify(f"{slot_name}没有发送：{blocked} 人未接受主动消息")
+        if not targets:
+            logger.info(f"{slot_name}：没有可发送对象")
+            if bool(self.cfg.notify_enabled) and bool(
+                self.cfg.active_msg_require_optin
+            ):
+                await self._notify(
+                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, feature)}"
+                )
             return
 
         draft = self.drafts.put(
@@ -428,13 +433,11 @@ class QzonePublisherPlugin(Star):
                 kind="greet",
                 text=text,
                 source=f"greet:{slot_key}",
-                targets=allowed,
+                targets=list(targets),
             )
         )
         await self._send_draft(draft)
         await self._arm_draft_timer(draft)
-        if blocked:
-            logger.info(f"{slot_name}草稿已生成：{blocked} 人未接受主动消息，已排除")
 
     async def _report_greet(self, slot_name: str, result) -> None:
         """问候类任务的统一通知。"""
@@ -471,8 +474,6 @@ class QzonePublisherPlugin(Star):
         parts.append(
             f"今日已发 {self.greet.sent_today(f'holiday:{today.isoformat()}')} 人"
         )
-        if bool(self.cfg.holiday_enabled) and not self.greet.targets:
-            parts.append("⚠️ 还没配置 greet_users，节日祝福不会发出")
         return "｜".join(parts)
 
     def _guidance_text(self) -> str:
@@ -556,14 +557,23 @@ class QzonePublisherPlugin(Star):
     async def _run_greet(self, slot_key: str) -> None:
         """执行一次问候：草稿确认开启时先转草稿，否则直接发送。
 
+        收件人口径与节日祝福一致：同意机制开启时只发给已接受且没关掉该项的用户。
+
         Args:
             slot_key: 时段标识（morning / night）。
         """
         slot = self.greet.slot_of(slot_key)
         slot_name = slot.name if slot else slot_key
+        targets = self._feature_targets(slot_key)
 
-        if not self.greet.targets:
-            logger.info("未配置 greet_users，跳过本次问候")
+        if not targets:
+            logger.info(f"{slot_name}：没有可发送对象，跳过本次问候")
+            if bool(self.cfg.notify_enabled) and bool(
+                self.cfg.active_msg_require_optin
+            ):
+                await self._notify(
+                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, slot_key)}"
+                )
             return
 
         if bool(self.cfg.draft_for_greet):
@@ -574,12 +584,16 @@ class QzonePublisherPlugin(Star):
                 await self._notify(f"{slot_name}问候失败：内容生成异常\n{e}")
                 return
             await self._draft_greet(
-                slot_key=slot_key, slot_name=slot_name, feature=slot_key, text=text
+                slot_key=slot_key,
+                slot_name=slot_name,
+                feature=slot_key,
+                text=text,
+                targets=targets,
             )
             return
 
         try:
-            result = await self.greet.send(slot_key, feature=slot_key)
+            result = await self.greet.send(slot_key, targets=targets, feature=slot_key)
         except Exception as e:
             logger.error(f"问候发送失败: {e}")
             return
@@ -589,7 +603,7 @@ class QzonePublisherPlugin(Star):
     async def _run_holiday(self) -> None:
         """执行一次节日祝福：收件人是已同意接收节日祝福的用户，当天不是节日就不发送。"""
         slot_name = "节日祝福"
-        targets = self._holiday_targets()
+        targets = self._feature_targets(HOLIDAY_KEY)
 
         if not targets:
             logger.info("没有已同意接收节日祝福的用户，跳过本次节日祝福")
@@ -597,8 +611,7 @@ class QzonePublisherPlugin(Star):
                 self.cfg.active_msg_require_optin
             ):
                 await self._notify(
-                    f"{slot_name}没有发送：目前没有已同意接收节日祝福的用户"
-                    "（对方可用 /私聊开 开通）"
+                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, HOLIDAY_KEY)}"
                 )
             return
 
@@ -617,6 +630,7 @@ class QzonePublisherPlugin(Star):
                 slot_name=slot_name,
                 feature=HOLIDAY_KEY,
                 text=text,
+                targets=targets,
             )
             return
 
@@ -1130,39 +1144,38 @@ class QzonePublisherPlugin(Star):
         night = self.greet.slot_of("night")
         lines.append(
             f"定时问候: {'开启' if bool(self.cfg.greet_enabled) else '关闭'}"
-            f"｜对象 {len(self.greet.targets)} 人"
+            f"｜收件人 {'已同意的用户' if bool(self.cfg.active_msg_require_optin) else 'greet_users'}"
             f"｜内容 {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
         )
-        if morning is not None:
+        for slot, task in (
+            (morning, self.greet_morning_task),
+            (night, self.greet_night_task),
+        ):
+            if slot is None:
+                continue
+            slot_targets = self._feature_targets(slot.key)
             lines.append(
-                f"　{morning.name}: {self.greet_morning_task.cron or '未设置'}"
-                f"（下次 {self.greet_morning_task.next_run_time}）"
-                f"｜今日已发 {self.greet.sent_today(morning.key)} 人"
+                f"　{slot.name}: {task.cron or '未设置'}"
+                f"（下次 {task.next_run_time}）"
+                f"｜今日已发 {self.greet.sent_today(slot.key)} 人"
+                f"｜本次将发给 {len(slot_targets)} 人（已同意）"
             )
-        if night is not None:
-            lines.append(
-                f"　{night.name}: {self.greet_night_task.cron or '未设置'}"
-                f"（下次 {self.greet_night_task.next_run_time}）"
-                f"｜今日已发 {self.greet.sent_today(night.key)} 人"
-            )
-        if bool(self.cfg.greet_enabled) and not self.greet.targets:
-            lines.append("　⚠️ 还没配置 greet_users，问候不会发出")
-        if self.greet.targets:
-            lines.append(f"　发送地址: {self.greet.umo_for(self.greet.targets[0])}")
+            if bool(self.cfg.greet_enabled) and not slot_targets:
+                lines.append(f"　⚠️ {self._no_consent_note(slot.name, slot.key)}")
+        sample_targets = self._feature_targets("morning") or self.greet.targets
+        if sample_targets:
+            lines.append(f"　发送地址: {self.greet.umo_for(sample_targets[0])}")
 
         upcoming = days_until(datetime.now(self.cfg.timezone).date())
         holiday_text = self.greet_holiday_status(upcoming)
-        holiday_targets = self._holiday_targets()
+        holiday_targets = self._feature_targets(HOLIDAY_KEY)
         lines.append(
             f"节日祝福: {'开启' if bool(self.cfg.holiday_enabled) else '关闭'}"
             f"｜{holiday_text}"
             f"｜本次将发给 {len(holiday_targets)} 人（已同意）"
         )
         if bool(self.cfg.holiday_enabled) and not holiday_targets:
-            lines.append(
-                "　⚠️ 目前没有已同意接收节日祝福的用户，节日祝福不会发出"
-                "（对方可用 /私聊开 开通）"
-            )
+            lines.append(f"　⚠️ {self._no_consent_note('节日祝福', HOLIDAY_KEY)}")
 
         stats = self.prefs.stats()
         lines.append(
@@ -1696,23 +1709,45 @@ class QzonePublisherPlugin(Star):
             morning = self.greet.slot_of("morning")
             night = self.greet.slot_of("night")
             upcoming = days_until(datetime.now(self.cfg.timezone).date())
-            yield event.plain_result(
+            require_optin = bool(self.cfg.active_msg_require_optin)
+            lines = [
                 f"问候开关: {'开' if bool(self.cfg.greet_enabled) else '关'}"
-                f"｜内容来源: {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}\n"
-                f"问候对象: {'、'.join(self.greet.targets) or '（未配置 greet_users）'}\n"
-                f"{morning.name if morning else '早安'}: {self.greet_morning_task.cron or '未设置'}"
-                f"（下次 {self.greet_morning_task.next_run_time}）"
-                f"｜{night.name if night else '晚安'}: {self.greet_night_task.cron or '未设置'}"
-                f"（下次 {self.greet_night_task.next_run_time}）\n"
+                f"｜内容来源: {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
+                f"｜收件人: {'已同意的用户' if require_optin else 'greet_users'}"
+            ]
+            for slot, task in (
+                (morning, self.greet_morning_task),
+                (night, self.greet_night_task),
+            ):
+                if slot is None:
+                    continue
+                slot_targets = self._feature_targets(slot.key)
+                lines.append(
+                    f"{slot.name}: {task.cron or '未设置'}"
+                    f"（下次 {task.next_run_time}）"
+                    f"｜本次将发给 {len(slot_targets)} 人（已同意）"
+                )
+                if bool(self.cfg.greet_enabled) and not slot_targets:
+                    lines.append(f"　⚠️ {self._no_consent_note(slot.name, slot.key)}")
+            holiday_targets = self._feature_targets(HOLIDAY_KEY)
+            lines.append(
                 f"节日祝福: {'开' if bool(self.cfg.holiday_enabled) else '关'}"
                 f"｜{self.greet_holiday_status(upcoming)}"
-                f"｜将发给 {len(self._holiday_targets())} 人（已同意）\n"
-                f"主动消息同意: {'需要' if bool(self.cfg.active_msg_require_optin) else '不需要'}"
-                f"（用户可用 /私聊开 或 /私聊关 自行设置）\n"
+                f"｜本次将发给 {len(holiday_targets)} 人（已同意）"
+            )
+            if bool(self.cfg.holiday_enabled) and not holiday_targets:
+                lines.append(f"　⚠️ {self._no_consent_note('节日祝福', HOLIDAY_KEY)}")
+            lines.append(
+                f"主动消息同意: {'需要' if require_optin else '不需要'}"
+                "（用户可用 /私聊开 或 /私聊关 自行设置）"
+            )
+            lines.append(
                 "用法: /空间问候 on|off 开关定时问候；"
-                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试（忽略当日去重）；"
+                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试"
+                "（忽略当日去重，且不受主动消息偏好限制）；"
                 "/空间问候 holiday 测试节日祝福"
             )
+            yield event.plain_result("\n".join(lines))
             return
 
         flag = parts[0].lower()
@@ -1730,9 +1765,10 @@ class QzonePublisherPlugin(Star):
                     return
                 yield event.plain_result(
                     f"定时问候已开启\n"
-                    f"早安: {morning_cron or '未设置'}（下次 {self.greet_morning_task.next_run_time}）\n"
-                    f"晚安: {night_cron or '未设置'}（下次 {self.greet_night_task.next_run_time}）\n"
-                    f"对象: {'、'.join(self.greet.targets) or '（还没配置 greet_users）'}"
+                    f"早安: {morning_cron or '未设置'}（下次 {self.greet_morning_task.next_run_time}）"
+                    f"｜本次将发给 {len(self._feature_targets('morning'))} 人（已同意）\n"
+                    f"晚安: {night_cron or '未设置'}（下次 {self.greet_night_task.next_run_time}）"
+                    f"｜本次将发给 {len(self._feature_targets('night'))} 人（已同意）"
                 )
                 return
 
@@ -1762,11 +1798,11 @@ class QzonePublisherPlugin(Star):
             who = "、".join(targets) if targets else "配置里的对象"
             yield event.plain_result(
                 f"正在发送节日祝福给 {who}"
-                "（测试发送：忽略今天是否节日、忽略当日去重）..."
+                "（测试发送：忽略今天是否节日、忽略当日去重，不受主动消息偏好限制）..."
             )
             try:
                 result = await self.greet.send_holiday(
-                    targets=targets or None, force=True, record=False
+                    targets=targets or None, force=True, record=False, check_optin=False
                 )
             except Exception as e:
                 yield event.plain_result(f"发送失败：{e}")
@@ -1775,13 +1811,19 @@ class QzonePublisherPlugin(Star):
             return
 
         yield event.plain_result(
-            f"正在发送{slot.name}问候给 {'、'.join(targets) if targets else '配置里的对象'}..."
+            f"正在发送{slot.name}问候给 {'、'.join(targets) if targets else '配置里的对象'}"
+            "（管理员手动发送，不受主动消息偏好限制）..."
         )
         try:
             # 手动发送不写「今日已问候」记录：否则会把当天的定时问候名额用掉，
-            # 到点时定时任务会认为已经发过而直接跳过（这正是「日志成功但没收到」的成因之一）
+            # 到点时定时任务会认为已经发过而直接跳过（这正是「日志成功但没收到」的成因之一）；
+            # 同时跳过偏好检查：这是管理员显式指定对象的动作
             result = await self.greet.send(
-                slot.key, targets=targets or None, force=True, record=False
+                slot.key,
+                targets=targets or None,
+                force=True,
+                record=False,
+                check_optin=False,
             )
         except Exception as e:
             yield event.plain_result(f"发送失败：{e}")
