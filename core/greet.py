@@ -20,10 +20,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import random
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -35,13 +36,34 @@ from .config import PluginConfig
 from .holidays import as_date, festival_of, next_festival
 from .ui import kv
 
+
+async def _default_pacer() -> None:
+    """默认的请求间隔：0.5~1 秒，避免连续拉取触发风控。"""
+    await asyncio.sleep(random.uniform(0.5, 1.0))
+
+
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
     from .llm import AIClient
+    from .nicknames import NicknameBook
+
+# 逐个对象分别生成内容时，所有提示词都必须带上的措辞安全约束
+SAFETY_RULES = (
+    "\n\n# 称呼与素材使用限制（必须遵守）\n"
+    "- 只能用对方的昵称作称呼或很温和的观察，不得基于昵称做联想式调侃\n"
+    "- 不得提及或暗示对方的外貌、性别、年龄、职业、地域、健康状况、经济情况、感情状态\n"
+    "- 不得拿昵称里的自嘲、梗、数字、符号开玩笑\n"
+    "- 昵称含敏感词、广告、乱码或明显不是名字时，一律不使用昵称，直接称呼「你」，"
+    "也不要评论昵称本身\n"
+    "- 不得暗示「我知道你的一切」这类越界表述\n"
+    "- 不得提到或暗示自己看过对方的说说，禁止「我看到你发的」「你最近发的那条」"
+    "这类表述；关于近况的素材只用来判断语气与话题，不必与问候内容相关\n"
+    "- 语气轻松、不冒犯，对方可以随时不理会"
+)
 
 DEFAULT_GREET_PROMPT = (
     "用你自己的说话风格，给一个你很在意的人写一句{slot}问候，"
     "一到两句话，自然、有温度，不要解释、不要加引号、不要提“问候”“说说”这类词。"
-)
+) + SAFETY_RULES
 
 # 节日祝福的功能标识（与用户偏好里的 features 键一致）
 HOLIDAY_KEY = "holiday"
@@ -52,7 +74,7 @@ CHAT_KEY = "chat"
 DEFAULT_HOLIDAY_PROMPT = (
     "用你自己的说话风格，给一个你很在意的人写一句{festival}祝福，"
     "一到两句话，自然、有温度，不要解释、不要加引号、不要分点或罗列。"
-)
+) + SAFETY_RULES
 
 DEFAULT_CHAT_OPEN_PROMPT = (
     "用你自己的说话风格，主动给一个熟悉的人发一两句轻松的搭话。\n"
@@ -61,7 +83,7 @@ DEFAULT_CHAT_OPEN_PROMPT = (
     "可以自然提一句你今天在做什么；"
     "给对方留出不理会的余地，不要追问对方为什么不回复；"
     "不要解释、不要加引号、不要分点或罗列。"
-)
+) + SAFETY_RULES
 
 # AI 不可用或返回为空时的兜底文案（内置，不占配置项）
 CHAT_FALLBACK_POOL: tuple[str, ...] = (
@@ -251,6 +273,12 @@ class GreetingService:
         umo_resolver: Callable[[str], str] | None = None,
         opted_in_checker: Callable[[str, str], bool] | None = None,
         sender: Callable[[str, str], object] | None = None,
+        client_provider: Callable[[], object | None] | None = None,
+        nickname_book: NicknameBook | None = None,
+        prefs_provider: Callable[[str], str] | None = None,
+        interaction_provider: Callable[[str], str] | None = None,
+        feeds_provider: Callable[[str, int], Awaitable[list[str]]] | None = None,
+        pacer: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """初始化服务。
 
@@ -264,6 +292,12 @@ class GreetingService:
             opted_in_checker: 可选的 ``(qq, feature) -> bool``，判断该用户是否接受
                 这个功能的主动消息；返回 False 的人会被跳过并计入 blocked。
             sender: 可选的异步发送函数 ``(umo, text) -> bool``，便于测试注入。
+            client_provider: 可选的 ``() -> OneBot 客户端``，用于取好友昵称。
+            nickname_book: 昵称缓存；缺省时按数据目录自动创建。
+            prefs_provider: 可选的 ``(qq) -> str``，返回该用户的偏好说明（用于个性化）。
+            interaction_provider: 可选的 ``(qq) -> str``，返回与该用户的最近互动说明。
+            feeds_provider: 可选的 ``(qq, count) -> list[str]``，返回该对象最近说说的正文。
+            pacer: 可选的异步间隔器，在每次拉取对方说说前调用（默认等 0.5~1 秒）。
         """
         self.cfg = config
         self.ai = ai
@@ -272,9 +306,23 @@ class GreetingService:
         self._umo_resolver = umo_resolver
         self._optin = opted_in_checker
         self._sender = sender
+        self._client_provider = client_provider
+        self._prefs_provider = prefs_provider
+        self._interaction_provider = interaction_provider
+        self._feeds_provider = feeds_provider
+        self._pacer = pacer or _default_pacer
+        if nickname_book is None:
+            from .nicknames import NicknameBook
+
+            nickname_book = NicknameBook(Path(config.data_dir) / "nicknames.json")
+        self.nicknames = nickname_book
         self.file = Path(config.data_dir) / "greet_state.json"
         self._sent: dict[str, list[str]] = {}
         self.load()
+        # 最近一次逐人生成的内容（QQ -> 文本），供回执展示
+        self.last_texts: dict[str, str] = {}
+        # 对方最近说说：{qq: (日期, 素材文本)}，同一天只拉一次
+        self._feed_cache: dict[str, tuple[str, str]] = {}
 
     # ------------------------------------------------------------------
     # 发送记录（去重）
@@ -373,11 +421,208 @@ class GreetingService:
                 return slot
         return None
 
-    async def build_text(self, slot: GreetSlot) -> str:
-        """生成这个时段的问候内容。
+    def note_of(self, qq: str) -> str:
+        """取管理员为这个对象写的备注（``greet_user_notes``，没有就返回空串）。"""
+        notes = getattr(self.cfg, "greet_user_notes", None)
+        if not isinstance(notes, dict):
+            return ""
+        return str(notes.get(str(qq).strip()) or "").strip()
+
+    # ------------------------------------------------------------------
+    # 对方最近的说说（只用于判断语气，不进日志正文、不落盘）
+    # ------------------------------------------------------------------
+
+    @property
+    def feed_count(self) -> int:
+        """参考对方最近几条说说（1~5）。"""
+        try:
+            value = int(self.cfg.greet_feed_count or 0)
+        except Exception:
+            value = 2
+        return min(max(value, 1), 5)
+
+    async def recent_feed_text(self, qq: str) -> str:
+        """取该对象最近说说的正文（仅内存使用）。
+
+        规则：
+
+        - 受 ``greet_read_feeds`` 控制，关闭时不发这次请求；
+        - **同一对象同一天只拉一次**（进程内缓存），同一时段多次生成不会重复请求；
+        - 每条正文截断到 80 字，最多取 ``greet_feed_count`` 条；
+        - 只在内存里用于本次生成，不落盘，日志最多写「已参考 M 条」；
+        - 对方设了权限或不是好友时读不到，直接当作没有这份素材，**不影响问候发送**。
+
+        Args:
+            qq: 目标 QQ 号。
+
+        Returns:
+            可直接拼进提示词的近况段落；没有素材时返回空串。
+        """
+        if not bool(self.cfg.greet_read_feeds) or self._feeds_provider is None:
+            return ""
+        key = str(qq or "").strip()
+        if not key:
+            return ""
+
+        today = self._now().date().isoformat()
+        cached = self._feed_cache.get(key)
+        if cached is not None and cached[0] == today:
+            return cached[1]
+
+        # 串行拉取，并在请求之间留出间隔，避免短时间内连续请求触发风控
+        if self._pacer is not None:
+            try:
+                await self._pacer()
+            except Exception as e:  # pragma: no cover - 间隔器异常不影响主流程
+                logger.debug(f"问候间隔等待失败，继续执行: {e}")
+
+        lines: list[str] = []
+        try:
+            raw = await self._feeds_provider(key, self.feed_count)
+        except Exception as e:
+            logger.debug(f"读取 {key} 的最近说说失败，本次不参考: {e}")
+            raw = []
+        if isinstance(raw, (list, tuple)):
+            for item in list(raw)[: self.feed_count]:
+                text = " ".join(str(item or "").split())
+                if text:
+                    lines.append(text[:80])
+
+        block = ""
+        if lines:
+            listing = "\n".join(f"- {item}" for item in lines)
+            block = (
+                "# 关于这个人的近况（仅供判断语气与话题，不必与问候内容相关；"
+                "不要提及你了解他的动态）\n"
+                f"{listing}\n"
+                "# 近况素材使用限制（必须遵守）\n"
+                "- 不得提到或暗示自己看过对方的说说，禁止「我看到你发的」"
+                "「你最近发的那条」这类表述\n"
+                "- 不得评论对方发过的内容，也不得暗示「我在关注你」\n"
+                "- 不确定时就当没有这份素材，只用昵称或「你」正常问候"
+            )
+            logger.info(f"[greet] 已参考 {key} 的最近 {len(lines)} 条说说")
+        self._feed_cache[key] = (today, block)
+        return block
+
+    async def _personal_material(self, qq: str) -> list[str]:
+        """组装这个对象的个性化素材（逐人生成时使用）。
+
+        素材按优先级尽力获取：昵称 -> 接收偏好 -> 最近互动 -> 管理员备注 -> 对方近况；
+        任何一项取不到就跳过，绝不因此阻塞或中断发送。
+
+        Args:
+            qq: 目标 QQ 号。
+
+        Returns:
+            可直接拼进提示词的段落列表；没有可用素材时返回空列表。
+        """
+        key = str(qq or "").strip()
+        if not key:
+            return []
+
+        parts: list[str] = []
+
+        name = ""
+        try:
+            client = self._client_provider() if self._client_provider else None
+            name = await self.nicknames.name_of(key, client)
+        except Exception as e:
+            logger.debug(f"获取 {key} 的昵称失败，本次不使用昵称: {e}")
+        if name:
+            parts.append(
+                "# 对方的信息\n"
+                f"- 昵称：{name}（只能用作称呼或很温和的观察，不要评论这个昵称本身）"
+            )
+
+        if self._prefs_provider is not None:
+            try:
+                info = str(self._prefs_provider(key) or "").strip()
+            except Exception as e:
+                logger.debug(f"读取 {key} 的接收偏好失败: {e}")
+                info = ""
+            if info:
+                parts.append(f"# 对方的接收偏好\n- {info}")
+
+        if self._interaction_provider is not None:
+            try:
+                info = str(self._interaction_provider(key) or "").strip()
+            except Exception as e:
+                logger.debug(f"读取 {key} 的最近互动失败: {e}")
+                info = ""
+            if info:
+                parts.append(f"# 你和他最近的往来\n- {info}")
+
+        note = self.note_of(key)
+        if note:
+            parts.append(
+                f"# 你为这个对象记的备注（由管理员提供，只用于他的这条内容）\n- {note}"
+            )
+
+        block = await self.recent_feed_text(key)
+        if block:
+            parts.append(block)
+
+        if parts:
+            parts.append(
+                "# 个性化使用要求\n"
+                "- 上面的信息只用来让这条内容更像是对他说的；"
+                "对方没提到的私事不要主动提，也不要暗示你了解他的全部"
+            )
+        return parts
+
+    async def _ask(
+        self,
+        *,
+        hint: str,
+        target: str = "",
+        provider_id: str = "",
+        feature: str = "问候",
+        output_rule: str,
+        fallback,
+    ) -> str:
+        """按「提示词 + 个性化素材 + 日程」调用 AI，失败时回退文案池。
+
+        Args:
+            hint: 用户配置或内置的提示词。
+            target: 目标 QQ 号（用于取个性化素材）。
+            provider_id: 本次使用的 AstrBot 提供商 id。
+            feature: 功能名，用于 Token 用量统计。
+            output_rule: 输出要求那一段。
+            fallback: 无参可调用对象，返回回退文案。
+
+        Returns:
+            生成好的文本。
+        """
+        parts = [hint, *await self._personal_material(target)]
+
+        life_context = ""
+        if self._life_context_provider is not None:
+            try:
+                life_context = str(await self._life_context_provider() or "")
+            except Exception as e:
+                logger.debug(f"获取{feature}用的日程上下文失败: {e}")
+
+        try:
+            text = await self.ai.chat(
+                system_prompt="\n\n".join([*parts, output_rule]),
+                prompt=life_context or None,
+                provider_id=provider_id,
+                feature=feature,
+            )
+        except Exception as e:
+            logger.warning(f"AI 生成{feature}失败，改用文案池: {e}")
+            return fallback()
+
+        cleaned = " ".join(text.split()).strip("\"'“”‘’")
+        return cleaned or fallback()
+
+    async def build_text(self, slot: GreetSlot, target: str = "") -> str:
+        """生成这个时段的问候内容（可按对象个性化）。
 
         Args:
             slot: 问候时段。
+            target: 目标 QQ 号；传入后会参考该对象的昵称、偏好、最近互动与备注。
 
         Returns:
             问候文本。
@@ -396,31 +641,16 @@ class GreetingService:
         except Exception:
             hint = prompt_template
 
-        life_context = ""
-        if self._life_context_provider is not None:
-            try:
-                life_context = str(await self._life_context_provider() or "")
-            except Exception as e:
-                logger.debug(f"获取问候用的日程上下文失败: {e}")
-
-        try:
-            text = await self.ai.chat(
-                system_prompt=(
-                    f"{hint}\n\n# 输出要求\n只输出问候正文，"
-                    "不要引号、不要解释、不要换行分段。"
-                ),
-                prompt=life_context or None,
-                provider_id=str(self.cfg.llm_greet_provider_id or ""),
-                feature="问候",
-            )
-        except Exception as e:
-            logger.warning(f"AI 生成问候失败，改用文案池: {e}")
-            return self._from_pool(slot)
-
-        cleaned = " ".join(text.split()).strip("\"'“”‘’")
-        if not cleaned:
-            return self._from_pool(slot)
-        return cleaned
+        return await self._ask(
+            hint=hint,
+            target=target,
+            provider_id=str(self.cfg.llm_greet_provider_id or ""),
+            feature="问候",
+            output_rule=(
+                "# 输出要求\n只输出问候正文，不要引号、不要解释、不要换行分段。"
+            ),
+            fallback=lambda: self._from_pool(slot),
+        )
 
     def _from_pool(self, slot: GreetSlot) -> str:
         """从对应文案池随机取一条。"""
@@ -469,11 +699,12 @@ class GreetingService:
         except Exception:
             return text.replace("{festival}", festival)
 
-    async def build_holiday_text(self, festival: str) -> str:
-        """生成节日祝福内容。
+    async def build_holiday_text(self, festival: str, target: str = "") -> str:
+        """生成节日祝福内容（可按对象个性化）。
 
         Args:
             festival: 节日名，用于替换提示词里的 ``{festival}``。
+            target: 目标 QQ 号；传入后会参考该对象的昵称、偏好、最近互动与备注。
             value_date: 不参与生成，仅用于调用方语义清晰。
 
         Returns:
@@ -491,35 +722,18 @@ class GreetingService:
         except Exception:
             hint = prompt_template
 
-        life_context = ""
-        if self._life_context_provider is not None:
-            try:
-                life_context = str(await self._life_context_provider() or "")
-            except Exception as e:
-                logger.debug(f"获取节日祝福用的日程上下文失败: {e}")
-
-        try:
-            text = await self.ai.chat(
-                system_prompt=(
-                    f"{hint}\n\n# 输出要求\n只输出祝福正文，"
-                    "不要引号、不要解释、不要换行分段。"
-                ),
-                prompt=life_context or None,
-                provider_id=str(self.cfg.llm_holiday_provider_id or ""),
-                feature="节日祝福",
-            )
-        except Exception as e:
-            logger.warning(f"AI 生成节日祝福失败，改用文案池: {e}")
-            return self._fill_festival(
+        return await self._ask(
+            hint=hint,
+            target=target,
+            provider_id=str(self.cfg.llm_holiday_provider_id or ""),
+            feature="节日祝福",
+            output_rule=(
+                "# 输出要求\n只输出祝福正文，不要引号、不要解释、不要换行分段。"
+            ),
+            fallback=lambda: self._fill_festival(
                 self._from_pool_key("holiday_pool", "节日祝福"), name
-            )
-
-        cleaned = " ".join(text.split()).strip("\"'“”‘’")
-        if not cleaned:
-            return self._fill_festival(
-                self._from_pool_key("holiday_pool", "节日祝福"), name
-            )
-        return cleaned
+            ),
+        )
 
     # ------------------------------------------------------------------
     # 主动闲聊（定时主动开口）
@@ -593,11 +807,15 @@ class GreetingService:
         """内置兜底搭话文案（AI 不可用或返回为空时使用）。"""
         return self._clean_chat(random.choice(CHAT_FALLBACK_POOL), self.chat_max_chars)
 
-    async def build_chat_text(self) -> str:
-        """生成一句主动搭话的内容。
+    async def build_chat_text(self, target: str = "") -> str:
+        """生成一句主动搭话的内容（可按对象个性化）。
 
-        人设取自 AstrBot 当前的人格，日程取当日生活日程；提示词里已写明语气约束
-        （轻松、不冒犯、不打探隐私、不用空招呼、留出不理会的余地）。
+        人设取自 AstrBot 当前的人格，日程取当日生活日程；传入 ``target`` 时还会参考该对象的
+        昵称、偏好、最近互动与备注。提示词里已写明语气与称呼约束
+        （轻松、不冒犯、不打探隐私、不用空招呼、留出不理会的余地、不基于昵称调侃）。
+
+        Args:
+            target: 目标 QQ 号。
 
         Returns:
             搭话文本；AI 失败或返回为空时回退内置文案。
@@ -612,6 +830,8 @@ class GreetingService:
             persona = {}
         if persona.get("prompt"):
             parts.append(f"# 人设\n{persona['prompt']}")
+
+        parts.extend(await self._personal_material(target))
 
         life_context = ""
         if self._life_context_provider is not None:
@@ -704,7 +924,6 @@ class GreetingService:
             return result
 
         random.shuffle(candidates)
-        result.text = await self.build_chat_text()
         # 最多尝试 3 个人：地址不对或发送失败时换下一个候选，避免一次失败就整天不发
         for attempt, qq in enumerate(candidates):
             if attempt >= 3:
@@ -717,6 +936,7 @@ class GreetingService:
                 record=record,
                 feature=CHAT_KEY,
                 check_optin=check_optin,
+                text_for=lambda target: self.build_chat_text(target),
             )
             if result.sent:
                 break
@@ -755,7 +975,10 @@ class GreetingService:
         feature: str = "",
         check_optin: bool = True,
     ) -> GreetResult:
-        """生成并发送一次问候。
+        """逐人生成并发送一次问候。
+
+        每个收件人都会单独生成一段内容（参考昵称、偏好、最近互动与备注），
+        因此不同的人收到的问候不会一字不差；某人生成失败只跳过该人，不影响其他人。
 
         Args:
             slot_key: 时段标识（morning / night）。
@@ -767,7 +990,7 @@ class GreetingService:
             check_optin: 为 False 时跳过偏好检查（管理员手动指定对象时使用）。
 
         Returns:
-            GreetResult 汇总。
+            GreetResult 汇总（``text`` 为第一个成功对象的内容）。
 
         Raises:
             RuntimeError: 时段未定义或内容生成失败时抛出。
@@ -782,7 +1005,6 @@ class GreetingService:
             result.errors.append("未配置 greet_users，不知道要问候谁")
             return result
 
-        result.text = await self.build_text(slot)
         await self._deliver(
             result,
             watch,
@@ -791,6 +1013,7 @@ class GreetingService:
             record=record,
             feature=feature or slot.key,
             check_optin=check_optin,
+            text_for=lambda qq: self.build_text(slot, qq),
         )
         return result
 
@@ -851,26 +1074,29 @@ class GreetingService:
         day = as_date(value_date)
         result = GreetResult(slot=f"{HOLIDAY_KEY}:{day.isoformat()}", record=record)
 
-        preview = await self.build_holiday_preview(value_date, force=force)
-        if preview is None:
+        festival = festival_of(day)
+        if not festival and not force:
             result.errors.append("今天不是内置的传统节日，未发送节日祝福")
             return result
-        slot_key, text = preview
+        if not festival:
+            # 手动测试落在非节日：用下一个节日的名字占位，避免提示词里没有节日名
+            upcoming = next_festival(day)
+            festival = upcoming[0] if upcoming else "节日"
 
         watch = targets if targets is not None else self.targets
         if not watch:
             result.errors.append("未配置 greet_users，不知道要问候谁")
             return result
 
-        result.text = text
         await self._deliver(
             result,
             watch,
-            slot_key,
+            result.slot,
             force=force,
             record=record,
             feature=HOLIDAY_KEY,
             check_optin=check_optin,
+            text_for=lambda qq: self.build_holiday_text(festival, qq),
         )
         return result
 
@@ -918,8 +1144,13 @@ class GreetingService:
         record: bool = True,
         feature: str = "",
         check_optin: bool = True,
+        text_for: Callable[[str], Awaitable[str]] | None = None,
     ) -> None:
         """逐个私聊发送并记录去重状态。
+
+        传入 ``text_for`` 时**逐人生成**：为每个收件人单独生成一段内容（参考昵称、偏好、
+        最近互动、备注与对方的近况），因此不同的人收到的话不会一模一样。
+        某个对象生成失败只跳过该人并记日志，不影响其他人。
 
         Args:
             result: 本次汇总。
@@ -929,6 +1160,7 @@ class GreetingService:
             record: 是否写入当日记录。
             feature: 用于偏好检查的功能标识；留空表示不检查。
             check_optin: 为 False 时跳过偏好检查（管理员手动指定对象时使用）。
+            text_for: 可选的异步函数 ``(qq) -> 文本``；缺省对所有人使用 ``result.text``。
         """
         platform_id = str(self._platform_id_provider() or "").strip()
         if not platform_id and self._umo_resolver is None:
@@ -938,6 +1170,7 @@ class GreetingService:
             logger.error("[greet] 没找到平台实例，问候未发送")
             return
 
+        self.last_texts = {}
         for qq in watch:
             if check_optin and feature and not self._allowed(qq, feature):
                 result.blocked += 1
@@ -946,10 +1179,27 @@ class GreetingService:
             if not force and self._already_sent(slot_key, qq):
                 result.skipped += 1
                 continue
+
+            text = result.text
+            if text_for is not None:
+                try:
+                    text = str(await text_for(qq) or "").strip()
+                except Exception as e:
+                    result.errors.append(f"{qq}: 生成内容失败 {e}")
+                    logger.error(f"[greet] 为 {qq} 生成内容失败，跳过该对象: {e}")
+                    continue
+                if not text:
+                    result.errors.append(f"{qq}: 生成内容为空，跳过该对象")
+                    logger.warning(f"[greet] 为 {qq} 生成的内容为空，跳过该对象")
+                    continue
+                self.last_texts[qq] = text
+                if not result.text:
+                    result.text = text
+
             umo = self.umo_for(qq)
             result.targets_used[qq] = umo
             try:
-                sent = bool(await self._dispatch(umo, result.text))
+                sent = bool(await self._dispatch(umo, text))
             except Exception as e:
                 result.errors.append(f"{qq}: 发送异常 {e}")
                 logger.error(f"[greet] 发送给 {qq} 失败（umo={umo}）: {e}")

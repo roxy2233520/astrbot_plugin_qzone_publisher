@@ -5733,8 +5733,8 @@ async def main() -> int:
     plugin.api.FEEDS_URL = "http://127.0.0.1:8792/feeds"
     plugin.api.DETAIL_URL = "http://127.0.0.1:8792/detail"
     plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
-    plugin.cfg.set("interact_reply_cron", "*/5 8-23 * * *")
-    plugin.cfg.set("interact_reply_jitter", 60)
+    plugin.cfg.set("interact_reply_cron", "*/30 8-23 * * *")
+    plugin.cfg.set("interact_reply_jitter", 120)
     plugin.cfg.set("interact_reply_days", 7)
     plugin.cfg.set("interact_cron", "0 21 * * *")
 
@@ -5742,13 +5742,13 @@ async def main() -> int:
     check(
         "回复巡检按自己的时间配置调度",
         plugin.reply_task.name == "qzone_reply"
-        and cron == "*/5 8-23 * * *"
+        and cron == "*/30 8-23 * * *"
         and plugin.reply_task.running,
         f"{plugin.reply_task.name}/{cron}/{plugin.reply_task.running}",
     )
     check(
         "回复巡检带自己的抖动",
-        plugin.reply_task.jitter == 60,
+        plugin.reply_task.jitter == 120,
         str(plugin.reply_task.jitter),
     )
     check(
@@ -5759,8 +5759,10 @@ async def main() -> int:
         f"{plugin.interact_task.cron}/{plugin.reply_task.cron}",
     )
     check(
-        "巡检间隔的人话说明能读出每 N 分钟",
-        plugin.interact_reply_interval_text() == "每 5 分钟一次（*/5 8-23 * * *）",
+        "巡检间隔的人话说明能读出每 N 分钟与最坏延迟",
+        "每 30 分钟一次（*/30 8-23 * * *）" in plugin.interact_reply_interval_text()
+        and "发现延迟上限约 30 分钟 + 抖动 120 秒"
+        in plugin.interact_reply_interval_text(),
         plugin.interact_reply_interval_text(),
     )
 
@@ -5772,9 +5774,9 @@ async def main() -> int:
         f"{fresh_cfg.interact_reply_days}/{fresh_cfg.interact_days}",
     )
     check(
-        "回复巡检间隔默认每 5 分钟",
-        fresh_cfg.interact_reply_cron == "*/5 8-23 * * *"
-        and fresh_cfg.interact_reply_jitter == 60,
+        "回复巡检间隔默认每 30 分钟，抖动 120 秒",
+        fresh_cfg.interact_reply_cron == "*/30 8-23 * * *"
+        and fresh_cfg.interact_reply_jitter == 120,
         f"{fresh_cfg.interact_reply_cron}/{fresh_cfg.interact_reply_jitter}",
     )
     schema_now = _json.loads(
@@ -5869,7 +5871,8 @@ async def main() -> int:
         plugin.cfg.interact_reply_enabled is True
         and plugin.reply_task.running
         and any("下次巡检" in item for item in out)
-        and any("每 5 分钟一次" in item for item in out),
+        and any("每 30 分钟一次" in item for item in out)
+        and any("发现延迟上限约 30 分钟" in item for item in out),
         str(out)[:240],
     )
     check(
@@ -5881,12 +5884,11 @@ async def main() -> int:
     # 状态行：补上巡检间隔、窗口与回复方式
     out = await collect(plugin.cmd_status(FakeEvent()))
     check(
-        "状态里的评论回复行含巡检间隔、窗口与回复方式",
+        "状态里的评论回复行含巡检间隔与窗口",
         any(
             "评论回复" in item
-            and "巡检 */5 8-23 * * *" in item
+            and "巡检 */30 8-23 * * *" in item
             and "窗口 7 天" in item
-            and "直接回复" in item
             for item in out
         ),
         str([item for item in out if "评论回复" in item])[:240],
@@ -5927,6 +5929,330 @@ async def main() -> int:
         plugin.cfg.interact_reply_enabled is True,
         str(plugin.cfg.interact_reply_enabled),
     )
+
+    # ==================================================================
+    print("\n[39] 逐人生成问候与个性化素材")
+
+    _greet_mod2 = _imp("core.greet")
+    _nick_mod = _imp("core.nicknames")
+
+    # ---- 昵称清洗规则 ----
+    check(
+        "正常昵称可用",
+        _nick_mod.nickname_is_usable("小明")
+        and _nick_mod.nickname_is_usable("Alice")
+        and _nick_mod.nickname_is_usable("小 明"),
+        "正常昵称",
+    )
+    check(
+        "广告与联系方式昵称不可用",
+        not _nick_mod.nickname_is_usable("加微信低价出号")
+        and not _nick_mod.nickname_is_usable("http://x.cn")
+        and not _nick_mod.nickname_is_usable("扫码免费领"),
+        "广告昵称",
+    )
+    check(
+        "纯数字、纯符号与超长昵称不可用",
+        not _nick_mod.nickname_is_usable("123456789")
+        and not _nick_mod.nickname_is_usable("★☆※§")
+        and not _nick_mod.nickname_is_usable("很长的昵称" * 5),
+        "异常昵称",
+    )
+    check(
+        "敏感词昵称不可用",
+        not _nick_mod.nickname_is_usable("博彩推广")
+        and not _nick_mod.nickname_is_usable("成人用品"),
+        "敏感昵称",
+    )
+
+    # ---- 昵称缓存：落盘与 TTL ----
+    book_path = DATA_DIR / "nicknames_case.json"
+    if book_path.exists():
+        book_path.unlink()
+
+    class NickOneBot:
+        def __init__(self) -> None:
+            self.friend_calls = 0
+            self.stranger_calls: list[int] = []
+
+        async def get_friend_list(self):
+            self.friend_calls += 1
+            return [
+                {"user_id": 10001, "nickname": "小红"},
+                {"user_id": 10002, "nickname": "加微信低价"},
+            ]
+
+        async def get_stranger_info(self, user_id):
+            self.stranger_calls.append(int(user_id))
+            if int(user_id) == 10003:
+                return {"nickname": "小刚"}
+            raise RuntimeError("查不到这个人")
+
+    nick_client = NickOneBot()
+    book = _nick_mod.NicknameBook(book_path, ttl=3600)
+    check("空缓存视为过期", book.expired is True, str(book.fetched_at))
+    first_name = await book.name_of("10001", nick_client)
+    check(
+        "从好友列表取到昵称",
+        first_name == "小红" and nick_client.friend_calls == 1,
+        f"{first_name}/{nick_client.friend_calls}",
+    )
+    check(
+        "昵称缓存落盘",
+        book_path.exists() and "小红" in book_path.read_text(encoding="utf-8"),
+        str(book_path),
+    )
+    check(
+        "TTL 内不再重新拉取好友列表且命中缓存",
+        book.expired is False,
+        str(book.fetched_at),
+    )
+    check(
+        "缓存里的广告昵称一律不使用",
+        await book.name_of("10002", nick_client) == "",
+        "广告昵称退化",
+    )
+    check(
+        "缓存没有该 QQ 时用陌生人接口补一次",
+        await book.name_of("10003", nick_client) == "小刚"
+        and 10003 in nick_client.stranger_calls,
+        str(nick_client.stranger_calls),
+    )
+    check(
+        "接口失败时退化为不使用昵称（不抛异常）",
+        await book.name_of("10004", nick_client) == "",
+        "接口失败",
+    )
+    reloaded_book = _nick_mod.NicknameBook(book_path, ttl=3600)
+    check(
+        "昵称缓存可重新加载并带抓取时间",
+        reloaded_book.usable_name("10001") == "小红" and reloaded_book.fetched_at > 0,
+        str(reloaded_book.fetched_at),
+    )
+
+    # ---- 逐人生成：素材注入 ----
+    greet_cfg = PluginConfig(StubAstrBotConfig({}), FakeContext(onebot))
+    greet_cfg.set("greet_use_ai", True)
+    greet_cfg.set("greet_morning_pool", ["池子甲", "池子乙"])
+    greet_cfg.set("greet_user_notes", {"10002": "同事，喜欢猫"})
+    greet_cfg.set("greet_read_feeds", True)
+    greet_cfg.set("greet_feed_count", 2)
+    greet_cfg.set("active_msg_require_optin", False)
+    greet_cfg.set("greet_users", ["10001", "10002"])
+
+    sent_pairs: list[tuple[str, str]] = []
+
+    async def fake_sender(umo: str, text: str) -> bool:
+        sent_pairs.append((umo, text))
+        return True
+
+    prompts: list[str] = []
+
+    class FakeGreetAI:
+        last_call: ClassVar[dict] = {}
+
+        async def chat(
+            self,
+            *,
+            system_prompt,
+            prompt=None,
+            contexts=None,
+            provider_id=None,
+            feature=None,
+        ):
+            prompts.append(str(system_prompt))
+            return f"给第 {len(prompts)} 位的话"
+
+        async def fetch_persona(self):
+            return {"name": "睦", "prompt": "冷淡但温柔"}
+
+    feeds_calls: list[tuple[str, int]] = []
+
+    async def fake_feeds(qq: str, count: int) -> list[str]:
+        feeds_calls.append((str(qq), int(count)))
+        return ["第一条说说正文", "第二条说说"]
+
+    paced: list[int] = []
+
+    async def fake_pacer() -> None:
+        paced.append(1)
+
+    greet_svc = _greet_mod2.GreetingService(
+        greet_cfg,
+        FakeGreetAI(),
+        lambda: "aiocqhttp",
+        sender=fake_sender,
+        client_provider=lambda: nick_client,
+        nickname_book=book,
+        feeds_provider=fake_feeds,
+        pacer=fake_pacer,
+        prefs_provider=lambda qq: "主动消息设置：已接受",
+        interaction_provider=lambda qq: "今天已经给他发过：早安",
+    )
+
+    greet_result = await greet_svc.send("morning", targets=["10001", "10002"])
+    texts = [text for _, text in sent_pairs]
+    check(
+        "逐人生成：两个人收到不同的内容",
+        len(texts) == 2 and texts[0] != texts[1],
+        str(texts),
+    )
+    check("逐人生成：每人各调用一次 AI", len(prompts) == 2, str(len(prompts)))
+    check("昵称进入该对象的提示词", "小红" in prompts[0], prompts[0][:120])
+    check(
+        "备注进入对应对象的提示词且不外泄",
+        any("同事，喜欢猫" in item for item in prompts)
+        and "同事，喜欢猫" in prompts[1]
+        and "同事，喜欢猫" not in prompts[0],
+        "备注隔离",
+    )
+    check(
+        "偏好与最近往来进入提示词",
+        "主动消息设置：已接受" in prompts[0] and "今天已经给他发过：早安" in prompts[0],
+        prompts[0][:160],
+    )
+    check(
+        "对方近况进入提示词",
+        all("第一条说说正文" in item and "第二条说说" in item for item in prompts),
+        "近况素材",
+    )
+    check(
+        "近况段落写明不必与内容相关",
+        all("不必与问候内容相关" in item for item in prompts),
+        "不必相关",
+    )
+    check(
+        "近况段落含「不得提及看过对方说说」的约束",
+        all(
+            "不得提到或暗示自己看过对方的说说" in item and "我看到你发的" in item
+            for item in prompts
+        ),
+        "近况禁忌",
+    )
+    check(
+        "默认提示词本身也含称呼与近况约束",
+        "不使用昵称" in _greet_mod2.DEFAULT_GREET_PROMPT
+        and "不得提到或暗示自己看过对方的说说" in _greet_mod2.DEFAULT_CHAT_OPEN_PROMPT
+        and "不必与问候内容相关" in _greet_mod2.DEFAULT_HOLIDAY_PROMPT,
+        "默认提示词约束",
+    )
+    check(
+        "每个对象各拉一次说说且条数符合配置",
+        feeds_calls == [("10001", 2), ("10002", 2)],
+        str(feeds_calls),
+    )
+    check("对象之间串行并留出请求间隔", len(paced) == 2, str(len(paced)))
+    check(
+        "逐人结果被记录（回执可显示人数）",
+        len(greet_svc.last_texts) == 2 and greet_result.sent == 2,
+        f"{len(greet_svc.last_texts)}/{greet_result.sent}",
+    )
+
+    feeds_calls.clear()
+    await greet_svc.send("night", targets=["10001", "10002"], force=True)
+    check(
+        "同一对象同一天只拉一次说说",
+        feeds_calls == [],
+        str(feeds_calls),
+    )
+
+    # ---- 关闭开关后不再发请求 ----
+    greet_cfg.set("greet_read_feeds", False)
+    greet_svc._feed_cache.clear()
+    feeds_calls.clear()
+    paced.clear()
+    prompts.clear()
+    await greet_svc.send("morning", targets=["10001"], force=True)
+    check(
+        "关闭「参考对方最近的说说」后不再发该请求",
+        feeds_calls == [] and paced == [],
+        f"{feeds_calls}/{paced}",
+    )
+    greet_cfg.set("greet_read_feeds", True)
+
+    # ---- 正文截断 80 字 ----
+    long_text = "很长的说说正文" * 20
+    greet_svc._feed_cache.clear()
+
+    async def long_feeds(qq: str, count: int) -> list[str]:
+        return [long_text]
+
+    greet_svc._feeds_provider = long_feeds
+    block = await greet_svc.recent_feed_text("10009")
+    check(
+        "对方正文逐条截断到 80 字",
+        f"- {long_text[:80]}" in block and long_text[:81] not in block,
+        str(len(block)),
+    )
+
+    # ---- 读不到对方说说时照常发送 ----
+    greet_svc._feed_cache.clear()
+
+    async def failing_feeds(qq: str, count: int) -> list[str]:
+        raise RuntimeError("无权限查看")
+
+    greet_svc._feeds_provider = failing_feeds
+    prompts.clear()
+    sent_pairs.clear()
+    no_feed_result = await greet_svc.send("morning", targets=["10001"], force=True)
+    check(
+        "读不到对方说说时跳过素材且照常发送",
+        no_feed_result.sent == 1 and prompts and "第一条说说正文" not in prompts[-1],
+        f"{no_feed_result.sent}/{no_feed_result.summary()}",
+    )
+
+    # ---- 单个对象生成失败只跳过该人 ----
+    greet_cfg.set("greet_morning_pool", [])
+    sent_pairs.clear()
+
+    class SelectiveAI:
+        last_call: ClassVar[dict] = {}
+
+        async def chat(
+            self,
+            *,
+            system_prompt,
+            prompt=None,
+            contexts=None,
+            provider_id=None,
+            feature=None,
+        ):
+            if "小红" in str(system_prompt):
+                return "只给小红的话"
+            raise RuntimeError("这个人生成失败")
+
+        async def fetch_persona(self):
+            return {}
+
+    async def empty_feeds(qq: str, count: int) -> list[str]:
+        return []
+
+    greeting_only = _greet_mod2.GreetingService(
+        greet_cfg,
+        SelectiveAI(),
+        lambda: "aiocqhttp",
+        sender=fake_sender,
+        client_provider=lambda: nick_client,
+        nickname_book=book,
+        feeds_provider=empty_feeds,
+        pacer=fake_pacer,
+    )
+    single_fail = await greeting_only.send(
+        "morning", targets=["10001", "10002"], force=True
+    )
+    check(
+        "某个对象生成失败时只跳过该人",
+        single_fail.sent == 1
+        and len(single_fail.errors) == 1
+        and "生成内容失败" in single_fail.errors[0],
+        f"{single_fail.sent}/{single_fail.errors}",
+    )
+    check(
+        "失败者不影响他人的内容",
+        [text for _, text in sent_pairs] == ["只给小红的话"],
+        str(sent_pairs),
+    )
+    greet_cfg.set("greet_morning_pool", ["池子甲", "池子乙"])
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

@@ -40,6 +40,7 @@ class Draft:
         target_post_text: 旧版本回复草稿遗留字段，仅为兼容旧数据保留。
         targets: 问候目标 QQ 号列表（kind=greet 时有效）。
         images: 附带图片数量（仅说说草稿有意义；图片本身不会持久化）。
+        note: 展示给管理员的补充说明（例如「实际发送时会按每个人分别生成」）。
     """
 
     kind: str
@@ -55,6 +56,7 @@ class Draft:
     target_post_text: str = ""
     targets: list[str] = field(default_factory=list)
     images: int = 0
+    note: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> Draft:
@@ -79,6 +81,7 @@ class Draft:
             target_post_text=str(data.get("target_post_text") or ""),
             targets=targets,
             images=int(data.get("images") or 0),
+            note=str(data.get("note") or ""),
         )
 
     def title(self) -> str:
@@ -103,6 +106,8 @@ class Draft:
             lines.append(kv("目标说说", self.target_tid))
         if self.kind == "greet" and self.targets:
             lines.append(kv("发送对象", "、".join(self.targets)))
+        if self.note:
+            lines.append(kv("说明", self.note))
         return lines
 
     def describe_pair(self) -> tuple[str, str]:

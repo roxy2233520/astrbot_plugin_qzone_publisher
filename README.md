@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-656%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-686%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -139,7 +139,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 - 说说互动：在面板里把 `interact_uins` 填成要关注的 QQ 号，`interact_enabled` 打开即可开始只读巡检；
   点赞（`interact_like`）与 AI 评论（`interact_comment`）需要单独打开。
-- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开即可；默认巡检到就直接回复，回复间隔由 `interact_reply_cron` 决定（默认每 5 分钟一轮）。
+- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开即可；默认巡检到就直接回复，回复间隔由 `interact_reply_cron` 决定（默认每 30 分钟一轮，可自行调紧）。
 
 ### 第七步：确认通知与管理员
 
@@ -332,16 +332,32 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `holiday_cron` | `0 9 * * *` | 节日祝福时间；当天不是内置节日则不发送 |
 | `greet_jitter` | `600` | 触发后随机延后 0~N 秒，不固定在同一秒发出 |
 | `holiday_jitter` | `600` | 节日祝福的随机抖动（秒） |
+| `greet_read_feeds` | `true` | **参考对方最近的说说**：仅用于判断语气与近况，不必与问候内容相关，也不会在问候里暴露。开启后每个对象会多一次读取请求，对象越多耗时与请求数越多；对方设权限或不是好友时读不到，会自动跳过并照常问候 |
+| `greet_feed_count` | `2` | 每个对象最多参考几条说说（正文逐条截断到 80 字，1~5） |
+| `greet_user_notes` | `{}` | **每个对象的备注**，形如 `{"10001": "同事，喜欢猫"}`；生成该对象的问候时会一并交给 AI，只影响这个人收到的内容；不想让问候被区分时可以留空 |
 | `greet_use_ai` | `false` | 用 AI 结合人设与当日生活日程生成；关闭则从文案池随机取 |
 | `greet_prompt` | 见默认值 | AI 提示词，`{slot}` 会被替换成「早安 / 晚安」 |
 | `greet_morning_pool` / `greet_night_pool` | 各 3 条示例 | 文案池 |
 | `holiday_prompt` / `holiday_pool` | 见默认值 / 3 条示例 | 节日祝福的提示词与文案池，`{festival}` 会被替换成节日名 |
 | `llm_greet_provider_id` / `llm_holiday_provider_id` | 空 | 分别给问候、节日祝福指定 AstrBot 提供商（留空用全局） |
 
+- **逐人分别生成**：问候、节日祝福与日常闲聊都会**按每个对象单独生成一份内容**，
+  因此不同的人收到的话不会一字不差。生成时会参考：对方的 QQ 昵称（取不到就退化为「你」）、
+  他本人的接收偏好、与他的最近往来，以及你在 `greet_user_notes` 里为他写的备注。
+  昵称只用作称呼或很温和的观察：含广告、敏感词、乱码或明显不是名字时一律不使用，
+  也不会拿昵称做联想调侃，更不会提及对方的外貌、性别、年龄、职业、地域、健康状况、
+  经济情况与感情状态。
+- **可以适当参考对方的近况**（`greet_read_feeds`，默认开启）：读一下对方最近的说说，
+  只用来判断语气与话题，**不必与问候内容相关**，也**不会在问候里暴露**——
+  提示词里明确禁止「我看到你发的」「你最近发的那条」这类表述。
+  每个对象同一天只读一次，对象之间串行并留出 0.5~1 秒间隔；读不到就当他没有这份素材。
+- **代价**：逐人生成意味着对象越多、AI 调用次数与用量越大；开启「参考对方最近的说说」后
+  每个对象还会多一次读取请求。
 - 同一天同一时段对同一个人只发一次（记录在 `greet_state.json`），
   随机抖动或错过的补偿触发都不会造成重复问候。
   只有**定时任务**会写这条记录；`/空间问候` 手动发送不会占用当日名额，
   所以手动测试过之后，当天的定时问候照样会发。
+- 某个对象生成失败（AI 失败且文案池为空）只会跳过该人并记日志，不影响其他人。
 - 发送结果会核对 AstrBot 的返回值：AstrBot 没找到匹配的会话时记为失败并明确报错，
   不会记入「今日已问候」，也不会在日志里写成成功。
 - AI 生成失败、返回空都会自动回退到文案池；某个 QQ 发不出去只记日志并汇总，不影响其他人。
@@ -417,9 +433,11 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 - **没有评论推送，只能轮询**：OneBot(NapCat) 只推送 QQ 消息事件，QQ空间的新评论没有
   推送或回调通道，因此评论只能靠定时轮询发现。回复巡检是**独立任务**
-  （`interact_reply_cron`，默认 `*/5 8-23 * * *` 即白天到晚上每 5 分钟一轮，
-  另有 `interact_reply_jitter` 随机抖动），不再搭在一天一次的好友巡检上；
-  发现延迟的上限就是这一轮的间隔。
+  （`interact_reply_cron`，默认 `*/30 8-23 * * *` 即白天到晚上每 30 分钟一轮，
+  另有 `interact_reply_jitter` 随机抖动），不再搭在一天一次的好友巡检上。
+  **最坏延迟 = 巡检间隔 + 抖动**（默认约 30~32 分钟）；巡检越频繁发现越及时，
+  但请求次数越多越可能触发风控与登录态失效：30 分钟一轮约每天 50~100 次请求，
+  5 分钟一轮约 300~600 次，可按需在面板里调整。
 - **回复有自己的时间窗口** `interact_reply_days`（默认 7 天）：只处理这么多天内
   **自己发布的**说说，比好友互动的 `interact_days`（默认 3 天）更长，
   旧说说下新来的评论同样会被发现；说说列表没带评论明细时，会再请求一次说说详情补取，
@@ -555,6 +573,9 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `chat_open_prompt` | 见默认值 | 主动闲聊的提示词，默认值已写明语气约束（轻松、不冒犯、不打探隐私、不用空招呼） |
 | `chat_open_per_day` | `1` | 每天最多主动开口几次（1~3）：随机挑这么多个窗口各发一条，窗口数不足时按窗口数发 |
 | `chat_open_max_chars` | `40` | 搭话字数上限（10~100），超出部分截断 |
+| `greet_read_feeds` | `true` | **参考对方最近的说说**（逐人生成时用）：只用于判断语气与近况，不必与问候内容相关、也不会在问候里暴露；开启后每个对象会多一次读取请求，对象越多耗时与请求数越多；对方设权限或不是好友时读不到，会自动跳过并照常问候 |
+| `greet_feed_count` | `2` | 每个对象最多参考几条说说（1~5，正文逐条截断到 80 字） |
+| `greet_user_notes` | `{}` | **每个对象的备注**，形如 `{"10001": "同事，喜欢猫"}`；只影响该对象收到的问候，留空即可 |
 
 收件人口径见上文「主动消息同意」（早安、晚安、日常闲聊、节日祝福完全一致）。
 问候与节日祝福是否先转草稿确认沿用 `draft_for_greet`；**主动闲聊不走草稿确认**（见上文「日常闲聊」）。
@@ -602,8 +623,8 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
 | `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复；默认巡检到就直接回复 |
-| `interact_reply_cron` | `*/5 8-23 * * *` | **评论回复的巡检间隔**：默认白天到晚上每 5 分钟检查一次自己的说说有没有新评论。QQ空间没有评论推送通道，评论只能靠定时轮询发现；支持 `HH:MM` 或 5 段 Cron |
-| `interact_reply_jitter` | `60` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒，避免卡在同一秒 |
+| `interact_reply_cron` | `*/30 8-23 * * *` | **评论回复的巡检间隔**：默认白天到晚上每 30 分钟检查一次自己的说说有没有新评论。QQ空间没有评论推送通道，评论只能靠定时轮询发现；巡检越频繁越及时，但请求越多越可能触发风控：30 分钟一轮约每天 50~100 次请求，5 分钟一轮约 300~600 次；支持 `HH:MM` 或 5 段 Cron |
+| `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒，避免卡在同一秒；最坏延迟 = 间隔 + 抖动 |
 | `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |
 | `llm_reply_provider_id` | 空 | 回复单独指定模型提供商（留空用全局） |
 | `interact_reply_prompt` | 见默认值 | 回复提示词 |
@@ -673,6 +694,7 @@ astrbot_plugin_qzone_publisher/
 ├── life_schedule.json     生活日程缓存
 ├── draft.json             待确认草稿
 ├── greet_state.json       今日已发过谁（问候、节日祝福与日常闲聊去重）
+├── nicknames.json        好友昵称缓存（逐人生成问候时用，6 小时刷新一次）
 ├── user_prefs.json        每个私聊用户的主动消息偏好
 ├── publish_angles.json    每天用过的创作角度（避免同一天内角度重复）
 ├── replied_comments.json  已回复过的评论（去重）

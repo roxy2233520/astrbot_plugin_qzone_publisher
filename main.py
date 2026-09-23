@@ -35,7 +35,7 @@ from .core.holidays import days_until, table_range_text
 from .core.interact import InteractService
 from .core.life import LifeManager, time_desc
 from .core.llm import AIClient
-from .core.qzone import QzoneAPI, QzoneSession
+from .core.qzone import QzoneAPI, QzoneParser, QzoneSession
 from .core.render import ReceiptRenderer
 from .core.scheduler import (
     CronTask,
@@ -116,6 +116,10 @@ class QzonePublisherPlugin(Star):
             life_context_provider=self.life.prompt_context,
             umo_resolver=self._greet_umo,
             opted_in_checker=self._active_msg_allowed,
+            client_provider=self._get_onebot_client,
+            prefs_provider=self._greet_prefs_text,
+            interaction_provider=self._greet_interaction_text,
+            feeds_provider=self._greet_feeds,
         )
 
         self.publish_task = CronTaskGroup.from_config(
@@ -550,6 +554,66 @@ class QzonePublisherPlugin(Star):
         """定时任务：节日当天群发节日祝福。"""
         await self._run_holiday()
 
+    def _greet_prefs_text(self, qq: str) -> str:
+        """逐人生成时给 AI 的「这个对象的偏好」说明（取不到返回空串）。"""
+        user = self.prefs.get(qq)
+        if user is None:
+            return ""
+        state = UserPrefStore.state_text(user)
+        return f"主动消息设置：{state}｜各项开关：{UserPrefStore.features_text(user)}"
+
+    def _greet_interaction_text(self, qq: str) -> str:
+        """逐人生成时给 AI 的「与该对象的最近往来」说明（取不到返回空串）。
+
+        只从插件已有的记录推断（今天的问候去重记录），不额外发请求。
+        """
+        labels = {
+            "morning": "早安",
+            "night": "晚安",
+            "chat": "日常闲聊",
+            "holiday": "节日祝福",
+        }
+        records = self.greet._sent.get(self.greet._today(), [])
+        hits: list[str] = []
+        for item in records:
+            if not str(item).endswith(f":{qq}"):
+                continue
+            slot = str(item).split(":", 1)[0]
+            label = labels.get(slot) or (
+                "节日祝福" if slot.startswith("holiday") else slot
+            )
+            if label not in hits:
+                hits.append(label)
+        if not hits:
+            return ""
+        return f"今天已经给他发过：{'、'.join(hits)}"
+
+    async def _greet_feeds(self, qq: str, count: int) -> list[str]:
+        """读取该对象最近说说的正文，供逐人生成参考。
+
+        只取正文（忽略图片），只用于当次生成、不落盘；对方设了权限或不是好友时
+        接口会返回空或失败，此时返回空列表（问候照常发送）。
+
+        Args:
+            qq: 目标 QQ 号。
+            count: 取最近几条。
+
+        Returns:
+            正文列表；读不到时为空列表。
+        """
+        try:
+            resp = await self.api.get_feeds(qq, pos=0, num=max(int(count or 1), 1))
+        except Exception as e:
+            logger.debug(f"读取 {qq} 的最近说说失败，本次不参考: {e}")
+            return []
+        if not resp.ok:
+            logger.debug(
+                f"读取 {qq} 的最近说说失败（{resp.message or resp.code}），本次不参考"
+            )
+            return []
+        posts = QzoneParser.parse_feeds(resp.data)
+        return [post.text for post in posts if post.text]
+
     def _active_msg_allowed(self, qq: str, feature: str) -> bool:
         """判断该 QQ 是否接受这个功能的主动消息。
 
@@ -636,6 +700,10 @@ class QzonePublisherPlugin(Star):
                 text=text,
                 source=f"greet:{slot_key}",
                 targets=list(targets),
+                note=(
+                    "下面是预览；确认后会按每个人分别生成内容再发出"
+                    f"（共 {len(targets)} 人）"
+                ),
             )
         )
         await self._send_draft(draft)
@@ -688,19 +756,34 @@ class QzonePublisherPlugin(Star):
         return "｜".join(parts)
 
     def interact_reply_interval_text(self) -> str:
-        """评论巡检间隔的人话说明（例如「每 5 分钟一次（*/5 8-23 * * *）」）。"""
+        """评论巡检间隔的人话说明（含最坏延迟）。
+
+        Returns:
+            形如「每 30 分钟一次（*/30 8-23 * * *）｜发现延迟上限约 30 分钟 + 抖动 120 秒」。
+        """
         cron = str(self.reply_task.cron or "").strip()
         if not cron:
             return "未设置（不会自动巡检）"
+
+        every_minutes = 0
         fields = cron.split()
         if len(fields) == 5:
             minute, hour = fields[0], fields[1]
             step = re.match(r"^\*/(\d+)$", minute)
             if step:
-                return f"每 {int(step.group(1))} 分钟一次（{cron}）"
-            if minute.isdigit() and hour.isdigit():
-                return f"每天 {int(hour):02d}:{int(minute):02d}（{cron}）"
-        return f"按 {cron}"
+                every_minutes = max(int(step.group(1)), 1)
+            elif minute.isdigit() and hour.isdigit():
+                every_minutes = 24 * 60
+
+        jitter = max(int(self.reply_task.jitter or 0), 0)
+        if every_minutes <= 0:
+            return f"按 {cron}｜发现延迟取决于巡检间隔 + 抖动 {jitter} 秒"
+        if every_minutes >= 24 * 60:
+            return f"每天一次（{cron}）｜发现延迟上限约 24 小时 + 抖动 {jitter} 秒"
+        return (
+            f"每 {every_minutes} 分钟一次（{cron}）"
+            f"｜发现延迟上限约 {every_minutes} 分钟 + 抖动 {jitter} 秒"
+        )
 
     def next_chat_window_text(self) -> str:
         """下一个主动闲聊窗口的时刻文本。
@@ -1007,14 +1090,32 @@ class QzonePublisherPlugin(Star):
             )
 
         if draft.kind == "greet":
-            result = await self.greet.send_text(draft.text, draft.targets or None)
+            # 确认后逐人重新生成（预览只是给人看的一份），因此每个人收到的话不一样
+            source = str(draft.source or "")
+            slot_key = source.split(":", 1)[1] if ":" in source else ""
+            targets = draft.targets or None
+            if slot_key in ("morning", "night"):
+                result = await self.greet.send(
+                    slot_key, targets=targets, force=True, feature=slot_key
+                )
+            elif slot_key.startswith("holiday"):
+                result = await self.greet.send_holiday(targets=targets, force=True)
+            else:
+                # 旧版本遗留的问候草稿：没有时段信息，只能按原文发出
+                result = await self.greet.send_text(draft.text, targets)
             if result.sent == 0:
                 raise RuntimeError(f"问候没有发出去：{result.summary()}")
-            return plain_receipt(
-                "问候已发送",
-                [*result.summary().splitlines(), kv("内容", draft.text)],
-                icon=ICON_OK,
-            )
+            lines = list(result.summary().splitlines())
+            if self.greet.last_texts:
+                lines.append(
+                    kv(
+                        "已生成",
+                        f"{len(self.greet.last_texts)} 人的不同内容（每人单独生成）",
+                    )
+                )
+            else:
+                lines.append(kv("内容", result.text))
+            return plain_receipt("问候已发送", lines, icon=ICON_OK)
 
         record = await self._publish(draft.text, source=draft.source or "draft")
         return self._format_record(record, prefix="草稿已发布")
