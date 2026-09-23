@@ -84,7 +84,9 @@ class QzonePublisherPlugin(Star):
         self.ai = AIClient(self.cfg, context)
         self.life = LifeManager(self.cfg, context, self.ai)
         self.web = WebSearchBridge(self.cfg, context)
-        self.content = ContentGenerator(self.cfg, self.ai, self.life, self.web)
+        self.content = ContentGenerator(
+            self.cfg, self.ai, self.life, self.web, store=self.store
+        )
         self.interact = InteractService(self.cfg, self.ai, self.api, self.drafts)
         self.render = ReceiptRenderer(self.cfg)
         # 最近一次与某个 QQ 的真实私聊会话地址（umo），问候优先用它，避免地址拼错
@@ -812,7 +814,9 @@ class QzonePublisherPlugin(Star):
             await self._notify(f"{prefix}失败：{e}" + self._usage_note())
             return
         await self._notify(
-            self._format_record(record, prefix=f"{prefix}成功") + self._usage_note()
+            self._format_record(record, prefix=f"{prefix}成功")
+            + self.content.warning_note()
+            + self._usage_note()
         )
 
     async def _confirm_draft(self, draft: Draft) -> str:
@@ -1189,12 +1193,13 @@ class QzonePublisherPlugin(Star):
             yield event.plain_result(f"发布失败：{e}{self._usage_note()}")
             return
 
-        await self._notify(
-            self._format_record(record, prefix="手动自动发成功") + self._usage_note()
+        receipt = (
+            self._format_record(record, prefix="手动自动发成功")
+            + self.content.warning_note()
+            + self._usage_note()
         )
-        yield event.plain_result(
-            self._format_record(record, prefix="手动自动发成功") + self._usage_note()
-        )
+        await self._notify(receipt)
+        yield event.plain_result(receipt)
 
     @filter.command("空间状态", alias={"space status", "qz status", "空间登录"})
     async def cmd_status(self, event: AstrMessageEvent):
@@ -1248,7 +1253,16 @@ class QzonePublisherPlugin(Star):
                 f"｜日程={'已引用' if basis.get('life') else '未引用'}"
                 f"｜联网素材={'有' if basis.get('web') else '无'}"
                 f"｜聊天记录={'有' if basis.get('chat') else '无'}"
+                f"｜角度={basis.get('angle') or '未启用'}"
+                f"｜时段={basis.get('slot') or '未知'}"
             )
+            if basis.get("repeat_checked"):
+                lines.append(
+                    f"　避免重复: 参考最近 {basis.get('recent') or 0} 条"
+                    f"｜与最近内容相似度 {basis.get('repeat') or 0}%"
+                    f"（阈值 {int(self.cfg.publish_repeat_threshold or 0)}%）"
+                    + ("｜已自动重写一次" if basis.get("repeat_rewritten") else "")
+                )
             for warning in basis.get("warnings") or []:
                 lines.append(f"　⚠️ {warning}")
 

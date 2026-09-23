@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-562%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-607%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -27,6 +27,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | 定时 | 可设置**每天发几条**与**具体时间点列表**（每个时间点各自随机抖动）；也兼容单个 `HH:MM` 或 5 段 Cron，改配置即时生效 |
 | 手动触发 | `/空间自动发` 立刻按人设生成并发一条说说：与定时发布走**同一条链路**，所以受草稿确认开关影响（开了就先给你草稿） |
 | 内容来源 | 文案池随机 / 文本文件随机一行 / AI 按人设生成（可参考今日日程、最近聊天记录与联网资料） |
+| 避免重复 | 每天多条也不雷同：生成时参考最近发过的内容、每次换一个创作角度、按当前时段来写；新内容与最近的内容过于相似时**自动重写一次** |
 | 联网素材 | **接入 AstrBot 自带的联网搜索**：先联网查资料，再让 AI 结合资料写说说；搜索不可用时自动降级 |
 | Token 用量 | 估算每次生成大概用多少 token，累计到 `/空间状态` 与 `/空间用量`；草稿与发布通知里也会带上 |
 | 回执图 | 通知与草稿可附带一张渲染出来的回执图（用 AstrBot 自带文转图，不加字体、不加体积；渲染失败自动降级纯文本） |
@@ -226,6 +227,27 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
   内容源确实有内容（AI 生成时确认 AstrBot 的提供商可用），以及时间点个数是否够。
 - 与其它 QQ空间插件同时开启自动发布会造成重复发布，请**只保留一个插件的自动发布**处于开启状态，
   自动评论同理（也可以把时间错开）。
+
+### 避免每天的说说内容重复
+
+每天发多条时，如果每次都用同一份当日日程、又看不到自己之前写过什么，内容就容易雷同。
+插件用三层机制避免重复，缺一层效果都不明显：
+
+1. **参考最近发过的内容**：把最近 `publish_avoid_repeat_count` 条发布成功的正文
+   （逐条截断到 60 字）作为「最近已经发过的内容（不要重复）」交给 AI，
+   并要求不要重复用过的意象、句式、开头方式与结尾方式，换一个角度写。填 `0` 表示不参考。
+2. **给一个创作角度**：每次从 `publish_angle_pool` 里随机抽一个角度
+   （例如「写一件今天具体的小事」「写一个声音或气味」）注入提示词，
+   并记录当天已经用过的角度，**保证同一天内各条的角度不同**（记录在 `publish_angles.json`，
+   池子当天用尽时才允许重复，并会在日志里说明）。同时还会告诉 AI **当前时段**
+   （早上 / 中午 / 下午 / 晚上 / 深夜，按插件时区），要求只写当下这个时段的事、不写一整天。
+3. **相似度把关**：生成后与最近已发内容按字符二元组算相似度，达到
+   `publish_repeat_threshold`（百分比）就**自动重写一次**，重写时明确告知「与最近某条过于相似，
+   换一个完全不同的切入角度」；重写后仍然相似就照常发布，并在日志、发布通知与
+   `/空间状态` 里注明，便于事后判断。填 `100` 表示关闭这项检查。
+
+`/空间状态` 的「上次生成依据」会显示本次使用的角度、时段，以及「避免重复」一行
+（参考条数、与最近内容的相似度、是否触发过重写）。
 
 ### 生活日程
 
@@ -520,11 +542,14 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `text_pool` | 3 条示例 | 文案池内容 |
 | `content_file` | 空 | 文本文件路径，一行一条，`#` 开头忽略 |
 | `llm_prompt` | 见默认值 | 写说说的提示词 |
+| `publish_angle_pool` | 7 条示例 | 创作角度池：每次随机抽一个注入提示词，并保证同一天内各条角度不同 |
 | `llm_use_persona` | `true` | 生成时注入 Bot 人设 |
 | `llm_use_life_context` | `true` | 把今日穿搭/日程作为素材交给 AI |
 | `llm_life_must_reference` | `true` | 要求正文自然带出今天行程的具体细节 |
 | `llm_reference_chat` | `false` | 是否参考最近聊天记录 |
 | `llm_chat_umo` / `llm_chat_count` | 空 / `30` | 参考哪个会话、参考多少条 |
+| `publish_avoid_repeat_count` | `5` | 参考最近几条已发说说（0~20，截断到 60 字）；`0` 表示不参考 |
+| `publish_repeat_threshold` | `60` | 重复相似度阈值（%，0~100）：达到就自动重写一次；`100` 表示关闭检查 |
 | `llm_max_chars` | `200` | 生成内容最大字数 |
 | `web_search_enabled` | `false` | 写说说前先联网查资料，再让 AI 结合资料写 |
 | `web_search_query_mode` | `ai` | 搜索词从哪来：AI 想一个 / 从关键词池取 |
@@ -616,6 +641,7 @@ astrbot_plugin_qzone_publisher/
 ├── draft.json             待确认草稿
 ├── greet_state.json       今日已发过谁（问候、节日祝福与日常闲聊去重）
 ├── user_prefs.json        每个私聊用户的主动消息偏好
+├── publish_angles.json    每天用过的创作角度（避免同一天内角度重复）
 ├── replied_comments.json  已回复过的评论（去重）
 ├── interacted_tids.json   已处理过的说说（去重用）
 └── token_usage.json       按天累计的 AI 用量估算（`/空间用量` 读取）

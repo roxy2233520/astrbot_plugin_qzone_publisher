@@ -611,7 +611,11 @@ async def main() -> int:
     parsed = QzoneParser.parse_response('{"code":0,"msg":undefined}')
     check("undefined 替换为 null", parsed.get("msg") is None, str(parsed))
     parsed = QzoneParser.parse_response("<html>403 Forbidden</html>")
-    check("非 JSON 返回错误码", parsed.get("code") == -1, str(parsed))
+    check(
+        "HTML 页面判定为登录态 / 风控而非普通错误",
+        parsed.get("code") == -3001 and "登录态" in str(parsed.get("message")),
+        str(parsed),
+    )
     parsed = QzoneParser.parse_response("")
     check("空响应返回错误码", parsed.get("code") == -1, str(parsed))
 
@@ -1335,6 +1339,36 @@ async def main() -> int:
             {"code": 0, "data": {"tid": "TID_DRAFT", "now": 1700000999}}
         )
 
+    login_page_calls = {"count": 0}
+
+    async def handle_publish_login_page(request):
+        """第一次返回登录页（不是数据），之后返回正常结果。"""
+        login_page_calls["count"] += 1
+        if login_page_calls["count"] == 1:
+            return web.Response(
+                text=(
+                    "<html><head><title>QQ登录</title></head>"
+                    "<body>请先登录后重试</body></html>"
+                ),
+                content_type="text/html",
+            )
+        return web.json_response(
+            {"code": 0, "data": {"tid": "TID_AFTER_LOGIN_PAGE", "now": 1700001000}}
+        )
+
+    async def handle_publish_login_page_always(request):
+        """始终返回登录页：用于验证「重试后仍失败」的回报。"""
+        return web.Response(
+            text="<html><body>登录态已失效，请重新登录</body></html>",
+            content_type="text/html",
+        )
+
+    async def handle_publish_garbage(request):
+        """返回既不是 JSON、也不像登录页的内容。"""
+        return web.Response(
+            text="这不是数据，只是一段没有结构的返回", content_type="text/plain"
+        )
+
     app2 = web.Application()
     app2.router.add_post("/v1/chat/completions", handle_ai)
     app2.router.add_get("/feeds", handle_feeds)
@@ -1342,6 +1376,9 @@ async def main() -> int:
     app2.router.add_post("/comment", handle_comment)
     app2.router.add_post("/publish", handle_publish_ok)
     app2.router.add_post("/publish_fail", handle_publish_fail)
+    app2.router.add_post("/publish_login_page", handle_publish_login_page)
+    app2.router.add_post("/publish_login_page_always", handle_publish_login_page_always)
+    app2.router.add_post("/publish_garbage", handle_publish_garbage)
     app2.router.add_post("/reply", handle_reply)
     app2.router.add_get("/detail", handle_detail)
     runner2 = web.AppRunner(app2)
@@ -5055,6 +5092,419 @@ async def main() -> int:
     )
 
     plugin._stop_chat_tasks()
+
+    # ==================================================================
+    print("\n[35] 响应解析容错与登录态失效判定")
+
+    _parser_mod = _imp("core.qzone.parser")
+    _const_mod = _imp("core.qzone.constants")
+    _P = _parser_mod.QzoneParser
+
+    parsed = _P.parse_response("{'code':0,'data':{'tid':'T1'}}")
+    check(
+        "单引号键与值能解析",
+        parsed.get("code") == 0 and parsed.get("data", {}).get("tid") == "T1",
+        str(parsed),
+    )
+    parsed = _P.parse_response('{code:0,msg:"ok",data:{tid:"T2"}}')
+    check(
+        "无引号的键能解析",
+        parsed.get("code") == 0 and parsed.get("data", {}).get("tid") == "T2",
+        str(parsed),
+    )
+    parsed = _P.parse_response('{"code":0,"data":{"tid":"T3",},}')
+    check(
+        "尾逗号能解析",
+        parsed.get("code") == 0 and parsed.get("data", {}).get("tid") == "T3",
+        str(parsed),
+    )
+    parsed = _P.parse_response("frameElement.callback({'code':0,'message':undefined});")
+    check(
+        "frameElement.callback 包裹 + 单引号 + undefined 一起处理",
+        parsed.get("code") == 0 and parsed.get("message") is None,
+        str(parsed),
+    )
+    parsed = _P.parse_response('_Callback({"code":0,"data":{"tid":"T4"}});')
+    check("_Callback 包裹仍能解析", parsed.get("code") == 0, str(parsed))
+    check(
+        "原有 JSONP 与 undefined 行为不变",
+        _P.parse_response('_preloadCallback({"code":0});').get("code") == 0
+        and _P.parse_response('{"code":0,"msg":undefined}').get("msg") is None,
+        "回归",
+    )
+    check(
+        "单引号字符串里的双引号与逗号不被误改",
+        _P.parse_response("{'con':'我说\"好\"，然后走了','code':0}").get("con")
+        == '我说"好"，然后走了',
+        str(_P.parse_response("{'con':'我说\"好\"，然后走了','code':0}")),
+    )
+
+    for raw, label in (
+        ("<html><head><title>QQ登录</title></head></html>", "HTML 登录页"),
+        ("ptlogin2.qq.com 请先登录", "ptlogin 提示"),
+        ("<!DOCTYPE html><body>安全验证</body>", "DOCTYPE 风控页"),
+    ):
+        payload = _P.parse_response(raw)
+        check(
+            f"{label} 判定为登录态 / 风控",
+            payload.get("code") == _const_mod.QZONE_CODE_LOGIN_REQUIRED
+            and "登录态可能已失效" in str(payload.get("message"))
+            and "/空间重登" in str(payload.get("message")),
+            str(payload),
+        )
+
+    payload = _P.parse_response("这不是数据，只是一段没有结构的返回")
+    check(
+        "非登录页的格式错误给「响应格式无法识别」",
+        payload.get("code") == -1
+        and "响应格式无法识别" in str(payload.get("message"))
+        and "详见日志" in str(payload.get("message")),
+        str(payload),
+    )
+    check(
+        "空响应仍然报空",
+        _P.parse_response("").get("message") == _const_mod.QZONE_MSG_EMPTY_RESPONSE,
+        str(_P.parse_response("")),
+    )
+    check(
+        "响应片段可见化：换行变成 \\n",
+        "\\n" in _P.visible_snippet("第一行\n第二行")
+        and "\n" not in _P.visible_snippet("a\nb"),
+        repr(_P.visible_snippet("第一行\n第二行")),
+    )
+
+    # 原始响应必须进日志（把 error 换成记录器，验证片段确实写进去了）
+    _stub_logger = sys.modules["astrbot.api"].logger
+    logged_errors: list[str] = []
+    _real_error = _stub_logger.error
+    _stub_logger.error = lambda *args, **kwargs: logged_errors.append(
+        str(args[0]) if args else ""
+    )
+    try:
+        _P.parse_response("<html><body>请先登录</body></html>")
+        _P.parse_response("这不是数据，只是一段没有结构的返回")
+    finally:
+        _stub_logger.error = _real_error
+    check(
+        "解析失败时原始响应片段会进日志",
+        any("请先登录" in item for item in logged_errors)
+        and any("这不是数据" in item for item in logged_errors),
+        str(logged_errors)[:200],
+    )
+    check(
+        "登录页的日志给出可操作建议",
+        any("/空间重登" in item for item in logged_errors),
+        str(logged_errors)[:200],
+    )
+
+    # 登录页 / 风控页 → 自动重取登录态并重试一次
+    plugin.api.EMOTION_URL = "http://127.0.0.1:8792/publish_login_page"
+    await plugin.session.invalidate()
+    resp = await plugin.api.publish("登录页重试测试")
+    check(
+        "登录页响应会自动重取登录态并重试一次",
+        resp.ok and resp.data.get("tid") == "TID_AFTER_LOGIN_PAGE",
+        str(resp),
+    )
+    check(
+        "确实重发了请求（第一次登录页、第二次成功）",
+        login_page_calls["count"] == 2,
+        str(login_page_calls),
+    )
+
+    plugin.api.EMOTION_URL = "http://127.0.0.1:8792/publish_login_page_always"
+    try:
+        await plugin.api.publish("一直返回登录页")
+        check("重试后仍失败会回报失败", False, "未抛异常")
+    except RuntimeError as e:
+        check(
+            "重试后仍失败时给出可操作提示",
+            "登录态" in str(e) and "/空间重登" in str(e),
+            str(e),
+        )
+
+    plugin.api.EMOTION_URL = "http://127.0.0.1:8792/publish_garbage"
+    out = await collect(plugin.cmd_publish(FakeEvent(), "格式异常的响应"))
+    check(
+        "格式无法识别时回执指向日志",
+        any(
+            "发布失败" in item and "响应格式无法识别" in item and "详见日志" in item
+            for item in out
+        ),
+        str(out)[:200],
+    )
+    check(
+        "失败也写进了发布历史",
+        plugin.store.recent(1)
+        and plugin.store.recent(1)[0].ok is False
+        and "响应格式无法识别" in plugin.store.recent(1)[0].error,
+        str(plugin.store.recent(1)),
+    )
+
+    # ==================================================================
+    print("\n[36] 避免每天的说说内容重复")
+
+    _content_mod = _imp("core.content")
+    time_slot_name = _content_mod.time_slot_name
+    text_similarity = _content_mod.text_similarity
+
+    check(
+        "时段划分：早上 / 中午 / 下午 / 晚上 / 深夜",
+        time_slot_name(datetime(2026, 9, 24, 7, 0)) == "早上"
+        and time_slot_name(datetime(2026, 9, 24, 12, 30)) == "中午"
+        and time_slot_name(datetime(2026, 9, 24, 15, 0)) == "下午"
+        and time_slot_name(datetime(2026, 9, 24, 20, 0)) == "晚上"
+        and time_slot_name(datetime(2026, 9, 24, 23, 30)) == "深夜"
+        and time_slot_name(datetime(2026, 9, 24, 3, 0)) == "深夜",
+        "时段划分",
+    )
+    check(
+        "相似度：完全相同为 1",
+        abs(text_similarity("今天去了公园散步", "今天去了公园散步") - 1.0) < 1e-9,
+        str(text_similarity("今天去了公园散步", "今天去了公园散步")),
+    )
+    check(
+        "相似度：差距很大时明显偏低",
+        text_similarity("今天下午去公园散步，风很舒服", "半夜听到楼下收摊的声音") < 0.2,
+        str(text_similarity("今天下午去公园散步，风很舒服", "半夜听到楼下收摊的声音")),
+    )
+    check(
+        "相似度：换词但结构相同会超过阈值",
+        text_similarity(
+            "今天下午去公园散步，风很舒服。",
+            "今天下午去公园走了走，风很舒服。",
+        )
+        > 0.6,
+        str(
+            text_similarity(
+                "今天下午去公园散步，风很舒服。",
+                "今天下午去公园走了走，风很舒服。",
+            )
+        ),
+    )
+
+    plugin.cfg.set("content_source", "llm")
+    plugin.cfg.set("llm_use_persona", False)
+    plugin.cfg.set("llm_use_life_context", False)
+    plugin.cfg.set("llm_reference_chat", False)
+    plugin.cfg.set("web_search_enabled", False)
+    plugin.cfg.set("publish_avoid_repeat_count", 5)
+    plugin.cfg.set("publish_repeat_threshold", 60)
+    plugin.cfg.set("publish_angle_pool", ["写一件今天具体的小事", "写一个声音或气味"])
+    plugin.store._records.clear()
+    plugin.store.append(
+        PublishRecord(time=1, text="第一条：昨天傍晚下了雨", source="llm")
+    )
+    plugin.store.append(
+        PublishRecord(time=2, text="第二条：今天中午吃了面", source="llm")
+    )
+    plugin.store.append(
+        PublishRecord(time=3, text="失败的内容不该被参考", source="llm", ok=False)
+    )
+
+    recent = plugin.content.recent_texts()
+    check(
+        "最近内容只取成功记录且最新在前",
+        recent[0] == "第二条：今天中午吃了面"
+        and recent[1] == "第一条：昨天傍晚下了雨"
+        and "失败的内容不该被参考" not in recent,
+        str(recent),
+    )
+
+    plugin.store._records.clear()
+    plugin.store.append(PublishRecord(time=1, text="很长的一句" * 15, source="llm"))
+    long_recent = plugin.content.recent_texts()
+    check(
+        "最近内容逐条截断到 60 字",
+        len(long_recent) == 1 and len(long_recent[0]) == 60,
+        str(len(long_recent[0]) if long_recent else 0),
+    )
+    plugin.cfg.set("publish_avoid_repeat_count", 0)
+    check(
+        "参考条数为 0 时不带最近内容",
+        plugin.content.recent_texts() == [],
+        str(plugin.content.recent_texts()),
+    )
+    plugin.cfg.set("publish_avoid_repeat_count", 5)
+
+    # 创作角度：同一天内不重复，落盘后可重新加载
+    plugin.content.angles._used.clear()
+    plugin.cfg.set(
+        "publish_angle_pool", ["角度一", "角度二", "角度三", "角度四", "角度五"]
+    )
+    picked = [plugin.content.pick_angle() for _ in range(3)]
+    check(
+        "同一天内抽到的角度互不重复",
+        len(set(picked)) == 3 and all(item for item in picked),
+        str(picked),
+    )
+    today_key = plugin.content.angles.day_key(datetime.now(tz))
+    reloaded_angles = _content_mod.AngleTracker(plugin.content.angles.path)
+    check(
+        "角度记录落盘并能重新加载",
+        set(picked) <= set(reloaded_angles.used_today(datetime.now(tz))),
+        f"{today_key}/{reloaded_angles.used_today(datetime.now(tz))}",
+    )
+    plugin.cfg.set("publish_angle_pool", ["只有一个角度"])
+    check(
+        "角度池用完时允许重复但仍返回角度",
+        plugin.content.pick_angle() == "只有一个角度",
+        "池子用尽",
+    )
+
+    # 提示词里带上最近内容、创作角度与当前时段
+    captured_prompts: list[str] = []
+    original_content_chat = plugin.ai.chat
+
+    async def capturing_content_ai(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        captured_prompts.append(str(system_prompt))
+        return "今天下午在窗边坐着，风把窗帘吹起来了一点。"
+
+    plugin.ai.chat = capturing_content_ai
+    plugin.cfg.set("publish_angle_pool", ["写一个声音或气味"])
+    plugin.content.angles._used.clear()
+    plugin.store._records.clear()
+    plugin.store.append(
+        PublishRecord(time=1, text="上周写过：早高峰的地铁", source="llm")
+    )
+    text, source = await plugin.content.generate()
+    system = captured_prompts[-1]
+    check(
+        "生成走 AI 分支",
+        source == "llm" and text.startswith("今天下午"),
+        f"{source}/{text}",
+    )
+    check(
+        "最近已发内容进入提示词并要求不要重复",
+        "上周写过：早高峰的地铁" in system
+        and "最近已经发过的内容" in system
+        and "不要重复上面用过的意象" in system,
+        system[:200],
+    )
+    check(
+        "创作角度进入提示词",
+        "本次的写作切入角度" in system and "写一个声音或气味" in system,
+        system[:200],
+    )
+    check(
+        "当前时段进入提示词并限定只写当下",
+        "当前时段" in system and "不要写一整天" in system,
+        system[:200],
+    )
+    check(
+        "上次生成依据记录了角度、时段与参考条数",
+        plugin.content.last_generation.get("angle") == "写一个声音或气味"
+        and plugin.content.last_generation.get("slot")
+        and plugin.content.last_generation.get("recent") == 1,
+        str(plugin.content.last_generation)[:200],
+    )
+
+    # 相似度超阈值 → 自动重写一次
+    calls = {"count": 0}
+
+    async def similar_then_new(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        captured_prompts.append(str(system_prompt))
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "上周写过：早高峰的地铁"
+        return "半夜醒了，听见楼下有人在收摊。"
+
+    plugin.ai.chat = similar_then_new
+    plugin.cfg.set("publish_angle_pool", ["写一个突然冒出来的念头"])
+    rewritten_text, _ = await plugin.content.generate()
+    check(
+        "与最近内容过于相似时自动重写一次",
+        calls["count"] == 2 and rewritten_text == "半夜醒了，听见楼下有人在收摊。",
+        f"{calls['count']}/{rewritten_text}",
+    )
+    check(
+        "重写提示词点明与最近某条过于相似",
+        "过于相似" in captured_prompts[-1]
+        and "换一个完全不同的切入角度" in captured_prompts[-1],
+        captured_prompts[-1][-160:],
+    )
+    check(
+        "重写后相似度下降就不告警",
+        plugin.content.last_generation.get("repeat_rewritten") is True
+        and not plugin.content.last_generation.get("repeat_warning"),
+        str(plugin.content.last_generation.get("repeat_warning")),
+    )
+    check(
+        "重写后没有告警注记",
+        plugin.content.warning_note() == "",
+        plugin.content.warning_note(),
+    )
+
+    # 重写后仍然相似 → 照发但写入日志与回执注记
+    calls["count"] = 0
+    logged_warnings: list[str] = []
+    _stub_logger = sys.modules["astrbot.api"].logger
+    real_warning = _stub_logger.warning
+    _stub_logger.warning = lambda *args, **kwargs: logged_warnings.append(
+        str(args[0]) if args else ""
+    )
+    try:
+
+        async def always_similar(
+            *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+        ):
+            calls["count"] += 1
+            return "上周写过：早高峰的地铁"
+
+        plugin.ai.chat = always_similar
+        still_text, _ = await plugin.content.generate()
+    finally:
+        _stub_logger.warning = real_warning
+    check(
+        "重写后仍相似时只重写一次并照常采用",
+        calls["count"] == 2 and still_text == "上周写过：早高峰的地铁",
+        f"{calls['count']}/{still_text}",
+    )
+    check(
+        "重写后仍相似会写日志",
+        any("重写后仍与最近的内容相似" in item for item in logged_warnings),
+        str(logged_warnings)[:200],
+    )
+    check(
+        "重写后仍相似会进回执注记",
+        "重写后仍与最近的内容相似" in plugin.content.warning_note(),
+        plugin.content.warning_note(),
+    )
+    check(
+        "告警同时写进上次生成依据的提醒列表",
+        any(
+            "仍然相似" in str(item) or "重写后仍" in str(item)
+            for item in plugin.content.last_generation.get("warnings") or []
+        ),
+        str(plugin.content.last_generation.get("warnings")),
+    )
+
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里显示创作角度、时段与相似度",
+        any("角度=" in item and "时段=" in item for item in out)
+        and any("避免重复: 参考最近" in item for item in out),
+        str([item for item in out if "角度=" in item or "避免重复" in item])[:240],
+    )
+
+    # 关闭开关：阈值 100 表示不检查
+    calls["count"] = 0
+    plugin.ai.chat = always_similar
+    plugin.cfg.set("publish_repeat_threshold", 100)
+    await plugin.content.generate()
+    check(
+        "阈值 100 时关闭相似度检查（不重写）",
+        calls["count"] == 1
+        and plugin.content.last_generation.get("repeat_checked") is False,
+        f"{calls['count']}/{plugin.content.last_generation.get('repeat_checked')}",
+    )
+    plugin.cfg.set("publish_repeat_threshold", 60)
+    plugin.ai.chat = original_content_chat
+    plugin.store._records.clear()
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

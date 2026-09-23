@@ -2,6 +2,15 @@
 
 AI 生成时可选注入：Bot 人设、今日生活日程（穿搭+日程）、最近聊天记录、
 以及 AstrBot 自带联网搜索查到的近期资料。
+
+为了避免「每天的说说都很像」，AI 生成路径还会做三件事（缺一层效果都不明显）：
+
+1. 把最近若干条已发说说当作「不要重复」的参照交给模型；
+2. 每次随机抽一个**创作角度**注入提示词，并保证同一天内各条角度不同；
+3. 告诉模型**当前时段**（早上 / 中午 / 下午 / 晚上 / 深夜），只写当下这一刻的事。
+
+生成后还会与最近内容算一次相似度，超过阈值就自动重写一次。
+
 所有 AI 调用统一走 :class:`~.llm.AIClient`，因此既可以用 AstrBot 里配好的提供商，
 也可以在插件配置里直接填 API 密钥。
 """
@@ -11,6 +20,7 @@ from __future__ import annotations
 import json
 import random
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +32,7 @@ from .llm import AIClient
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注，避免运行期循环导入
     from .life import LifeManager
+    from .store import PublishStore
     from .web import WebSearchBridge
 
 _CODE_FENCE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```$")
@@ -36,6 +47,142 @@ DEFAULT_SEARCH_QUERY_PROMPT = (
     "只输出一句搜索关键词（不要引号、不要解释、不要标点结尾）。"
 )
 
+# 时段划分（按插件时区）：(起始小时, 结束小时, 名称)，左闭右开；深夜跨零点单独处理
+_TIME_SLOTS: tuple[tuple[int, int, str], ...] = (
+    (5, 11, "早上"),
+    (11, 13, "中午"),
+    (13, 17, "下午"),
+    (17, 22, "晚上"),
+)
+_NIGHT_SLOT = "深夜"
+
+# 创作角度文件：记录每天已用过的角度，保证同一天内各条不重复
+_ANGLE_FILE = "publish_angles.json"
+_ANGLE_KEEP_DAYS = 7
+
+
+def time_slot_name(moment: datetime) -> str:
+    """按小时判断当前时段名。
+
+    Args:
+        moment: 时刻。
+
+    Returns:
+        早上 / 中午 / 下午 / 晚上 / 深夜 之一。
+    """
+    hour = int(moment.hour)
+    for start, end, name in _TIME_SLOTS:
+        if start <= hour < end:
+            return name
+    return _NIGHT_SLOT
+
+
+def text_similarity(left: str, right: str) -> float:
+    """计算两段文本的相似度（字符 bigram 的 Jaccard 系数）。
+
+    中文没有词边界，按字符二元组比较比按词更稳；两边都太短时退回「完全相同才算相似」。
+
+    Args:
+        left: 文本一。
+        right: 文本二。
+
+    Returns:
+        0.0 ~ 1.0 的相似度。
+    """
+
+    def grams(text: str) -> set[str]:
+        cleaned = re.sub(r"\s+", "", str(text or ""))
+        if len(cleaned) < 2:
+            return {cleaned} if cleaned else set()
+        return {cleaned[index : index + 2] for index in range(len(cleaned) - 1)}
+
+    left_grams = grams(left)
+    right_grams = grams(right)
+    if not left_grams or not right_grams:
+        return 0.0
+    union = left_grams | right_grams
+    if not union:
+        return 0.0
+    return len(left_grams & right_grams) / len(union)
+
+
+class AngleTracker:
+    """记录每天已经用过的创作角度，保证同一天内不重复。"""
+
+    def __init__(self, path: Path | None) -> None:
+        """初始化。
+
+        Args:
+            path: 落盘路径；为 None 时只保存在内存里（便于测试或没有数据目录的场景）。
+        """
+        self.path = Path(path) if path else None
+        self._used: dict[str, list[str]] = {}
+        self.load()
+
+    def load(self) -> None:
+        """从磁盘读取记录。"""
+        self._used = {}
+        if self.path is None or not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"创作角度记录读取失败，已忽略: {e}")
+            return
+        if not isinstance(raw, dict):
+            return
+        for day, items in raw.items():
+            if isinstance(items, list):
+                self._used[str(day)] = [str(item) for item in items if str(item)]
+
+    def save(self) -> None:
+        """原子写入记录，只保留最近 7 天。"""
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            keys = sorted(self._used)[-_ANGLE_KEEP_DAYS:]
+            payload = {key: self._used[key] for key in keys}
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self.path)
+        except Exception as e:
+            logger.error(f"创作角度记录写入失败: {e}")
+
+    @staticmethod
+    def day_key(moment: datetime) -> str:
+        """当天的日期串。"""
+        return moment.strftime("%Y-%m-%d")
+
+    def used_today(self, moment: datetime) -> list[str]:
+        """今天已经用过的角度。"""
+        return list(self._used.get(self.day_key(moment), []))
+
+    def pick(self, pool: list[str], moment: datetime) -> str:
+        """从角度池里挑一个今天没用过的角度。
+
+        Args:
+            pool: 角度池（已去空）。
+            moment: 当前时刻，用于判断「今天」。
+
+        Returns:
+            选中的角度；角度池为空时返回空串；池子今天已用完时允许重复并记日志。
+        """
+        if not pool:
+            return ""
+        day = self.day_key(moment)
+        used = self._used.setdefault(day, [])
+        candidates = [item for item in pool if item not in used]
+        if not candidates:
+            logger.info(f"创作角度池今天已经用完（{len(pool)} 个），本次允许重复使用")
+            candidates = list(pool)
+        chosen = random.choice(candidates)
+        used.append(chosen)
+        self.save()
+        return chosen
+
 
 class ContentGenerator:
     """按配置生成待发布的文本内容。"""
@@ -46,6 +193,7 @@ class ContentGenerator:
         ai: AIClient,
         life: LifeManager | None = None,
         web: WebSearchBridge | None = None,
+        store: PublishStore | None = None,
     ) -> None:
         """初始化内容生成器。
 
@@ -54,14 +202,18 @@ class ContentGenerator:
             ai: AI 客户端。
             life: 生活日程管理器，可为 None（不注入日程）。
             web: AstrBot 内置联网搜索桥，可为 None（不使用联网素材）。
+            store: 发布历史，可为 None（不做「避免重复」的参照）。
         """
         self.cfg = config
         self.ai = ai
         self.life = life
         self.web = web
+        self.store = store
         self.context: Context | None = getattr(ai, "context", None)
         self.last_generation: dict[str, Any] = {}
         self._last_umo = ""
+        data_dir = getattr(config, "data_dir", None)
+        self.angles = AngleTracker((Path(data_dir) / _ANGLE_FILE) if data_dir else None)
 
     def remember_umo(self, umo: str) -> None:
         """记录最近一次触发指令的会话，用于参考聊天记录。
@@ -71,6 +223,96 @@ class ContentGenerator:
         """
         if umo:
             self._last_umo = str(umo)
+
+    # ------------------------------------------------------------------
+    # 避免重复：最近内容 / 创作角度 / 当前时段
+    # ------------------------------------------------------------------
+
+    def _now(self) -> datetime:
+        """当前时刻（按插件时区）。"""
+        try:
+            return datetime.now(self.cfg.timezone)
+        except Exception:
+            return datetime.now()
+
+    def recent_texts(self) -> list[str]:
+        """最近若干条已发说说的正文（用于「不要重复」）。
+
+        Returns:
+            正文列表，最新在前，每条截断到 60 字；未配置条数或没有历史时返回空列表。
+        """
+        count = int(self.cfg.publish_avoid_repeat_count or 0)
+        if count <= 0 or self.store is None:
+            return []
+        return [item[:60] for item in self.store.recent_success_texts(count)]
+
+    @property
+    def angle_pool(self) -> list[str]:
+        """创作角度池（去空、去重）。"""
+        pool: list[str] = []
+        for item in self.cfg.publish_angle_pool or []:
+            text = str(item).strip()
+            if text and text not in pool:
+                pool.append(text)
+        return pool
+
+    def pick_angle(self) -> str:
+        """挑一个今天没用过的创作角度。"""
+        return self.angles.pick(self.angle_pool, self._now())
+
+    def _avoid_repeat_parts(self, recent: list[str]) -> list[str]:
+        """拼「不要重复」相关提示词段落。"""
+        if not recent:
+            return []
+        listing = "\n".join(f"- {item}" for item in recent)
+        return [
+            "# 最近已经发过的内容（不要重复）\n"
+            f"{listing}\n"
+            "- 不要重复上面用过的意象、句式、开头方式与结尾方式\n"
+            "- 换一个完全不同的切入角度写这一条"
+        ]
+
+    def _now_parts(self, angle: str) -> list[str]:
+        """拼「创作角度 + 当前时段」提示词段落。"""
+        parts: list[str] = []
+        if angle:
+            parts.append(
+                "# 本次的写作切入角度\n"
+                f"- {angle}\n"
+                "- 只从这个角度写，不要面面俱到，也不要写成一天的总结"
+            )
+        slot = time_slot_name(self._now())
+        parts.append(
+            f"# 当前时段\n- 现在是{slot}，只写当下这个时段发生的事与感受，不要写一整天"
+        )
+        return parts
+
+    def repeat_report(self, text: str, recent: list[str]) -> tuple[float, str]:
+        """把生成的文本与最近内容比对。
+
+        Args:
+            text: 本次生成的正文。
+            recent: 最近已发过的正文。
+
+        Returns:
+            二元组 (最高相似度 0~1, 最相似的那条)；没有可比较对象时为 (0.0, "")。
+        """
+        best = 0.0
+        closest = ""
+        for item in recent:
+            score = text_similarity(text, item)
+            if score > best:
+                best, closest = score, item
+        return best, closest
+
+    def warning_note(self) -> str:
+        """把「避免重复」相关的提醒拼成一行，供回执与状态展示。"""
+        warning = str(self.last_generation.get("repeat_warning") or "").strip()
+        return f"\n⚠️ {warning}" if warning else ""
+
+    # ------------------------------------------------------------------
+    # 生成
+    # ------------------------------------------------------------------
 
     async def generate(self) -> tuple[str, str]:
         """按配置生成一条发布内容。
@@ -83,18 +325,87 @@ class ContentGenerator:
         """
         source = str(self.cfg.content_source or "pool").strip().lower()
         if source == "llm":
-            return await self.rewrite(), "llm"
+            return await self._generate_llm(), "llm"
         if source == "file":
             return self._from_file(), "file"
         if source != "pool":
             logger.warning(f"未知的内容来源 {source}，已回退为文案池")
         return self._from_pool(), "pool"
 
-    async def rewrite(self, previous: str = "") -> str:
+    async def _generate_llm(self) -> str:
+        """AI 生成一条内容，并在必要时做一次「太像了就重写」。
+
+        Returns:
+            生成好的文本。
+
+        Raises:
+            RuntimeError: AI 不可用或返回为空时抛出。
+        """
+        recent = self.recent_texts()
+        angle = self.pick_angle()
+        text = await self.rewrite(angle=angle)
+
+        threshold = max(min(int(self.cfg.publish_repeat_threshold or 0), 100), 0)
+        checked = bool(recent) and 0 < threshold < 100
+        if not checked:
+            # 没开检查：也要把角度与参考条数留下来给状态指令看
+            basis = self.last_generation
+            basis["angle"] = angle
+            basis["recent"] = len(recent)
+            basis["repeat"] = 0
+            basis["repeat_checked"] = False
+            return text
+
+        score, closest = self.repeat_report(text, recent)
+        if score * 100 < threshold:
+            basis = self.last_generation
+            basis["angle"] = angle
+            basis["recent"] = len(recent)
+            basis["repeat"] = round(score * 100)
+            basis["repeat_checked"] = True
+            return text
+
+        logger.warning(
+            f"生成的内容与最近一条相似度 {score * 100:.0f}%（阈值 {threshold}%），"
+            "自动重写一次"
+        )
+        hint = (
+            "这次生成的内容与最近这条过于相似"
+            f"：「{closest[:30]}」。换一个完全不同的切入角度重写，"
+            "不要沿用它的意象、句式、开头与结尾。"
+        )
+        rewritten = await self.rewrite(previous=text, repeat_hint=hint, angle=angle)
+        new_score, new_closest = self.repeat_report(rewritten, recent)
+        # 重写会重新写一份生成依据，这里取最新的一份再补上「避免重复」的结果
+        basis = self.last_generation
+        basis["angle"] = angle
+        basis["recent"] = len(recent)
+        basis["repeat"] = round(new_score * 100)
+        basis["repeat_checked"] = True
+        basis["repeat_rewritten"] = True
+        if new_score * 100 >= threshold:
+            note = (
+                f"重写后仍与最近的内容相似（{new_score * 100:.0f}%，阈值 {threshold}%），"
+                "本次照常发布"
+            )
+            basis["repeat_warning"] = note
+            basis["warnings"].append(note)
+            logger.warning(f"{note}｜最相似的一条：{new_closest[:30]}")
+        else:
+            logger.info(
+                f"重写后相似度降到 {new_score * 100:.0f}%（阈值 {threshold}%），采用重写结果"
+            )
+        return rewritten
+
+    async def rewrite(
+        self, previous: str = "", *, repeat_hint: str = "", angle: str = ""
+    ) -> str:
         """强制用 AI 重新生成一版内容。
 
         Args:
             previous: 上一版内容，传入后会让模型避开重复表达。
+            repeat_hint: 「与最近某条过于相似」的额外要求，重写时使用。
+            angle: 本次的创作切入角度；留空表示不注入角度。
 
         Returns:
             生成好的文本。
@@ -122,6 +433,13 @@ class ContentGenerator:
 
         task = str(self.cfg.llm_prompt or "").strip() or DEFAULT_POST_PROMPT
         parts.append(f"# 任务\n{task}")
+
+        repeat_parts = self._avoid_repeat_parts(self.recent_texts())
+        parts.extend(repeat_parts)
+        parts.extend(self._now_parts(angle))
+        basis["avoid_repeat"] = bool(repeat_parts)
+        basis["slot"] = time_slot_name(self._now())
+        basis["angle"] = angle
 
         if bool(self.cfg.llm_use_life_context) and self.life is not None:
             life_context = await self.life.prompt_context()
@@ -155,6 +473,8 @@ class ContentGenerator:
             parts.append(
                 "# 上一版（已被否决，不要重复同样的表达）\n" + previous.strip()[:200]
             )
+        if repeat_hint:
+            parts.append("# 必须避免的重复\n" + repeat_hint)
 
         # 让 AI 自己先确认「我是谁、我今天在做什么」，再把它们引用进正文
         if basis["life"] and bool(self.cfg.llm_life_must_reference):
@@ -167,8 +487,8 @@ class ContentGenerator:
                 "\n# 引用要求\n"
                 "- 正文里要自然带出今天行程中的**具体细节**（正在做的事、去过的地方、"
                 "身上的穿搭等），至少一处，让这条说说与你今天的生活真正连得上\n"
-                "- 不要罗列日程表、不要写成流水账、也不要解释你在引用日程，"
-                "像随手记一句那样提一下即可\n"
+                "- 只取与当前时段相符的一处细节，不要罗列整天的日程表、不要写成流水账、"
+                "也不要解释你在引用日程\n"
                 "- 细节可以与日程呼应但要用你自己的话，不要照抄日程原文"
             )
         elif bool(self.cfg.llm_use_life_context):
@@ -203,6 +523,8 @@ class ContentGenerator:
             f"AI 生成的说说内容: {text}｜依据: 人设={basis['persona'] or '无'}"
             f"，日程={'有' if basis['life'] else '无'}"
             f"，联网={'有' if basis['web'] else '无'}"
+            f"，角度={basis.get('angle') or '无'}"
+            f"，时段={basis.get('slot') or '未知'}"
             f"，约 {basis['tokens'].get('total', 0)} tokens"
         )
         return text

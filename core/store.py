@@ -112,3 +112,28 @@ class PublishStore:
             if record.ok:
                 return record
         return None
+
+    def recent_success_texts(self, count: int = 5) -> list[str]:
+        """返回最近 count 条发布成功的正文，最新在前。
+
+        用于「避免与最近发过的内容重复」：只取成功记录，跳过空正文与重复文本。
+
+        Args:
+            count: 最多返回几条；0 或负数表示不取。
+
+        Returns:
+            正文列表，最新在前。
+        """
+        if count <= 0:
+            return []
+        texts: list[str] = []
+        for record in reversed(self._records):
+            if not record.ok:
+                continue
+            text = str(record.text or "").strip()
+            if not text or text in texts:
+                continue
+            texts.append(text)
+            if len(texts) >= count:
+                break
+        return texts

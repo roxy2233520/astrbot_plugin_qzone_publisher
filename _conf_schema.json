@@ -330,6 +330,20 @@
         "editor_theme": "vs-dark",
         "default": "请以第一人称写一条发在QQ空间的说说，内容贴近你的日常与心情，简短自然，不要出现“说说”“动态”等词，不要加引号、标题或解释。"
       },
+      "publish_angle_pool": {
+        "description": "创作角度池",
+        "hint": "每次生成随机抽一个角度写，并保证同一天内各条用到的角度不同；默认 7 条，可自行增删",
+        "type": "list",
+        "default": [
+          "写一件今天具体的小事",
+          "写一句没说出口的话",
+          "写一个声音或气味",
+          "写一个身边的物件",
+          "写此刻的身体感受",
+          "写一句想对某人说的话",
+          "写一个突然冒出来的念头"
+        ]
+      },
       "llm_use_persona": {
         "description": "生成时注入 Bot 人设",
         "type": "bool",
@@ -368,6 +382,28 @@
           "step": 5
         },
         "default": 30
+      },
+      "publish_avoid_repeat_count": {
+        "description": "参考最近几条已发内容",
+        "hint": "把最近这么多条发布成功的正文交给 AI 作为「不要重复」的参照（逐条截断到 60 字）；0 表示不参考",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 20,
+          "step": 1
+        },
+        "default": 5
+      },
+      "publish_repeat_threshold": {
+        "description": "重复相似度阈值（%）",
+        "hint": "生成后与最近已发内容比较相似度，达到该值就自动重写一次；重写后仍然相似则照常发布并提示；100 表示关闭检查",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 100,
+          "step": 5
+        },
+        "default": 60
       },
       "llm_max_chars": {
         "description": "生成内容最大字数",

@@ -8,11 +8,15 @@ from astrbot.api import logger
 from .constants import (
     HTTP_STATUS_UNAUTHORIZED,
     QZONE_CODE_LOGIN_EXPIRED,
+    QZONE_CODE_LOGIN_REQUIRED,
     QZONE_INTERNAL_HTTP_STATUS_KEY,
     QZONE_INTERNAL_META_KEY,
 )
 from .parser import QzoneParser
 from .session import QzoneSession
+
+# 判定为登录态失效 / 被风控的返回码（业务码 + 解析层的合成码）
+_LOGIN_REQUIRED_CODES = (QZONE_CODE_LOGIN_EXPIRED, QZONE_CODE_LOGIN_REQUIRED)
 
 
 class QzoneHttpClient:
@@ -90,14 +94,20 @@ class QzoneHttpClient:
             parsed[QZONE_INTERNAL_META_KEY] = meta
         meta[QZONE_INTERNAL_HTTP_STATUS_KEY] = status
 
-        # 仅在明确登录失效时重新获取 Cookie 并重试一次
+        # 明确登录失效（401 / -3000）或响应被判定为登录页、风控页（-3001）时，
+        # 重新获取 Cookie 并重试一次；发布、点赞、评论、回复等路径都由这里统一覆盖。
         if (
             status == HTTP_STATUS_UNAUTHORIZED
-            or parsed.get("code") == QZONE_CODE_LOGIN_EXPIRED
+            or parsed.get("code") in _LOGIN_REQUIRED_CODES
         ):
             if retry >= 1:
-                raise RuntimeError("QQ空间登录态失效，重新获取 Cookie 后仍然失败")
-            logger.warning("QQ空间登录态失效，正在重新获取 Cookie 并重试")
+                raise RuntimeError(
+                    "登录态可能已失效或被风控拦截，已自动重取登录态后仍然失败，"
+                    "请用 /空间重登 重取后再试"
+                )
+            logger.warning(
+                "QQ空间登录态可能已失效或被风控拦截，正在重新获取 Cookie 并重试"
+            )
             await self.session.invalidate()
             return await self.request(
                 method,
