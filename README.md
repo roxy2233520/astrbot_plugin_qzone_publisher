@@ -135,6 +135,20 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 通知默认发给 AstrBot 的管理员私聊；可用 `admin_uins` 单独指定插件内的收件人，
 或用 `/空间管理员 add 你的QQ号` 维护名单。`notify_umo` 可以再指定一个会话同时接收通知。
 
+### 结果在哪里看
+
+| 想确认的事 | 在哪里看 |
+| :--- | :--- |
+| 定时任务是否正常、下次什么时候发 | `/空间状态` 的「定时发布」一行（显示开/关与每天的时间点列表） |
+| 这条说说发出去了没有 | 发布通知（发给管理员私聊，`notify_umo` 可另加一个会话），通知里带成功或失败原因 |
+| 历史记录与失败原因 | `/空间历史`，条数由 `history_limit` 控制 |
+| 待确认的草稿 | 草稿会私聊发给你，`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
+| 本次生成依据与 AI 用量 | `/空间状态` 的「上次生成依据」与 Token 用量两行；明细用 `/空间用量 [天数]` |
+| 今日生活日程 | `/空间日程`，`renew` 重新生成 |
+| 问候与节日祝福发了没有 | 问候通知与 `/空间状态` 的「定时问候」「节日祝福」两行（含本次将发给几人、今日已发几人） |
+| 巡检做了什么 | `interact_notify` 打开后每次巡检结束会发一条汇总；好友说说与自己说说下的评论都会覆盖 |
+| 主动消息的同意情况 | `/空间状态` 的「主动消息同意」一行，以及问候通知里的「因未接受主动消息跳过 N 人」 |
+
 ### 数据与升级
 
 运行期数据全部写在 AstrBot 数据目录下的 `plugin_data/astrbot_plugin_qzone_publisher/`，
@@ -556,7 +570,7 @@ astrbot_plugin_qzone_publisher/
 ├── logo.png                   插件图标（可用 tools/make_logo.py 重新生成）
 ├── README.md / CHANGELOG.md   说明文档与更新日志
 ├── LICENSE                    许可证（AGPL-3.0）
-├── THIRD_PARTY_NOTICES.md     第三方许可与致谢
+├── THIRD_PARTY_NOTICES.md     第三方许可声明
 ├── ruff.toml                  代码检查配置
 ├── .gitattributes             换行符统一为 LF（避免跨平台整文件 diff）
 ├── .astrbot-plugin/i18n/      插件名与描述的国际化文案
@@ -595,35 +609,8 @@ astrbot_plugin_qzone_publisher/
 
 ---
 
-## 开发与测试
-
-```bash
-pip install aiohttp apscheduler pyyaml
-
-python tests/run_tests.py        # 502 项功能自测（不需要安装 AstrBot）
-python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
-python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
-python tests/check_logo.py       # 校验 logo.png
-
-ruff check . && ruff format --check .   # 代码检查与格式（配置见 ruff.toml）
-```
-
-细节见 [tests/README.md](tests/README.md)。CI 会在 Python 3.10 与 3.12 上跑上面全部检查。
-
----
-
 ## 免责声明
 
 1. 本插件使用 QQ空间**网页端私有协议**，非腾讯官方接口。接口变更、风控、频率限制都可能导致失败。
 2. 请遵守相关服务条款与法律法规，不要用于营销刷屏、骚扰他人等用途。
 3. 使用本插件产生的任何后果（包括但不限于账号受限）由使用者自行承担。
-
----
-
-## 致谢与许可
-
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot)：插件框架与配置面板机制。
-
-完整的第三方许可声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-本项目以 [AGPL-3.0](LICENSE) 许可发布。更新记录见 [CHANGELOG.md](CHANGELOG.md)。
