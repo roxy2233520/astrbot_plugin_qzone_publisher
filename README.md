@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-493%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-502%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -260,6 +260,9 @@
 各板块内部统一按「开关 → 对象与时间 → 模型提供商 → 内容与提示词 → 数量与限制 → 通知」排列。
 
 > 从旧版本升级：面板结构变了，但**原有配置值会自动迁移到对应板块**，无需重新填写。
+> 自动发布时间也会被继承：旧版填的「每天一次」时间会转成对应的时间点
+> （例如 `30 00 * * *` → `00:30`），带星期/月份限定的写法仍由 `publish_cron` 生效——
+> **升级后发布时间不会被改成别的时间**。
 
 ### 基础设置
 
@@ -315,9 +318,9 @@
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `auto_publish_enabled` | `false` | 定时自动发布总开关 |
-| `publish_per_day` | `1` | 每天自动发布几条；`0` 表示不自动发布。**多于可用时间点个数时视为配置不完整**：当天不会自动发布，并在状态、`/空间定时` 回执与日志里提示补齐时间点或调小条数 |
-| `publish_times` | `["08:30"]` | 发布时间点列表（`HH:MM`），按顺序取前 `publish_per_day` 个，每个时间点各自加随机抖动。**个数必须不少于「每天自动发布几条」**，否则视为配置不完整而不发布 |
-| `publish_cron` | `30 8 * * *` | 兼容项：仅当 `publish_times` 为空或全部无法识别时，作为唯一时间点生效（此时若条数大于 1 也算配置不完整） |
+| `publish_per_day` | `1` | 每天自动发布几条；`0` 表示不自动发布。**时间点个数不足时视为配置不完整**：当天不会自动发布，并在状态、`/空间定时` 回执与日志里提示补齐时间点或调小条数 |
+| `publish_times` | `[]` | 发布时间点列表（`HH:MM`），按顺序取前 `publish_per_day` 个，每个时间点各自加随机抖动。**留空时使用 `publish_cron`**；个数必须不少于「每天自动发布几条」，否则视为配置不完整而不发布 |
+| `publish_cron` | `30 8 * * *` | 每天一次的发布时间：`publish_times` 留空（或全部无法识别）时按这里执行；支持 `HH:MM` 或 5 段 Cron（带星期/月份限定的写法只能写在这里） |
 | `publish_jitter` | `600` | 触发后随机延后 0~N 秒，0=精确触发 |
 | `llm_provider_id` | 空 | 写说说使用哪个模型提供商（留空用全局） |
 | `content_source` | `pool` | 下拉选择：文案池 / 文本文件 / AI 生成 |
@@ -576,7 +579,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 493 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 502 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

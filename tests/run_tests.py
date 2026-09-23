@@ -3259,6 +3259,95 @@ async def main() -> int:
         str(again.publish_cron),
     )
 
+    # 升级兼容：旧 publish_cron 要继承成 publish_times，发布时间不能被静默改掉
+    CronTaskGroup = _imp("core.scheduler").CronTaskGroup
+
+    async def publish_noop() -> None:
+        """占位任务：只用来验证调度参数。"""
+        return None
+
+    def group_of(config_obj) -> object:
+        return CronTaskGroup.from_config(
+            config_obj,
+            name="qzone_auto_publish",
+            job=publish_noop,
+            times_key="publish_times",
+            per_day_key="publish_per_day",
+            cron_key="publish_cron",
+            jitter_key="publish_jitter",
+            enabled_key="auto_publish_enabled",
+        )
+
+    simple_cfg = PluginConfig(
+        StubAstrBotConfig({"publish_cron": "30 00 * * *"}), FakeContext(onebot)
+    )
+    check(
+        "旧发布时间（每天一次）被继承为 publish_times",
+        simple_cfg.publish_times == ["00:30"] and simple_cfg.publish_per_day == 1,
+        f"{simple_cfg.publish_times}/{simple_cfg.publish_per_day}",
+    )
+    check(
+        "继承后两处写法一致",
+        simple_cfg.publish_cron == "30 0 * * *",
+        simple_cfg.publish_cron,
+    )
+    simple_group = group_of(simple_cfg)
+    check(
+        "调度实际按旧时间 00:30 执行",
+        simple_group.crons == ["30 0 * * *"] and simple_group.times_used == ["00:30"],
+        f"{simple_group.crons}/{simple_group.times_used}",
+    )
+
+    complex_cfg = PluginConfig(
+        StubAstrBotConfig({"publish_cron": "0 8 * * 1"}), FakeContext(onebot)
+    )
+    check(
+        "复杂写法不转换，publish_times 保持为空",
+        complex_cfg.publish_times == [] and complex_cfg.publish_cron == "0 8 * * 1",
+        f"{complex_cfg.publish_times}/{complex_cfg.publish_cron}",
+    )
+    complex_group = group_of(complex_cfg)
+    check(
+        "复杂写法仍按原 cron 触发",
+        complex_group.crons == ["0 8 * * 1"],
+        str(complex_group.crons),
+    )
+
+    plugin.cfg.set("publish_times", [])
+    plugin.cfg.set("publish_cron", "0 8 * * 1")
+    plugin.publish_task.reconfigure(times=[], per_day=1, cron="0 8 * * 1", enabled=True)
+    schedule_text = plugin._schedule_text()
+    schedule_head = schedule_text.splitlines()[0]
+    check(
+        "状态里显示原 cron 而不是 08:30",
+        "0 8 * * 1" in schedule_head and "08:30" not in schedule_head,
+        schedule_head,
+    )
+    plugin.publish_task.stop()
+
+    empty_cfg = PluginConfig(
+        StubAstrBotConfig({"publish_cron": ""}), FakeContext(onebot)
+    )
+    empty_group = group_of(empty_cfg)
+    check(
+        "时间点与兼容项都为空时不自动发布且不报错",
+        empty_group.crons == [] and empty_group.incomplete is False,
+        f"{empty_group.crons}/{empty_group.incomplete}/{empty_group.error}",
+    )
+
+    fresh_cfg = PluginConfig(StubAstrBotConfig({}), FakeContext(onebot))
+    check(
+        "新用户开箱：publish_times 为空，时间由 publish_cron 决定",
+        fresh_cfg.publish_times == [] and fresh_cfg.publish_cron == "30 8 * * *",
+        f"{fresh_cfg.publish_times}/{fresh_cfg.publish_cron}",
+    )
+    fresh_group = group_of(fresh_cfg)
+    check(
+        "开箱时间是 08:30",
+        fresh_group.crons == ["30 8 * * *"],
+        str(fresh_group.crons),
+    )
+
     print("\n[30] 回复自己说说下的评论")
 
     plugin.api.LIST_URL = f"{AI_BASE}/feeds"

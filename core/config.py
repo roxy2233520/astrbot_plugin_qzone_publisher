@@ -11,12 +11,15 @@
 旧版本是扁平结构，升级时 AstrBot 会删掉 schema 里不存在的键并立刻存盘，
 因此旧键在新 schema 里以「带永不成立 condition 的隐藏项」保留下来，
 由 :meth:`PluginConfig.migrate_flat_config` 在插件启动时把值搬进板块并打上标记，
-用户原有配置不会丢。
+用户原有配置不会丢。搬运时还会处理一处语义变化：新版发布时间优先读
+``publish_times``，所以旧版 ``publish_cron`` 会被继承成对应的时间点，
+避免升级后发布时间被静默改成别的值。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -199,6 +202,12 @@ class PluginConfig:
     def migrate_flat_config(self) -> list[str]:
         """把旧版扁平配置的值搬进新板块结构（同一次安装只做一次）。
 
+        除了搬运，还会处理一处**语义变化**：新版自动发布时间优先读
+        ``publish_times``（时间点列表），而旧版只有 ``publish_cron``。
+        如果只搬运不改写，旧用户的时间会从 ``publish_cron`` 悄悄变成
+        ``publish_times`` 的默认值——所以这里把「每天一次」的旧写法继承进来，
+        复杂写法则留空 ``publish_times``，交给「为空时回退 ``publish_cron``」的既有逻辑。
+
         Returns:
             本次搬移的配置项名列表；无需迁移时为空。
         """
@@ -224,6 +233,8 @@ class PluginConfig:
             except Exception as e:  # pragma: no cover - 极端情况下不强求删除
                 logger.debug(f"删除旧配置键 {key} 失败: {e}")
 
+        self._inherit_publish_time(raw)
+
         raw[MIGRATION_FLAG] = True
         try:
             raw.save_config()
@@ -232,6 +243,84 @@ class PluginConfig:
         if moved:
             logger.info(f"已把 {len(moved)} 项旧配置迁移到新的板块结构（原值保持不变）")
         return moved
+
+    @staticmethod
+    def _simple_daily_time(spec: object) -> str | None:
+        """把「每天一次」的简单时间写法转成 ``HH:MM``；复杂写法返回 None。
+
+        Args:
+            spec: 旧版 ``publish_cron`` 的值（``HH:MM`` 或 5 段 Cron）。
+
+        Returns:
+            形如 ``"00:30"`` 的规范写法；带星期/月份限定、多值或无法识别时返回 None。
+        """
+        text = str(spec or "").strip()
+        if not text:
+            return None
+
+        match = re.fullmatch(r"(\d{1,2}):(\d{1,2})", text)
+        if match:
+            hour, minute = int(match.group(1)), int(match.group(2))
+        else:
+            fields = text.split()
+            if len(fields) != 5:
+                return None
+            minute_text, hour_text, day, month, day_of_week = fields
+            # 只有「每天、单值的小时与分钟」才敢转；其余（星期/月份限定、多值）
+            # 一律不转换，避免改变用户的原意
+            if day != "*" or month != "*" or day_of_week != "*":
+                return None
+            if not (minute_text.isdigit() and hour_text.isdigit()):
+                return None
+            hour, minute = int(hour_text), int(minute_text)
+
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return f"{hour:02d}:{minute:02d}"
+
+    def _inherit_publish_time(self, raw: dict) -> str:
+        """把旧版发布时间继承到 ``publish_times``（迁移时调用一次）。
+
+        Args:
+            raw: 已搬到板块结构上的配置字典。
+
+        Returns:
+            继承下来的 ``HH:MM``；未继承（无需或无法转换）时返回空串。
+        """
+        path_times = PATHS.get("publish_times")
+        path_cron = PATHS.get("publish_cron")
+        path_per_day = PATHS.get("publish_per_day")
+        if not (path_times and path_cron):
+            return ""
+
+        existing = _get_path(raw, path_times)
+        if isinstance(existing, list) and existing:
+            # 用户已经自己填过时间点列表，保持不动
+            return ""
+
+        cron = str(_get_path(raw, path_cron) or "").strip()
+        if not cron:
+            return ""
+
+        converted = self._simple_daily_time(cron)
+        if not converted:
+            logger.info(
+                "旧发布时间形式较复杂（带星期/月份限定或多值），"
+                f"保留 publish_cron={cron} 由它兜底，publish_times 保持为空"
+            )
+            return ""
+
+        hour, minute = converted.split(":")
+        _set_path(raw, path_times, [converted])
+        if path_per_day:
+            _set_path(raw, path_per_day, 1)
+        # 顺手把兼容项也写成同一个时间的 Cron，避免两处写法不一致时误以为改错了
+        _set_path(raw, path_cron, f"{int(minute)} {int(hour)} * * *")
+        logger.info(
+            f"旧发布时间已继承为 publish_times={converted}"
+            f"（publish_cron 同步为 {int(minute)} {int(hour)} * * *，每天 1 条）"
+        )
+        return converted
 
     # ------------------------------------------------------------------
     # 读取与写入
