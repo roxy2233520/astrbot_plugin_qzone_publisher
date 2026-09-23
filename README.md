@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-314%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-324%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -243,69 +243,87 @@
 
 ## ⚙️ 配置说明
 
-配置在 AstrBot 面板「插件配置」里修改。
+配置在 AstrBot 面板「插件配置」里修改。面板已按板块分组，**板块标题与顺序与本文一致**；
+各板块内部统一按「开关 → 对象与时间 → 模型提供商 → 内容与提示词 → 数量与限制 → 通知」排列。
 
-### 管理员
+> 从旧版本升级：面板结构变了，但**原有配置值会自动迁移到对应板块**，无需重新填写。
+
+### 基础设置
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `admin_uins` | `[]` | 插件内管理员 QQ 号；填了就用它作为草稿/通知接收人，留空回退 AstrBot 的 `admins_id`（见上面「管理员识别」） |
+| `notify_enabled` | `true` | 是否发送发布结果通知 |
+| `notify_umo` | 空 | 通知发到哪个会话，格式 `平台ID:消息类型:会话ID`；留空则只发给管理员私聊 |
+| `notify_render_image` | `false` | 通知与草稿附带一张渲染好的回执图 |
+| `notify_render_network` | `false` | 回执图是否走 AstrBot 的 t2i 端点；默认关 = 本地渲染，内容不出本机 |
+| `history_limit` | `200` | 本地保留发布记录条数 |
 
-### 发布控制
+### 私聊问候
+
+| 字段 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `greet_enabled` | `false` | 总开关，也可用 `/空间问候 on` 打开 |
+| `greet_users` | `[]` | 问候对象的 QQ 号，例如 `["123456"]` |
+| `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
+| `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
+| `greet_jitter` | `600` | 触发后随机延后 0~N 秒，不固定在同一秒发出 |
+| `llm_greet_provider_id` | 空 | 问候单独指定模型提供商（留空用全局） |
+| `greet_use_ai` | `false` | 用 AI 结合人设与当日生活日程生成；关闭则从文案池随机取 |
+| `greet_prompt` | 见默认值 | AI 提示词，`{slot}` 会被替换成「早安 / 晚安」 |
+| `greet_morning_pool` / `greet_night_pool` | 各 3 条示例 | 文案池 |
+
+### 空间说说
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `auto_publish_enabled` | `false` | 定时自动发布总开关 |
 | `publish_cron` | `30 8 * * *` | `HH:MM` 或 5 段 Cron（分 时 日 月 周），留空=不发布 |
 | `publish_jitter` | `600` | 触发后随机延后 0~N 秒，0=精确触发 |
-
-### 内容来源
-
-| 字段 | 默认 | 说明 |
-| :--- | :--- | :--- |
+| `llm_provider_id` | 空 | 写说说使用哪个模型提供商（留空用全局） |
 | `content_source` | `pool` | 下拉选择：文案池 / 文本文件 / AI 生成 |
 | `text_pool` | 3 条示例 | 文案池内容 |
 | `content_file` | 空 | 文本文件路径，一行一条，`#` 开头忽略 |
 | `llm_prompt` | 见默认值 | 写说说的提示词 |
 | `llm_use_persona` | `true` | 生成时注入 Bot 人设 |
 | `llm_use_life_context` | `true` | 把今日穿搭/日程作为素材交给 AI |
+| `llm_life_must_reference` | `true` | 要求正文自然带出今天行程的具体细节 |
 | `llm_reference_chat` | `false` | 是否参考最近聊天记录 |
 | `llm_chat_umo` / `llm_chat_count` | 空 / `30` | 参考哪个会话、参考多少条 |
 | `llm_max_chars` | `200` | 生成内容最大字数 |
-
-### AI 接入
-
-`llm_provider_id`、`llm_life_provider_id`、`llm_comment_provider_id`、
-`llm_greet_provider_id`（见上一节）。
-
-### 联网素材
-
-`web_search_enabled`、`web_search_query_mode`、`web_search_query_pool`、
-`web_search_query_prompt`、`web_search_count`（见上一节）。
-
-### 生活日程
-
-| 字段 | 默认 | 说明 |
-| :--- | :--- | :--- |
-| `life_inject_enabled` | `false` | 是否把日程注入 system prompt。**默认关**：只有本插件负责注入时才打开，避免和其他也在注入生活状态的插件重复 |
-| `life_reference_days` | `3` | 生成时参考过去几天日程，避免重复 |
-| `life_prompt` | 见默认值 | 日程生成提示词，占位符见字段说明 |
-| `life_pool` | 4 个池 | 面板里是「对象」类型，4 个子键：`daily_themes`（主题）/ `mood_colors`（心情色彩）/ `outfit_styles`（穿搭风格）/ `schedule_types`（日程类型），生成时每池随机抽一项 |
+| `web_search_enabled` | `false` | 写说说前先联网查资料，再让 AI 结合资料写 |
+| `web_search_query_mode` | `ai` | 搜索词从哪来：AI 想一个 / 从关键词池取 |
+| `web_search_query_pool` | 3 条示例 | 关键词池（`web_search_query_mode` 为 fixed 时生效） |
+| `web_search_query_prompt` | 见默认值 | 让 AI 想搜索词的提示词 |
+| `web_search_count` | `5` | 每次搜几条 |
+| `max_images` | `9` | 单条说说最多图片 |
 
 ### 说说互动
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `interact_enabled` | `true` | 定时读说说（只读）总开关 |
-| `interact_cron` / `interact_jitter` | `0 21 * * *` / `600` | 巡检时间与抖动 |
 | `interact_uins` | `[]` | **关注谁的空间**，填 QQ 号；留空则巡检不做任何事 |
+| `interact_cron` / `interact_jitter` | `0 21 * * *` / `600` | 巡检时间与抖动 |
+| `interact_days` | `3` | **时间窗口**：每个好友只看最近几天内最新的一条说说。最新一条超出窗口就整体跳过（不点赞、不评论），避免去处理几天前的老说说 |
 | `interact_count` | `3` | 每个对象拉取几条；只用于在时间窗口内挑出最新一条，不会逐条处理 |
-| `interact_days` | `3` | **时间窗口**：每个好友只看最近几天内最新的一条说说。最新一条超出窗口就整体跳过（不点赞、不评论），避免去评论几天前的老说说 |
 | `interact_skip_self` | `true` | 跳过自己发的 |
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
-| `interact_comment_prompt` / `interact_comment_max_chars` | 见默认值 / `60` | 评论提示词与字数 |
+| `llm_comment_provider_id` | 空 | 评论单独指定模型提供商（留空用全局） |
+| `interact_comment_prompt` | 见默认值 | 评论提示词 |
+| `interact_comment_max_chars` | `60` | 评论最大字数 |
 | `interact_notify` | `false` | 巡检结束后发汇总通知 |
+
+### 生活日程
+
+| 字段 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `life_inject_enabled` | `false` | 是否把日程注入 system prompt。**默认关**：只有本插件负责注入时才打开，避免和其他也在注入生活状态的插件重复 |
+| `llm_life_provider_id` | 空 | 生成日程单独指定模型提供商（留空用全局） |
+| `life_prompt` | 见默认值 | 日程生成提示词，占位符见字段说明 |
+| `life_reference_days` | `3` | 生成时参考过去几天日程，避免重复 |
+| `life_pool` | 4 个池 | 面板里是「对象」类型，4 个子键：`daily_themes`（主题）/ `mood_colors`（心情色彩）/ `outfit_styles`（穿搭风格）/ `schedule_types`（日程类型），生成时每池随机抽一项 |
 
 ### 草稿确认
 
@@ -316,26 +334,15 @@
 | `draft_umo` | 空 | 草稿额外发到的会话，格式 `平台ID:消息类型:会话ID` |
 | `draft_for_comment` | `true` | 自动评论也先转草稿 |
 | `draft_for_greet` | `false` | 定时问候也先转草稿 |
-| `draft_timeout_minutes` | `0` | 超时自动放行的分钟数，0 = 必须人工处理 |
+| `draft_timeout_minutes` | `0` | 大于 0 时草稿超时无人处理会**自动放行**并通知你；0 = 必须人工处理 |
 
-### 定时问候
-
-`greet_enabled`、`greet_users`、`greet_morning_cron`、`greet_night_cron`、
-`greet_jitter`、`greet_use_ai`、`greet_prompt`、`greet_morning_pool`、
-`greet_night_pool`、`llm_greet_provider_id`（见上面「定时问候」）。
-
-### 网络与通知
+### 网络与登录
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `cookie` | 空 | 手动 Cookie 兜底（需含 `uin`/`skey`/`p_skey`） |
 | `cookie_ttl` | `600` | Cookie 缓存秒数，0=不主动刷新 |
 | `timeout` | `15` | QQ空间请求超时（秒） |
-| `max_images` | `9` | 单条说说最多图片 |
-| `notify_enabled` / `notify_umo` | `true` / 空 | 发布结果通知发到哪 |
-| `notify_render_image` | `false` | 通知与草稿附带一张渲染好的回执图 |
-| `notify_render_network` | `false` | 回执图是否走 AstrBot 的 t2i 端点；默认关 = 本地渲染，内容不出本机 |
-| `history_limit` | `200` | 本地保留发布记录条数 |
 
 ---
 
@@ -497,7 +504,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 314 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 324 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

@@ -516,6 +516,32 @@ async def main() -> int:
     PublishStore = _store.PublishStore
     QzonePublisherPlugin = _imp("main").QzonePublisherPlugin
 
+    _cfg_paths = _imp("core.config").PATHS
+
+    def cfg_set(raw: dict, key: str, value) -> None:
+        """按板块路径写配置值。
+
+        面板 schema 已分组，测试里不能再直接写扁平键；顺带每一层都复制一份，
+        避免浅拷贝出来的子字典被改动后污染源配置。
+        """
+        path = _cfg_paths[key]
+        node = raw
+        for part in path[:-1]:
+            child = node.get(part)
+            child = dict(child) if isinstance(child, dict) else {}
+            node[part] = child
+            node = child
+        node[path[-1]] = value
+
+    def cfg_peek(raw: dict, key: str):
+        """按板块路径读原始值，读不到返回 None。"""
+        node: object = raw
+        for part in _cfg_paths[key]:
+            if not isinstance(node, dict) or part not in node:
+                return None
+            node = node[part]
+        return node
+
     cookie = "uin=o123456; skey=@Abc123; p_skey=Zz99Kk"
     onebot = FakeOneBot(cookie)
 
@@ -671,9 +697,22 @@ async def main() -> int:
     check("未定义项报 AttributeError", not hasattr(cfg, "not_a_field"))
     cfg.set("publish_cron", "0 9 * * *")
     check(
-        "配置写回并持久化",
-        raw_config["publish_cron"] == "0 9 * * *" and raw_config.saved >= 1,
+        "配置写回并持久化（写入对应板块）",
+        raw_config["sec_post"]["publish_cron"] == "0 9 * * *" and raw_config.saved >= 1,
         str(raw_config.saved),
+    )
+    check(
+        "旧扁平配置已迁移到板块结构",
+        "publish_cron" not in raw_config
+        and raw_config["_flat_keys_migrated"] is True
+        and raw_config["sec_post"]["text_pool"] == ["文案A", "文案B"],
+        str(sorted(raw_config.keys())[:6]),
+    )
+    check(
+        "配置项能报出所属板块",
+        cfg.section_of.get("publish_cron") == "空间说说"
+        and cfg.section_of.get("greet_users") == "私聊问候",
+        str(cfg.section_of.get("publish_cron")),
     )
 
     content = ContentGenerator(cfg, AIClient(cfg, FakeContext(onebot)), None)
@@ -968,7 +1007,7 @@ async def main() -> int:
     check(
         "定时指令设置 HH:MM",
         any("45 9 * * *" in item for item in out)
-        and raw_config["publish_cron"] == "45 9 * * *",
+        and raw_config["sec_post"]["publish_cron"] == "45 9 * * *",
         str(out),
     )
 
@@ -978,7 +1017,8 @@ async def main() -> int:
     out = await collect(plugin.cmd_schedule(FakeEvent(), "off"))
     check(
         "定时指令关闭",
-        raw_config["publish_cron"] == "" and not plugin.publish_task.running,
+        raw_config["sec_post"]["publish_cron"] == ""
+        and not plugin.publish_task.running,
         str(out),
     )
 
@@ -988,7 +1028,8 @@ async def main() -> int:
     out = await collect(plugin.cmd_toggle(FakeEvent(), "off"))
     check(
         "开关指令关闭",
-        raw_config["auto_publish_enabled"] is False and not plugin.publish_task.running,
+        raw_config["sec_post"]["auto_publish_enabled"] is False
+        and not plugin.publish_task.running,
         str(out),
     )
 
@@ -996,10 +1037,10 @@ async def main() -> int:
     check("删除指令要求 tid", any("用法" in item for item in out), str(out))
 
     print("\n[11] 自动发布全链路（含通知）")
-    raw_config["publish_cron"] = "30 8 * * *"
-    raw_config["auto_publish_enabled"] = True
-    raw_config["text_pool"] = ["自动发布内容"]
-    raw_config["content_source"] = "pool"
+    plugin.cfg.set("publish_cron", "30 8 * * *")
+    plugin.cfg.set("auto_publish_enabled", True)
+    plugin.cfg.set("text_pool", ["自动发布内容"])
+    plugin.cfg.set("content_source", "pool")
     plugin.api.EMOTION_URL = "http://127.0.0.1:8791/publish"
     await plugin._auto_publish()
     last = plugin.store.last_success()
@@ -1021,9 +1062,7 @@ async def main() -> int:
     await runner.cleanup()
 
     print("\n[12] OneBot Cookie 自动获取路径")
-    auto_cfg = StubAstrBotConfig(dict(raw_config))
-    auto_cfg["cookie"] = ""
-    auto_cfg["cookie_ttl"] = 600
+    auto_cfg = StubAstrBotConfig({"sec_network": {"cookie": "", "cookie_ttl": 600}})
     session_auto = QzoneSession(
         PluginConfig(auto_cfg, FakeContext(onebot)), lambda: onebot
     )
@@ -1066,8 +1105,7 @@ async def main() -> int:
             return {"cookies": self.cookie}
 
     no_domain = NoDomainOneBot(cookie)
-    auto_cfg2 = StubAstrBotConfig(dict(raw_config))
-    auto_cfg2["cookie"] = ""
+    auto_cfg2 = StubAstrBotConfig({"sec_network": {"cookie": "", "cookie_ttl": 600}})
     session_fallback = QzoneSession(
         PluginConfig(auto_cfg2, FakeContext(no_domain)), lambda: no_domain
     )
@@ -1082,8 +1120,7 @@ async def main() -> int:
         async def get_cookies(self, domain=None, **kwargs):
             return {"cookies": ""}
 
-    empty_cfg = StubAstrBotConfig(dict(raw_config))
-    empty_cfg["cookie"] = ""
+    empty_cfg = StubAstrBotConfig({"sec_network": {"cookie": ""}})
     empty_session = QzoneSession(
         PluginConfig(empty_cfg, FakeContext(EmptyCookieOneBot(cookie))),
         lambda: EmptyCookieOneBot(cookie),
@@ -1094,8 +1131,7 @@ async def main() -> int:
     except RuntimeError as e:
         check("空 Cookie 给出可操作报错", "get_cookies" in str(e), str(e)[:70])
 
-    no_client_cfg = StubAstrBotConfig(dict(raw_config))
-    no_client_cfg["cookie"] = ""
+    no_client_cfg = StubAstrBotConfig({"sec_network": {"cookie": ""}})
     no_client_session = QzoneSession(
         PluginConfig(no_client_cfg, FakeContext(None)), lambda: None
     )
@@ -1228,9 +1264,10 @@ async def main() -> int:
 
     def make_ai_config(**overrides) -> PluginConfig:
         """构造一份插件配置（AI 相关只涉及 AstrBot 提供商）。"""
-        data = dict(raw_config)
-        data.update(overrides)
-        return PluginConfig(StubAstrBotConfig(data), FakeContext(onebot))
+        data = StubAstrBotConfig(dict(raw_config))
+        for key, value in overrides.items():
+            cfg_set(data, key, value)
+        return PluginConfig(data, FakeContext(onebot))
 
     print("\n[13] AI 接入层（只走 AstrBot 提供商）")
     provider_ctx = FakeContext(onebot)
@@ -1803,13 +1840,15 @@ async def main() -> int:
     out = await collect(plugin.cmd_interact(FakeEvent(), "off"))
     check(
         "互动指令关闭任务",
-        raw_config["interact_enabled"] is False and not plugin.interact_task.running,
+        raw_config["sec_interact"]["interact_enabled"] is False
+        and not plugin.interact_task.running,
         str(out),
     )
     out = await collect(plugin.cmd_interact(FakeEvent(), "on"))
     check(
         "互动指令开启任务",
-        raw_config["interact_enabled"] is True and plugin.interact_task.running,
+        raw_config["sec_interact"]["interact_enabled"] is True
+        and plugin.interact_task.running,
         str(out),
     )
     plugin.interact._seen = []
@@ -1846,19 +1885,18 @@ async def main() -> int:
         "comment-model": provider_comment,
         "greet-model": provider_greet,
     }
-    multi_data = dict(raw_config)
-    multi_data.update(
-        {
-            "llm_provider_id": "global-model",
-            "llm_life_provider_id": "life-model",
-            "llm_comment_provider_id": "comment-model",
-            "llm_greet_provider_id": "greet-model",
-            "life_inject_enabled": False,
-            "interact_comment_prompt": "随便评一句",
-            "interact_comment_max_chars": 60,
-        }
-    )
-    multi_cfg = PluginConfig(StubAstrBotConfig(multi_data), ctx_multi)
+    multi_data = StubAstrBotConfig(dict(raw_config))
+    for key, value in {
+        "llm_provider_id": "global-model",
+        "llm_life_provider_id": "life-model",
+        "llm_comment_provider_id": "comment-model",
+        "llm_greet_provider_id": "greet-model",
+        "life_inject_enabled": False,
+        "interact_comment_prompt": "随便评一句",
+        "interact_comment_max_chars": 60,
+    }.items():
+        cfg_set(multi_data, key, value)
+    multi_cfg = PluginConfig(multi_data, ctx_multi)
     ai_multi = AIClient(multi_cfg, ctx_multi)
 
     check(
@@ -1898,17 +1936,11 @@ async def main() -> int:
         f"{comment_text}/comment={len(provider_comment.calls)}",
     )
 
-    empty_cfg = PluginConfig(
-        StubAstrBotConfig(
-            {
-                **multi_data,
-                "llm_life_provider_id": "",
-                "llm_comment_provider_id": "",
-                "llm_greet_provider_id": "",
-            }
-        ),
-        ctx_multi,
-    )
+    empty_data = StubAstrBotConfig(dict(multi_data))
+    cfg_set(empty_data, "llm_life_provider_id", "")
+    cfg_set(empty_data, "llm_comment_provider_id", "")
+    cfg_set(empty_data, "llm_greet_provider_id", "")
+    empty_cfg = PluginConfig(empty_data, ctx_multi)
     check(
         "留空时不显示单独指定",
         AIClient(empty_cfg, ctx_multi).overrides_text() == "",
@@ -1943,16 +1975,15 @@ async def main() -> int:
             "web_search_baidu": baidu_tool,
         }
     )
-    web_data = dict(raw_config)
-    web_data.update(
-        {
-            "web_search_enabled": True,
-            "web_search_query_mode": "fixed",
-            "web_search_query_pool": ["固定关键词"],
-            "web_search_count": 5,
-        }
-    )
-    web_cfg = PluginConfig(StubAstrBotConfig(web_data), web_ctx)
+    web_data = StubAstrBotConfig(dict(raw_config))
+    for key, value in {
+        "web_search_enabled": True,
+        "web_search_query_mode": "fixed",
+        "web_search_query_pool": ["固定关键词"],
+        "web_search_count": 5,
+    }.items():
+        cfg_set(web_data, key, value)
+    web_cfg = PluginConfig(web_data, web_ctx)
     bridge = WebSearchBridge(web_cfg, web_ctx)
 
     web_ctx.provider_settings = {"web_search": False, "websearch_provider": "tavily"}
@@ -2263,7 +2294,7 @@ async def main() -> int:
         str(admin_plugin._admin_umos()),
     )
 
-    admin_cfg["admin_uins"] = ["20001"]
+    cfg_set(admin_cfg, "admin_uins", ["20001"])
     qqs, source = admin_plugin._admin_qqs()
     check(
         "插件内名单优先于 AstrBot 的",
@@ -2285,17 +2316,17 @@ async def main() -> int:
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "add 30003"))
     check(
         "add 生效并写回配置",
-        admin_cfg["admin_uins"] == ["20001", "30003"]
+        cfg_peek(admin_cfg, "admin_uins") == ["20001", "30003"]
         and any("已添加" in item for item in out),
-        str(admin_cfg["admin_uins"]),
+        str(cfg_peek(admin_cfg, "admin_uins")),
     )
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "add 30003"))
     check("重复添加给出提示", any("已在名单" in item for item in out), str(out)[:80])
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "remove 20001"))
     check(
         "remove 生效",
-        admin_cfg["admin_uins"] == ["30003"],
-        str(admin_cfg["admin_uins"]),
+        cfg_peek(admin_cfg, "admin_uins") == ["30003"],
+        str(cfg_peek(admin_cfg, "admin_uins")),
     )
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "add abc"))
     check("非数字 QQ 被拒绝", any("不是纯数字" in item for item in out), str(out)[:80])
@@ -2311,17 +2342,16 @@ async def main() -> int:
 
     print("\n[23] 定时问候")
     greet_cfg = StubAstrBotConfig(dict(raw_config))
-    greet_cfg.update(
-        {
-            "greet_enabled": True,
-            "greet_users": ["10001", "10002"],
-            "greet_morning_pool": ["早上好呀"],
-            "greet_night_pool": ["晚安咯"],
-            "greet_use_ai": False,
-            "llm_greet_provider_id": "greet-model",
-            "greet_prompt": "写一句{slot}问候",
-        }
-    )
+    for key, value in {
+        "greet_enabled": True,
+        "greet_users": ["10001", "10002"],
+        "greet_morning_pool": ["早上好呀"],
+        "greet_night_pool": ["晚安咯"],
+        "greet_use_ai": False,
+        "llm_greet_provider_id": "greet-model",
+        "greet_prompt": "写一句{slot}问候",
+    }.items():
+        cfg_set(greet_cfg, key, value)
     greet_ctx = FakeContext(onebot)
     greet_ctx.providers = {
         "greet-model": provider_greet,
@@ -2378,7 +2408,7 @@ async def main() -> int:
         str(greet.sent_today("morning")),
     )
 
-    greet_cfg["greet_users"] = []
+    cfg_set(greet_cfg, "greet_users", [])
     morning_again = greet.slot_of("morning")
     result = await greet.send("morning")
     check(
@@ -2386,7 +2416,7 @@ async def main() -> int:
         result.sent == 0 and bool(result.errors),
         result.summary(),
     )
-    greet_cfg["greet_users"] = ["10001"]
+    cfg_set(greet_cfg, "greet_users", ["10001"])
     _ = morning_again
 
     await expect_raises_async(
@@ -2396,7 +2426,7 @@ async def main() -> int:
         "未知的问候时段",
     )
 
-    greet_cfg["greet_night_pool"] = []
+    cfg_set(greet_cfg, "greet_night_pool", [])
     night = greet.slot_of("night")
     await expect_raises_async(
         "文案池为空且未开 AI 时报错",
@@ -2405,8 +2435,8 @@ async def main() -> int:
         "文案池为空",
     )
 
-    greet_cfg["greet_use_ai"] = True
-    greet_cfg["greet_night_pool"] = ["晚安咯"]
+    cfg_set(greet_cfg, "greet_use_ai", True)
+    cfg_set(greet_cfg, "greet_night_pool", ["晚安咯"])
     provider_greet.calls.clear()
     provider_global.calls.clear()
     ai_text = await greet.build_text(greet.slot_of("night"))
@@ -2423,7 +2453,7 @@ async def main() -> int:
     fallback_text = await greet.build_text(greet.slot_of("night"))
     check("AI 返回空时回退文案池", fallback_text == "晚安咯", fallback_text)
 
-    greet_cfg["greet_use_ai"] = False
+    cfg_set(greet_cfg, "greet_use_ai", False)
     plugin.cfg.set("greet_enabled", True)
     plugin.cfg.set("greet_users", ["10001"])
     plugin.cfg.set("greet_use_ai", False)
@@ -3047,6 +3077,91 @@ async def main() -> int:
         str(out)[:160],
     )
     plugin.greet._sent = {}
+
+    print("\n[29] 面板板块结构与旧配置自动迁移")
+
+    schema_now = json.loads(
+        (REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    visible_sections = {
+        key: meta
+        for key, meta in schema_now.items()
+        if isinstance(meta, dict)
+        and meta.get("type") == "object"
+        and not meta.get("condition")
+    }
+    titles = [str(meta.get("description")) for meta in visible_sections.values()]
+    check(
+        "面板分成 7 个板块且顺序固定",
+        titles
+        == [
+            "基础设置",
+            "私聊问候",
+            "空间说说",
+            "说说互动",
+            "生活日程",
+            "草稿确认",
+            "网络与登录",
+        ],
+        str(titles),
+    )
+    check(
+        "每个板块都带标题与说明",
+        all(
+            str(meta.get("description") or "").strip()
+            and str(meta.get("hint") or "").strip()
+            for meta in visible_sections.values()
+        ),
+        str(titles),
+    )
+    order_ok = True
+    for meta in visible_sections.values():
+        keys = list((meta.get("items") or {}).keys())
+        providers = [i for i, k in enumerate(keys) if k.endswith("_provider_id")]
+        prompts = [i for i, k in enumerate(keys) if k.endswith("_prompt")]
+        if providers and prompts and min(providers) > min(prompts):
+            order_ok = False
+    check("板块内「模型提供商」统一排在提示词之前", order_ok, "板块内顺序")
+
+    hidden = [
+        key
+        for key, meta in schema_now.items()
+        if isinstance(meta, dict) and meta.get("condition")
+    ]
+    check(
+        "旧扁平键以隐藏项保留（迁移用，不出现在面板）",
+        len(hidden) == 65 and "_flat_keys_migrated" in hidden,
+        f"隐藏项 {len(hidden)} 个",
+    )
+
+    legacy_raw = StubAstrBotConfig(
+        {"greet_users": ["10001"], "publish_cron": "0 6 * * *", "content_source": "llm"}
+    )
+    legacy_cfg = PluginConfig(legacy_raw, FakeContext(onebot))
+    check(
+        "旧扁平配置被搬到对应板块",
+        legacy_raw["sec_private"]["greet_users"] == ["10001"]
+        and legacy_raw["sec_post"]["publish_cron"] == "0 6 * * *"
+        and legacy_raw["sec_post"]["content_source"] == "llm",
+        str(legacy_raw["sec_private"]),
+    )
+    check(
+        "迁移后旧键删除并打上标记",
+        "greet_users" not in legacy_raw and legacy_raw["_flat_keys_migrated"] is True,
+        str(sorted(legacy_raw.keys())[:4]),
+    )
+    check(
+        "迁移后的值照常读得到",
+        legacy_cfg.greet_users == ["10001"] and legacy_cfg.publish_cron == "0 6 * * *",
+        str(legacy_cfg.greet_users),
+    )
+    legacy_raw["sec_post"]["publish_cron"] = "0 7 * * *"
+    again = PluginConfig(legacy_raw, FakeContext(onebot))
+    check(
+        "再次启动不会用旧值覆盖面板里改过的新值",
+        again.publish_cron == "0 7 * * *",
+        str(again.publish_cron),
+    )
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

@@ -1,4 +1,18 @@
-"""插件配置包装层。"""
+"""插件配置包装层。
+
+面板 schema（``_conf_schema.json``）现在是「板块」结构：顶层是若干
+``{"type": "object", "description": "板块标题", "items": {...}}``，
+面板会把每个板块渲染成一张带标题的卡片。
+
+而插件代码始终按**扁平名字**读配置（``cfg.greet_users`` / ``cfg.set("draft_enabled", ...)``），
+所以这里维护一份「配置项名 -> 板块内路径」的索引，把两种视图隔开：
+改面板排版不需要动任何业务代码。
+
+旧版本是扁平结构，升级时 AstrBot 会删掉 schema 里不存在的键并立刻存盘，
+因此旧键在新 schema 里以「带永不成立 condition 的隐藏项」保留下来，
+由 :meth:`PluginConfig.migrate_flat_config` 在插件启动时把值搬进板块并打上标记，
+用户原有配置不会丢。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +21,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from astrbot.api import logger
 from astrbot.api.star import StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.star.context import Context
@@ -15,6 +30,9 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 _SCHEMA_FILE = _PLUGIN_ROOT / "_conf_schema.json"
 
 _MISSING = object()
+
+# 旧版扁平键的迁移标记（同样是隐藏项，不出现在面板里）
+MIGRATION_FLAG = "_flat_keys_migrated"
 
 
 def _resolve_plugin_name() -> str:
@@ -41,49 +59,108 @@ def _resolve_plugin_name() -> str:
 PLUGIN_NAME = _resolve_plugin_name()
 
 
-def _load_defaults() -> dict[str, Any]:
-    """从 _conf_schema.json 读取默认值。
-
-    以面板配置 schema 作为默认值的唯一来源，避免两处默认值不一致。
-    对 object 类型（如 life_pool）没有顶层 default 时，把 items 里各项的
-    default 组装成嵌套字典。
-
-    Returns:
-        配置项到默认值的映射，读取失败时返回空字典。
-    """
+def _load_schema() -> dict[str, Any]:
+    """读取面板 schema，失败时返回空字典。"""
     try:
         schema = json.loads(_SCHEMA_FILE.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.error(f"读取 _conf_schema.json 失败，将使用内置默认值: {e}")
         return {}
-    if not isinstance(schema, dict):
-        return {}
+    return schema if isinstance(schema, dict) else {}
 
+
+def _leaf_default(meta: dict[str, Any]) -> Any:
+    """取一个配置项的默认值；object 类型用 items 里的默认值组装。"""
+    if "default" in meta:
+        return meta["default"]
+    items = meta.get("items")
+    if isinstance(items, dict):
+        nested = {
+            name: sub["default"]
+            for name, sub in items.items()
+            if isinstance(sub, dict) and "default" in sub
+        }
+        if nested:
+            return nested
+    return _MISSING
+
+
+def _build_index(
+    schema: dict[str, Any],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, Any], list[str]]:
+    """建立「配置项名 -> 板块路径」「配置项名 -> 默认值」「旧扁平键」三份索引。
+
+    Args:
+        schema: 面板 schema。
+
+    Returns:
+        (paths, defaults, legacy_keys)。
+    """
+    paths: dict[str, tuple[str, ...]] = {}
     defaults: dict[str, Any] = {}
+    legacy: list[str] = []
+
     for key, meta in schema.items():
         if not isinstance(meta, dict):
             continue
-        if "default" in meta:
-            defaults[key] = meta["default"]
+        # 隐藏项（旧的扁平键）只用于迁移，不作为主索引
+        if meta.get("condition"):
+            if key != MIGRATION_FLAG:
+                legacy.append(key)
+            default = _leaf_default(meta)
+            if default is not _MISSING:
+                defaults.setdefault(key, default)
             continue
-        items = meta.get("items")
-        if isinstance(items, dict):
-            nested = {
-                name: sub["default"]
-                for name, sub in items.items()
-                if isinstance(sub, dict) and "default" in sub
-            }
-            if nested:
-                defaults[key] = nested
-    return defaults
+
+        if meta.get("type") == "object" and isinstance(meta.get("items"), dict):
+            for name, sub in meta["items"].items():
+                if not isinstance(sub, dict):
+                    continue
+                paths[name] = (key, name)
+                default = _leaf_default(sub)
+                if default is not _MISSING:
+                    defaults[name] = default
+            continue
+
+        # 顶层直接放的可见项（兼容以后可能新增的散项）
+        paths[key] = (key,)
+        default = _leaf_default(meta)
+        if default is not _MISSING:
+            defaults[key] = default
+
+    return paths, defaults, legacy
 
 
-DEFAULTS = _load_defaults()
+SCHEMA = _load_schema()
+PATHS, DEFAULTS, LEGACY_KEYS = _build_index(SCHEMA)
+
+
+def _get_path(config: Any, path: tuple[str, ...]) -> Any:
+    """按路径读嵌套配置；任一层缺失时返回 ``_MISSING``。"""
+    node: Any = config
+    for part in path:
+        if not isinstance(node, dict) or part not in node:
+            return _MISSING
+        node = node[part]
+    return node
+
+
+def _set_path(config: Any, path: tuple[str, ...], value: Any) -> None:
+    """按路径写嵌套配置，中间缺失的层级自动补空字典。"""
+    node = config
+    for part in path[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[path[-1]] = value
 
 
 class PluginConfig:
     """插件配置对象。
 
-    属性访问即读取配置（缺失时回退到 schema 默认值），
+    属性访问即读取配置（按板块路径读取，缺失时回退到 schema 默认值），
     通过 set() 写入并立即持久化到 AstrBot 配置。
 
     Attributes:
@@ -92,6 +169,7 @@ class PluginConfig:
         data_dir: 插件数据目录。
         history_file: 发布历史文件路径。
         timezone: AstrBot 配置的时区，缺省为 Asia/Shanghai。
+        migrated_keys: 本次启动从旧扁平结构搬到板块下的配置项名。
     """
 
     def __init__(self, raw: AstrBotConfig, context: Context) -> None:
@@ -106,6 +184,7 @@ class PluginConfig:
         self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.history_file = self.data_dir / "publish_history.json"
         self.draft_file = self.data_dir / "draft.json"
+        self.migrated_keys: list[str] = self.migrate_flat_config()
 
         tz = context.get_config().get("timezone")
         try:
@@ -113,18 +192,68 @@ class PluginConfig:
         except Exception:
             self.timezone = ZoneInfo("Asia/Shanghai")
 
+    # ------------------------------------------------------------------
+    # 旧扁平配置 -> 板块结构的迁移
+    # ------------------------------------------------------------------
+
+    def migrate_flat_config(self) -> list[str]:
+        """把旧版扁平配置的值搬进新板块结构（同一次安装只做一次）。
+
+        Returns:
+            本次搬移的配置项名列表；无需迁移时为空。
+        """
+        raw = self.raw
+        if not isinstance(raw, dict) or not LEGACY_KEYS:
+            return []
+        if raw.get(MIGRATION_FLAG):
+            return []
+
+        moved: list[str] = []
+        for key in LEGACY_KEYS:
+            if key not in raw:
+                continue
+            path = PATHS.get(key)
+            if path is None:
+                continue
+            value = raw[key]
+            if value is not None:
+                _set_path(raw, path, value)
+                moved.append(key)
+            try:
+                del raw[key]
+            except Exception as e:  # pragma: no cover - 极端情况下不强求删除
+                logger.debug(f"删除旧配置键 {key} 失败: {e}")
+
+        raw[MIGRATION_FLAG] = True
+        try:
+            raw.save_config()
+        except Exception as e:
+            logger.warning(f"迁移后的配置保存失败: {e}")
+        if moved:
+            logger.info(f"已把 {len(moved)} 项旧配置迁移到新的板块结构（原值保持不变）")
+        return moved
+
+    # ------------------------------------------------------------------
+    # 读取与写入
+    # ------------------------------------------------------------------
+
     def __getattr__(self, name: str) -> Any:
         """按配置项名读取配置值。"""
         if name.startswith("_") or "raw" not in self.__dict__:
             raise AttributeError(name)
 
-        default = DEFAULTS.get(name, _MISSING)
-        if default is _MISSING:
-            raise AttributeError(f"未定义的配置项: {name}")
+        path = PATHS.get(name)
+        value = _get_path(self.raw, path) if path else _MISSING
+        if value is _MISSING:
+            # 兼容尚未迁移的旧扁平配置与测试桩
+            value = self.raw.get(name, _MISSING)
 
-        value = self.raw.get(name, default)
-        if value is None:
+        default = DEFAULTS.get(name, _MISSING)
+        if value is _MISSING or value is None:
+            if default is _MISSING:
+                raise AttributeError(f"未定义的配置项: {name}")
             return default
+
         # 嵌套配置（如 life_pool）：面板里只改了部分子项时，用默认值补齐其余子项
         if isinstance(default, dict) and isinstance(value, dict):
             merged = dict(default)
@@ -139,9 +268,29 @@ class PluginConfig:
             key: 配置项名。
             value: 新的配置值。
         """
-        self.raw[key] = value
+        path = PATHS.get(key)
+        if path:
+            _set_path(self.raw, path, value)
+        else:
+            self.raw[key] = value
         self.raw.save_config()
 
     def mapping(self) -> dict[str, Any]:
-        """返回当前配置的浅拷贝，便于展示或调试。"""
-        return {key: self.raw.get(key, default) for key, default in DEFAULTS.items()}
+        """返回当前配置的扁平浅拷贝，便于展示或调试。"""
+        result: dict[str, Any] = {}
+        for key in PATHS:
+            try:
+                result[key] = getattr(self, key)
+            except AttributeError:  # pragma: no cover - 理论上不会发生
+                continue
+        return result
+
+    @property
+    def section_of(self) -> dict[str, str]:
+        """配置项名 -> 所属板块标题，便于排查与展示。"""
+        titles: dict[str, str] = {}
+        for key, path in PATHS.items():
+            meta = SCHEMA.get(path[0])
+            if isinstance(meta, dict):
+                titles[key] = str(meta.get("description") or path[0])
+        return titles
