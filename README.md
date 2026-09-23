@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-305%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-314%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -176,9 +176,14 @@
 | `llm_greet_provider_id` | 空 | 问候单独指定 AstrBot 提供商（留空用全局） |
 
 - 同一天同一时段对同一个人只发一次（记录在 `greet_state.json`），
-  随机抖动或错过的补偿触发都不会造成重复问候；手动测试会无视这条去重。
+  随机抖动或错过的补偿触发都不会造成重复问候。
+  只有**定时任务**会写这条记录；`/空间问候` 手动发送不会占用当日名额，
+  所以手动测试过之后，当天的定时问候照样会发。
+- 发送结果会核对 AstrBot 的返回值：AstrBot 没找到匹配的会话时记为失败并明确报错，
+  不会记入「今日已问候」，也不会在日志里写成成功。
 - AI 生成失败、返回空都会自动回退到文案池；某个 QQ 发不出去只记日志并汇总，不影响其他人。
-- 先用 `/空间问候 morning 你的QQ号` 手动测一条，确认能收到再开定时。
+- 先用 `/空间问候 morning 你的QQ号` 手动测一条，确认能收到再开定时；
+  回执里会带上实际使用的发送地址（`平台:消息类型:QQ`），排查时先看这一行。
 
 ---
 
@@ -343,7 +348,7 @@
 | `/空间状态` | 所有人 | 登录态 / 管理员 / AI 接入 / 生成依据 / 日程 / 定时任务 / 问候 / Token 用量 / 草稿 |
 | `/空间用量 [天数]` | 管理员 | 查看 AI token 用量估算（按功能分组） |
 | `/空间管理员 [add\|remove] <QQ>` | 管理员 | 查看或维护插件内管理员名单 |
-| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` | 管理员 | 开关定时问候 / 立刻测试发一条 |
+| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` | 管理员 | 开关定时问候 / 立刻测试发一条（**不占用当日定时名额**，并回报实际发送地址） |
 | `/空间重登` | 管理员 | 强制重取 Cookie |
 | `/空间定时 [时间]` | 管理员 | 查看或设置发布时间（`08:30` / `30 8 * * *` / `off`） |
 | `/空间开关 [on\|off]` | 管理员 | 定时发布开关 |
@@ -451,13 +456,23 @@ A：先看 `/空间状态` 的「管理员」那一行。两边都没配就会�
 `/空间管理员 add 你的QQ号` 补上。
 
 **Q：开了定时问候但没收到？**
-A：依次检查：`greet_enabled` 是否开启（或 `/空间问候 on`）、`greet_users` 是否填了你的 QQ、
-时间是否到了；然后先手动测一条：`/空间问候 morning 你的QQ号`。
-另外注意：问候是**私聊**，需要 Bot 能给你发私聊（互为好友或平台允许）。
+A：按这个顺序查：
+
+1. `/空间状态` 看「定时问候」那几行：开关是否为开、有没有配 `greet_users`、
+   **今日已发几人**（如果是 1，说明这个时段已经发过了，今天不会再发），
+   以及「发送地址」这一行——它应该形如 `睦:FriendMessage:你的QQ`（`睦` 是你在 AstrBot 里
+   给这个 OneBot 平台实例起的 id）。
+2. 看插件日志里 `[greet]` 那几行：`已发送给 xxx（umo=…）` 才是真的发出去了；
+   出现 `未发出：AstrBot 没有找到平台会话` 或 `发送异常` 就是失败，会写明原因。
+3. 如果日志说发送成功、你却没收到：那是**协议端（NapCat / Lagrange）或 QQ 侧**的问题，
+   插件已把它交给了 AstrBot，AstrBot 也交给了协议端。可以看协议端控制台的返回码，
+   常见原因是目标 QQ 不是 Bot 的好友、账号被限制主动发消息、或消息被风控拦下。
+   验证方法：直接在协议端手动调一次 `send_private_msg`，看返回的 `retcode`。
+4. 补一条：`/空间问候 morning 你的QQ号` 手动测一次——它不会占用当天的定时名额。
 
 **Q：同一条问候会不会重复发？**
 A：不会。同一天同一时段对同一个人只发一次，记录在 `greet_state.json`；
-只有手动 `/空间问候` 测试才会忽略这条去重。
+只有**定时任务**会写这条记录，`/空间问候` 手动发送不写（否则手动测过之后，当天的定时问候会被误判为已发而跳过）。
 
 **Q：图片上传失败？**
 A：图片接口本身较脆弱。失败时整条说说不会发布（避免发出半截内容），可以少带几张图重试。
@@ -482,7 +497,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 305 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 314 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

@@ -61,8 +61,11 @@ class GreetResult:
     Attributes:
         slot: 时段标识。
         text: 实际发送的内容。
-        sent: 成功发送人数。
+        sent: 成功发送人数（AstrBot 确认找到平台、消息已交给协议端）。
         skipped: 跳过人数（今天已发过 / 没配目标）。
+        record: 是否写入「今日已问候」记录；手动测试时为 False，
+            否则手动发一次会把当天的自动问候名额用掉。
+        targets_used: 实际使用的发送地址（QQ -> UMO），用于排查发不出去的问题。
         errors: 出错信息。
     """
 
@@ -70,11 +73,15 @@ class GreetResult:
     text: str = ""
     sent: int = 0
     skipped: int = 0
+    record: bool = True
+    targets_used: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         """生成可读汇总。"""
         parts = [f"成功 {self.sent} 人", f"跳过 {self.skipped} 人"]
+        if not self.record:
+            parts.append("手动发送（不占用今日自动问候名额）")
         text = "，".join(parts)
         if self.errors:
             text += "\n" + "\n".join(f"⚠️ {item}" for item in self.errors[:5])
@@ -91,6 +98,7 @@ class GreetingService:
         platform_id_provider: Callable[[], str],
         *,
         life_context_provider: Callable[[], object] | None = None,
+        umo_resolver: Callable[[str], str] | None = None,
         sender: Callable[[str, str], object] | None = None,
     ) -> None:
         """初始化服务。
@@ -100,12 +108,15 @@ class GreetingService:
             ai: AI 客户端。
             platform_id_provider: 返回当前平台实例 id 的可调用对象，用于拼 UMO。
             life_context_provider: 可选的异步函数，返回当日日程文本。
-            sender: 可选的异步发送函数 ``(umo, text) -> int``，便于测试注入。
+            umo_resolver: 可选的 ``(qq) -> umo``，优先用「最近一次真实私聊会话地址」，
+                拿不到时返回空串表示回退到按平台 id 拼装。
+            sender: 可选的异步发送函数 ``(umo, text) -> bool``，便于测试注入。
         """
         self.cfg = config
         self.ai = ai
         self._platform_id_provider = platform_id_provider
         self._life_context_provider = life_context_provider
+        self._umo_resolver = umo_resolver
         self._sender = sender
         self.file = Path(config.data_dir) / "greet_state.json"
         self._sent: dict[str, list[str]] = {}
@@ -185,7 +196,19 @@ class GreetingService:
         return [str(item).strip() for item in values if str(item).strip()]
 
     def umo_for(self, qq: str) -> str:
-        """把 QQ 号拼成私聊 UMO。"""
+        """把 QQ 号拼成私聊 UMO。
+
+        优先用「最近一次与该 QQ 的真实私聊会话地址」——那是 AstrBot 自己用的地址，
+        一定和平台对得上；拿不到时才按平台实例 id 拼 ``平台:FriendMessage:QQ``。
+        """
+        if self._umo_resolver is not None:
+            try:
+                resolved = str(self._umo_resolver(qq) or "").strip()
+            except Exception as e:
+                logger.debug(f"解析 {qq} 的会话地址失败: {e}")
+                resolved = ""
+            if resolved:
+                return resolved
         return f"{self._platform_id_provider()}:FriendMessage:{qq}"
 
     def slot_of(self, key: str) -> GreetSlot | None:
@@ -268,6 +291,7 @@ class GreetingService:
         *,
         targets: list[str] | None = None,
         force: bool = False,
+        record: bool = True,
     ) -> GreetResult:
         """生成并发送一次问候。
 
@@ -275,6 +299,8 @@ class GreetingService:
             slot_key: 时段标识（morning / night）。
             targets: 覆盖本次目标；缺省用配置里的 greet_users。
             force: 为 True 时忽略今日去重（用于手动测试）。
+            record: 是否写入「今日已问候」记录。手动测试应传 False，
+                否则会把当天的自动问候名额用掉，定时任务到点会直接跳过。
 
         Returns:
             GreetResult 汇总。
@@ -286,14 +312,14 @@ class GreetingService:
         if slot is None:
             raise RuntimeError(f"未知的问候时段: {slot_key}")
 
-        result = GreetResult(slot=slot.key)
+        result = GreetResult(slot=slot.key, record=record)
         watch = targets if targets is not None else self.targets
         if not watch:
             result.errors.append("未配置 greet_users，不知道要问候谁")
             return result
 
         result.text = await self.build_text(slot)
-        await self._deliver(result, watch, slot.key, force=force)
+        await self._deliver(result, watch, slot.key, force=force, record=record)
         return result
 
     async def send_text(
@@ -303,6 +329,7 @@ class GreetingService:
         *,
         slot_key: str = "custom",
         force: bool = True,
+        record: bool = True,
     ) -> GreetResult:
         """发送一段已经定好的文本（草稿确认放行时使用）。
 
@@ -311,17 +338,18 @@ class GreetingService:
             targets: 目标 QQ 号；缺省用配置里的 greet_users。
             slot_key: 记录用的标识。
             force: 为 True 时忽略当日去重。
+            record: 是否写入「今日已问候」记录。
 
         Returns:
             GreetResult 汇总。
         """
-        result = GreetResult(slot=slot_key, text=text)
+        result = GreetResult(slot=slot_key, text=text, record=record)
         watch = targets if targets is not None else self.targets
         if not watch:
             result.errors.append("未配置 greet_users，不知道要问候谁")
             return result
 
-        await self._deliver(result, watch, slot_key, force=force)
+        await self._deliver(result, watch, slot_key, force=force, record=record)
         return result
 
     async def _deliver(
@@ -331,35 +359,54 @@ class GreetingService:
         slot_key: str,
         *,
         force: bool,
+        record: bool = True,
     ) -> None:
         """逐个私聊发送并记录去重状态。"""
+        platform_id = str(self._platform_id_provider() or "").strip()
+        if not platform_id and self._umo_resolver is None:
+            result.errors.append(
+                "没找到 aiocqhttp(OneBot) 平台实例，无法确定私聊地址，本次没有发送"
+            )
+            logger.error("[greet] 没找到平台实例，问候未发送")
+            return
+
         for qq in watch:
             if not force and self._already_sent(slot_key, qq):
                 result.skipped += 1
                 continue
             umo = self.umo_for(qq)
+            result.targets_used[qq] = umo
             try:
-                sent = await self._dispatch(umo, result.text)
+                sent = bool(await self._dispatch(umo, result.text))
             except Exception as e:
-                result.errors.append(f"{qq}: {e}")
+                result.errors.append(f"{qq}: 发送异常 {e}")
+                logger.error(f"[greet] 发送给 {qq} 失败（umo={umo}）: {e}")
                 continue
             if sent:
                 result.sent += 1
-                self._mark_sent(slot_key, qq)
+                if record:
+                    self._mark_sent(slot_key, qq)
+                logger.info(f"[greet] 已发送给 {qq}（umo={umo}）")
             else:
-                result.errors.append(f"{qq}: 发送未成功")
+                result.errors.append(
+                    f"{qq}: AstrBot 没找到匹配的会话（umo={umo}），消息没有发出"
+                )
+                logger.warning(f"[greet] 未发出：AstrBot 没有找到平台会话 umo={umo}")
 
         self.save()
         logger.info(f"[greet] {slot_key} 发送完成：{result.summary()}")
 
-    async def _dispatch(self, umo: str, text: str) -> int:
-        """实际发送消息（默认走 AstrBot 的 StarTools.send_message）。"""
+    async def _dispatch(self, umo: str, text: str) -> bool:
+        """实际发送消息，返回「是否已交给平台」。
+
+        返回 False 表示 AstrBot 没找到匹配的平台会话（消息根本没发出去），
+        绝不能当成成功——否则会记进「今日已问候」而整天不再重试。
+        """
         if self._sender is not None:
-            return int(await self._sender(umo, text))
+            return bool(await self._sender(umo, text))
 
         from astrbot.api.star import StarTools
         from astrbot.core.message.components import Plain
         from astrbot.core.message.message_event_result import MessageChain
 
-        await StarTools.send_message(umo, MessageChain([Plain(text)]))
-        return 1
+        return bool(await StarTools.send_message(umo, MessageChain([Plain(text)])))

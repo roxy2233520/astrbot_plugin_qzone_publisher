@@ -2958,6 +2958,96 @@ async def main() -> int:
     plugin.cfg.set("draft_enabled", False)
     plugin.drafts.clear()
 
+    print("\n[28] 问候发送结果校验（「日志说成功但没收到」的两个成因）")
+
+    async def failing_sender(umo: str, text: str) -> bool:
+        return False
+
+    verify = GreetingService(
+        greet_cfg_obj, greet_ai, lambda: "aiocqhttp", sender=failing_sender
+    )
+    verify._sent = {}
+    res_fail = await verify.send("morning", force=True, record=False)
+    check(
+        "平台返回 False 时不算成功",
+        res_fail.sent == 0 and any("没有发出" in item for item in res_fail.errors),
+        res_fail.summary(),
+    )
+    check(
+        "发送失败不写今日记录（下次还会重试）",
+        verify._already_sent("morning", "10001") is False,
+        str(verify._sent),
+    )
+
+    no_platform = GreetingService(
+        greet_cfg_obj, greet_ai, lambda: "", sender=failing_sender
+    )
+    no_platform._sent = {}
+    res_np = await no_platform.send("morning", force=True, record=False)
+    check(
+        "找不到平台实例时明确报错且不发送",
+        res_np.sent == 0 and any("平台实例" in item for item in res_np.errors),
+        res_np.summary(),
+    )
+
+    manual = GreetingService(
+        greet_cfg_obj, greet_ai, lambda: "aiocqhttp", sender=fake_sender
+    )
+    manual._sent = {}
+    sent_messages.clear()
+    two = ["10001", "10002"]
+    res_manual = await manual.send("morning", targets=two, force=True, record=False)
+    check(
+        "手动发送标记为不占用今日名额",
+        res_manual.sent == 2 and "不占用" in res_manual.summary(),
+        res_manual.summary(),
+    )
+    res_auto = await manual.send("morning", targets=two)
+    check(
+        "手动发送后定时任务仍会真的发出去",
+        res_auto.sent == 2 and res_auto.skipped == 0,
+        res_auto.summary(),
+    )
+
+    resolved = GreetingService(
+        greet_cfg_obj,
+        greet_ai,
+        lambda: "aiocqhttp",
+        umo_resolver=lambda qq: f"睦:FriendMessage:{qq}" if qq == "10001" else "",
+        sender=fake_sender,
+    )
+    check(
+        "优先用记住的真实会话地址，缺失时回退按平台拼",
+        resolved.umo_for("10001") == "睦:FriendMessage:10001"
+        and resolved.umo_for("10002") == "aiocqhttp:FriendMessage:10002",
+        f"{resolved.umo_for('10001')} / {resolved.umo_for('10002')}",
+    )
+    resolved._sent = {}
+    sent_messages.clear()
+    res_addr = await resolved.send("morning", targets=two, force=True)
+    check(
+        "汇总里带出实际发送地址",
+        res_addr.targets_used.get("10001") == "睦:FriendMessage:10001"
+        and len(sent_messages) == 2,
+        str(res_addr.targets_used),
+    )
+
+    plugin.greet._sent = {}
+    StarTools.sent.clear()
+    out = await collect(plugin.cmd_greet(FakeEvent(), "morning 1611729294"))
+    check(
+        "手动指令不占用今日自动问候名额，并回报发送地址",
+        plugin.greet._already_sent("morning", "1611729294") is False
+        and any("发送地址" in item for item in out),
+        str(out)[:160],
+    )
+    check(
+        "手动指令用真实私聊会话地址",
+        "aiocqhttp:FriendMessage:1611729294" in str(out),
+        str(out)[:160],
+    )
+    plugin.greet._sent = {}
+
     plugin.publish_task.stop()
     plugin.interact_task.stop()
     await plugin.api.close()

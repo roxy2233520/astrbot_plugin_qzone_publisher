@@ -74,11 +74,14 @@ class QzonePublisherPlugin(Star):
         self.content = ContentGenerator(self.cfg, self.ai, self.life, self.web)
         self.interact = InteractService(self.cfg, self.ai, self.api, self.drafts)
         self.render = ReceiptRenderer(self.cfg)
+        # 最近一次与某个 QQ 的真实私聊会话地址（umo），问候优先用它，避免地址拼错
+        self._private_umos: dict[str, str] = {}
         self.greet = GreetingService(
             self.cfg,
             self.ai,
             self._platform_id,
             life_context_provider=self.life.prompt_context,
+            umo_resolver=self._greet_umo,
         )
 
         self.publish_task = CronTask.from_config(
@@ -208,14 +211,24 @@ class QzonePublisherPlugin(Star):
     def _remember_client(self, event: AstrMessageEvent) -> None:
         """缓存 OneBot 客户端与当前会话标识，避免重复查找。
 
-        会话标识会同步给联网搜索桥，用于读取按会话覆盖的 AstrBot 配置。
+        会话标识会同步给联网搜索桥，用于读取按会话覆盖的 AstrBot 配置；
+        私聊会话还会按 QQ 号记下来，问候优先用它当发送地址。
         """
         bot = getattr(event, "bot", None)
         if bot is not None:
             self._client = bot
-        umo = getattr(event, "unified_msg_origin", "")
-        if umo:
-            self.web.remember_umo(str(umo))
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if not umo:
+            return
+        self.web.remember_umo(umo)
+
+        parts = umo.split(":")
+        if len(parts) == 3 and parts[1] == "FriendMessage" and parts[2].isdigit():
+            self._private_umos[parts[2]] = umo
+
+    def _greet_umo(self, qq: str) -> str:
+        """问候用：返回最近一次与该 QQ 的真实私聊会话地址；没有则返回空串。"""
+        return self._private_umos.get(str(qq).strip(), "")
 
     # ------------------------------------------------------------------
     # 发布
@@ -347,10 +360,17 @@ class QzonePublisherPlugin(Star):
             return
 
         if bool(self.cfg.notify_enabled):
-            await self._notify(
-                f"{slot_name}问候已发送：{result.summary()}\n内容：{result.text}"
-                + self._usage_note(),
-            )
+            if result.sent == 0 and result.errors:
+                # 别再用「已发送」这种说法掩盖失败：一条都没发出去时明确报警
+                await self._notify(
+                    f"⚠️ {slot_name}问候没有发出去：{result.summary()}"
+                    + self._usage_note()
+                )
+            else:
+                await self._notify(
+                    f"{slot_name}问候已发送：{result.summary()}\n内容：{result.text}"
+                    + self._usage_note(),
+                )
 
     async def _dispatch_post(self, text: str, *, source: str, prefix: str) -> None:
         """统一的自动发布出口：草稿模式先转人工确认。
@@ -853,6 +873,8 @@ class QzonePublisherPlugin(Star):
             )
         if bool(self.cfg.greet_enabled) and not self.greet.targets:
             lines.append("　⚠️ 还没配置 greet_users，问候不会发出")
+        if self.greet.targets:
+            lines.append(f"　发送地址: {self.greet.umo_for(self.greet.targets[0])}")
 
         last = self.store.last_success()
         if last:
@@ -1222,16 +1244,23 @@ class QzonePublisherPlugin(Star):
             f"正在发送{slot.name}问候给 {'、'.join(targets) if targets else '配置里的对象'}..."
         )
         try:
+            # 手动发送不写「今日已问候」记录：否则会把当天的定时问候名额用掉，
+            # 到点时定时任务会认为已经发过而直接跳过（这正是「日志成功但没收到」的成因之一）
             result = await self.greet.send(
-                slot.key, targets=targets or None, force=True
+                slot.key, targets=targets or None, force=True, record=False
             )
         except Exception as e:
             yield event.plain_result(f"发送失败：{e}")
             return
 
-        yield event.plain_result(
-            f"{slot.name}问候：{result.summary()}\n内容：{result.text}"
-        )
+        lines = [f"{slot.name}问候：{result.summary()}"]
+        if result.targets_used:
+            lines.append(
+                "发送地址: "
+                + "；".join(f"{qq} → {umo}" for qq, umo in result.targets_used.items())
+            )
+        lines.append(f"内容：{result.text}")
+        yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------
     # 指令：草稿确认
