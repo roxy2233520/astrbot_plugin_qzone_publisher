@@ -630,11 +630,12 @@
       },
       "interact_reply_prompt": {
         "description": "回复评论的提示词",
+        "hint": "生成时会自动附上整段评论交流（说说正文、父评论与全部子回复，我自己的回复标成「我」），这里只写风格与要求",
         "type": "text",
         "editor_mode": true,
         "editor_language": "markdown",
         "editor_theme": "vs-dark",
-        "default": "针对对方的评论写一句得体的回复，直接回应对方提到的内容，不要解释、不做自我描述、不分选项。"
+        "default": "针对这段评论交流写一句得体的回复：结合整段对话回应对方最新那条，不要只针对最后一句孤立作答，也不要重复自己已经说过的意思，不要解释、不做自我描述、不分选项。"
       },
       "interact_comment_max_chars": {
         "description": "评论最大字数",

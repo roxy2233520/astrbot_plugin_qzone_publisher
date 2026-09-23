@@ -6774,7 +6774,245 @@ async def main() -> int:
             str(replies[-1]["form"])[:200],
         )
 
-        # 5) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        # 5) 去重精确到「具体哪一条」：线程里已有我的回复，也不影响回应对方的新回复
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        posted_replies.clear()
+        replies.clear()
+        detail_comments.clear()
+        plugin.interact._replied = []
+        plugin.cfg.set("interact_reply_max_per_run", 3)
+        feeds_payload[:] = [
+            my_post(
+                "S_T1",
+                1,
+                [
+                    comment_item(
+                        "C_T1",
+                        "机器人之前的回复",
+                        uin=888888,
+                        list_3=[
+                            comment_item(
+                                "C_T1_MINE",
+                                "我之前已经说过的内容",
+                                uin=SELF_UIN,
+                                name="我自己",
+                                parent_tid="C_T1",
+                                createTime=now_ts - 900,
+                            ),
+                            comment_item(
+                                "C_T1_NEW",
+                                "对方刚回的新内容",
+                                uin=777777,
+                                name="小红",
+                                parent_tid="C_T1",
+                                createTime=now_ts - 60,
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ]
+        t1 = await plugin.interact.run_replies_once()
+        check(
+            "线程里已有我的回复时，对方新发的子回复仍会被回复",
+            t1.replied == 1
+            and len(replies) == 1
+            and replies[-1]["form"].get("commentId") == "C_T1_NEW",
+            f"{t1.summary()}/{replies}",
+        )
+
+        # 已经回过的那一条候选（精确到 tid）不再回复，且不会带出别的请求
+        plugin.interact._replied = ["S_T2_C_T2_NEW"]
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_T2",
+                1,
+                [
+                    comment_item(
+                        "C_T2",
+                        "父评论",
+                        uin=888888,
+                        list_3=[
+                            comment_item(
+                                "C_T2_MINE",
+                                "我回过父评论",
+                                uin=SELF_UIN,
+                                name="我自己",
+                                parent_tid="C_T2",
+                                createTime=now_ts - 900,
+                            ),
+                            comment_item(
+                                "C_T2_NEW",
+                                "已经回过的子回复",
+                                uin=777777,
+                                parent_tid="C_T2",
+                                createTime=now_ts - 60,
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ]
+        t2 = await plugin.interact.run_replies_once()
+        check(
+            "已回复过的具体候选不再回复（0 次请求）",
+            t2.replied == 0 and not replies,
+            f"{t2.summary()}/{replies}",
+        )
+
+        # 多个未回复候选时最新优先
+        plugin.interact._replied = ["S_T3_C_T3"]
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_T3",
+                1,
+                [
+                    comment_item(
+                        "C_T3",
+                        "父评论",
+                        uin=888888,
+                        list_3=[
+                            comment_item(
+                                "C_T3_OLD",
+                                "较早的子回复",
+                                uin=777777,
+                                parent_tid="C_T3",
+                                createTime=now_ts - 3600,
+                            ),
+                            comment_item(
+                                "C_T3_NEW",
+                                "最新的子回复",
+                                uin=666666,
+                                parent_tid="C_T3",
+                                createTime=now_ts - 30,
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ]
+        t3 = await plugin.interact.run_replies_once()
+        check(
+            "同一线程多个未回复候选时最新优先",
+            len(replies) == 1 and replies[-1]["form"].get("commentId") == "C_T3_NEW",
+            f"{t3.summary()}/{[item['form'].get('commentId') for item in replies]}",
+        )
+
+        # 6) 生成回复时把整段交流交给 AI（不是只看最后一句）
+        prompts: list[str] = []
+        systems: list[str] = []
+        real_chat = plugin.ai.chat
+
+        async def capture_chat(
+            *,
+            system_prompt,
+            prompt=None,
+            contexts=None,
+            provider_id=None,
+            feature=None,
+        ):
+            systems.append(system_prompt or "")
+            prompts.append(prompt or "")
+            return "好，那我接着说。"
+
+        plugin.ai.chat = capture_chat
+        try:
+            plugin.interact._replied = []
+            replies.clear()
+            posted_replies.clear()
+            feeds_payload[:] = [
+                my_post(
+                    "S_T4",
+                    1,
+                    [
+                        comment_item(
+                            "C_T4",
+                            "父评论说的是去哪玩",
+                            uin=888888,
+                            name="小明",
+                            list_3=[
+                                comment_item(
+                                    "C_T4_OLD",
+                                    "子回复早一些",
+                                    uin=777777,
+                                    name="小刚",
+                                    parent_tid="C_T4",
+                                    createTime=now_ts - 3600,
+                                ),
+                                comment_item(
+                                    "C_T4_MINE",
+                                    "我自己之前说过的话",
+                                    uin=SELF_UIN,
+                                    name="我自己",
+                                    parent_tid="C_T4",
+                                    createTime=now_ts - 1800,
+                                ),
+                                comment_item(
+                                    "C_T4_NEW",
+                                    "子回复最新的一条",
+                                    uin=666666,
+                                    name="小红",
+                                    parent_tid="C_T4",
+                                    createTime=now_ts - 30,
+                                ),
+                            ],
+                        )
+                    ],
+                    content="我今天去公园散步了，人不多",
+                )
+            ]
+            t4 = await plugin.interact.run_replies_once()
+        finally:
+            plugin.ai.chat = real_chat
+
+        digest = prompts[-1] if prompts else ""
+        check(
+            "回复提示词带上整段交流（说说正文 + 父评论 + 全部子回复）",
+            t4.replied == 1
+            and "我今天去公园散步了" in digest
+            and "小明" in digest
+            and "父评论说的是去哪玩" in digest
+            and all(
+                text in digest
+                for text in ("子回复早一些", "我自己之前说过的话", "子回复最新的一条")
+            ),
+            digest[:220],
+        )
+        check(
+            "子回复按时间升序出现在提示词里",
+            digest.find("子回复早一些")
+            < digest.find("我自己之前说过的话")
+            < digest.find("子回复最新的一条"),
+            str(
+                [
+                    digest.find(text)
+                    for text in (
+                        "子回复早一些",
+                        "我自己之前说过的话",
+                        "子回复最新的一条",
+                    )
+                ]
+            ),
+        )
+        check(
+            "提示词单独列出「我之前已经说过的话」并指明本次回复对象",
+            "我之前已经说过的话" in digest
+            and "本次要回复的是：" in digest
+            and "子回复最新的一条" in digest.split("本次要回复的是：")[-1],
+            digest[-200:],
+        )
+        check(
+            "生成要求写明结合整段对话、不要重复自己说过的话",
+            "不要只针对最后一句" in (systems[-1] if systems else "")
+            and "不要重复" in (systems[-1] if systems else ""),
+            (systems[-1] if systems else "")[-200:],
+        )
+
+        # 7) 请求头与 comment() 完全一致（不传 h5 专用请求头）
         plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
         comments.clear()
         replies.clear()

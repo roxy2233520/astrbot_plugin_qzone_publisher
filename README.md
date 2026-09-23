@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-736%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-743%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -464,20 +464,29 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
   找到才算成功并写入去重记录，找不到就算失败并在日志里写明回查结果。
   回执里的「回复 N 条」都是确认过的条数，不会再出现「其实已发出却报失败」。
   「返回的是页面」只写进日志（这一路径记 debug 级），**不参与**成功与否的判定。
-- **已经在评论下回复过就跳过**：接口会把一条评论下的回复放在子回复里
-  （字段名 `list_3`，少数返回用 `list`，两者都认），插件回复前先看这里有没有
-  自己的回复，有就跳过并在日志里说明。这条保护也能兜住历史上已经重复发出的回复，
-  避免继续叠加。
+- **已经在评论下回复过就跳过，但只针对具体那一条**：接口会把一条评论下的回复放在
+  子回复里（字段名 `list_3`，少数返回用 `list`，两者都认），插件回复前先看这里有没有
+  针对**这一条**的我的回复，有就跳过并在日志里说明。判断精确到具体哪一条——
+  线程里别处有我的回复不会牵连其它候选，所以**对方又回了新的那条时，会继续回应
+  对方最新的回复**；历史上已经重复发出的回复也能被这条保护认出来，不会继续叠加。
+- **候选最新优先**：一条评论下的候选（父评论 + 每个子回复）按时间倒序处理，
+  保证「对方刚回的那条」先被回复（没有时间的排在最后），仍受每轮上限与
+  「同一条说说每轮最多回一条」的约束。
+- **回复时结合整段对话**：生成回复会把整段交流一起交给 AI——说说正文（截断到 80 字）、
+  这条评论，以及该线程下全部子回复（按时间升序、标明说话人；我自己的回复标成「我」，
+  并单独列一段「我之前已经说过的话」），最后明确指出本次要回复的是哪一条。
+  提示词里要求接着往下说：不要只针对最后一句孤立作答，也不要重复自己说过的意思。
 - 只回复文字评论：纯图片、纯表情（剥离表情标记后为空）以及自己发的评论都会被跳过。
 - **评论下的子回复同样是待回复对象**：别人在这条评论下追加的回复会单独处理，
   回复它时 `commentId` 用那条子回复自己的 id；自己写的子回复不会回复。
 - **一律直接回复**：巡检到新评论就直接发出，不产生草稿、也不需要确认（旧版本「回复先走草稿」的选项已移除）。
-- 同一条评论只回复一次，记录在 `<数据目录>/replied_comments.json`；
+- 同一条评论（或同一条子回复）只回复一次，记录在 `<数据目录>/replied_comments.json`
+  （键是「说说 tid + 被回复那一条的 tid」，所以对方继续回复时会被当成新的一条）；
   每日回复条数记在 `<数据目录>/reply_counts.json`（`/空间回复` 里的「今日已回」）；
   未确认发出的回复不会记为已回复，下次巡检仍会重试。
 - 每轮总数由 `interact_reply_max_per_run` 限制（默认 3 条），同一条说说每轮最多回复一条，
   被上限截断的新评论会在下一轮继续处理；回复字数上限为 `interact_reply_max_chars`，
-  提示词为 `interact_reply_prompt`。
+  提示词为 `interact_reply_prompt`（只写风格与要求，整段交流由插件自动附上）。
 - **每轮都有日志**：无论有没有新评论，都会写一行
   `[reply] 第 N 轮评论巡检：检查 … 回复 … 跳过 …`；发现新评论却没回复时会写明原因
   （例如达到每轮上限、已经有我的回复）。用 `/空间回复` 可以查看开关、巡检间隔、
@@ -663,7 +672,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒（默认最多 2 分钟），避免卡在同一秒；最坏延迟 = 时段内的巡检间隔 + 抖动，跨时段则等到下一个时段 |
 | `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |
 | `llm_reply_provider_id` | 空 | 回复单独指定模型提供商（留空用全局） |
-| `interact_reply_prompt` | 见默认值 | 回复提示词 |
+| `interact_reply_prompt` | 见默认值 | 回复提示词；整段评论交流（说说正文、父评论与全部子回复）由插件自动附上，这里只写风格与要求 |
 | `interact_reply_max_chars` | `80` | 回复最大字数 |
 | `interact_reply_max_per_run` | `3` | 每轮最多回复几条；同一条说说每轮最多回一条 |
 | `llm_comment_provider_id` | 空 | 评论单独指定模型提供商（留空用全局） |

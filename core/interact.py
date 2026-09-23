@@ -40,6 +40,14 @@ from .qzone import FeedComment, FeedPost, QzoneAPI, QzoneParser
 from .ui import kv
 
 _SEEN_LIMIT = 1000
+# 放进提示词的说说正文截断长度
+_BRIEF_LIMIT = 80
+# 回复提示词的默认任务描述（与面板里的默认值保持一致）
+DEFAULT_REPLY_PROMPT = (
+    "针对这段评论交流写一句得体的回复：结合整段对话回应对方最新那条，"
+    "不要只针对最后一句孤立作答，也不要重复自己已经说过的意思，"
+    "不要解释、不做自我描述、不分选项。"
+)
 
 
 @dataclass(slots=True)
@@ -444,29 +452,35 @@ class InteractService:
 
     @staticmethod
     def reply_candidates(comment: FeedComment) -> list[FeedComment]:
-        """一条评论下所有可回复的对象：评论本身，以及它下面的子回复。
+        """一条评论下所有可回复的对象，**最新优先**。
 
-        子回复来自接口的 ``list_3``；别人的子回复同样是新的待回复对象，
-        回复它时 ``commentId`` 用该子回复自己的 tid。
+        候选 = 父评论 + 它下面的每个子回复（接口的 ``list_3``）。按 ``create_time``
+        倒序排列，保证「对方刚回的那条」优先被处理；没有时间（0）的排在最后
+        （``sorted`` 是稳定排序，时间相同的仍保持接口顺序）。
 
         Args:
             comment: 顶层评论。
 
         Returns:
-            候选列表，父评论在前、子回复按接口顺序在后。
+            候选列表，最新的在前。
         """
-        return [comment, *comment.replies]
+        return sorted(
+            [comment, *comment.replies],
+            key=lambda item: item.create_time,
+            reverse=True,
+        )
 
     @staticmethod
     def has_own_reply(
         thread: FeedComment, candidate: FeedComment, self_uin: int
     ) -> bool:
-        """该评论（或它的子回复）下面是否已经有我发出的回复。
+        """**这条候选**下面是否已经有一条我发出的、针对它的回复。
 
-        只要这条评论的 ``list_3`` 里出现我自己的回复，就认为这条线程已经处理过：
-        评论本身不再回复，它下面别人的子回复也一并跳过——宁可少回一次，
-        也不要在已有重复回复的基础上继续叠加。``parent_tid`` 指向别的子回复时
-        不算（那是另一条分支）。
+        精确到「具体哪一条」，不整条线程一起跳过：只有在我的回复明确指向这条候选
+        （``parent_tid`` 等于候选 tid）时才算已回复。子回复没带 ``parent_tid`` 时，
+        解析层会把它填成父评论的 tid——那正好表示「我回的是父评论」，
+        因此对父评论候选成立，对子回复候选不成立（这时只靠去重记录判断，
+        不会扩大到整条线程）。
 
         Args:
             thread: 顶层评论。
@@ -474,17 +488,17 @@ class InteractService:
             self_uin: 自己的 QQ 号。
 
         Returns:
-            已经有我的回复时返回 True。
+            已经回过这一条时返回 True。
         """
         if not self_uin:
+            return False
+        candidate_tid = str(candidate.tid or "").strip()
+        if not candidate_tid:
             return False
         for sub in thread.replies:
             if sub.uin != self_uin:
                 continue
-            parent = str(sub.parent_tid).strip()
-            # 子回复多半不带 parent_tid，解析时会填成父评论的 tid；
-            # 两种都算「这条线程已经有我的回复」。
-            if not parent or parent in (candidate.tid, thread.tid):
+            if str(sub.parent_tid).strip() == candidate_tid:
                 return True
         return False
 
@@ -727,15 +741,17 @@ class InteractService:
                 if self.replied(post.tid, candidate.tid):
                     result.skipped += 1
                     continue
-                # 这条评论下已经有我的回复：跳过，避免继续叠加重复回复
+                # 只判断「这一条」是否已经回过：线程里别处有我的回复不影响它
                 if self.has_own_reply(thread, candidate, self_uin):
                     result.skipped += 1
-                    note = f"{post.tid} 下评论 {candidate.tid} 已经有我的回复，本轮跳过"
+                    note = (
+                        f"{post.tid} 下的评论 {candidate.tid} 已经有我的回复，本轮跳过"
+                    )
                     logger.info(f"[reply] {note}")
                     continue
 
                 try:
-                    await self._reply_to_comment(post, candidate, result)
+                    await self._reply_to_comment(post, thread, candidate, result)
                 except Exception as e:
                     result.errors.append(f"{post.tid}/{candidate.tid}: {e}")
                 # 同一条说说每轮最多回一条
@@ -790,7 +806,11 @@ class InteractService:
         return QzoneParser.parse_comments(resp.data)
 
     async def _reply_to_comment(
-        self, post: FeedPost, comment: FeedComment, result: ReplyResult
+        self,
+        post: FeedPost,
+        thread: FeedComment,
+        comment: FeedComment,
+        result: ReplyResult,
     ) -> None:
         """生成一条回复并直接发出。
 
@@ -799,10 +819,11 @@ class InteractService:
 
         Args:
             post: 评论所在的说说。
-            comment: 被回复的评论（也可能是别人写的子回复）。
+            thread: 这条候选所属的顶层评论（用来把整段交流交给 AI）。
+            comment: 本次要回复的那一条（可能是父评论，也可能是别人的子回复）。
             result: 本轮汇总，用于累计结果与错误。
         """
-        content = await self._generate_reply(post, comment)
+        content = await self._generate_reply(post, thread, comment)
 
         # 回复一律直接发出：不生成草稿、也不需要用户确认
         resp = await self.api.reply(
@@ -821,12 +842,65 @@ class InteractService:
             f"已回复 {comment.display_name()} 在 {post.tid} 下的评论（回查已确认）"
         )
 
-    async def _generate_reply(self, post: FeedPost, comment: FeedComment) -> str:
-        """用 AI 生成一条评论回复。
+    @staticmethod
+    def _brief(text: str, limit: int = _BRIEF_LIMIT) -> str:
+        """把正文压成一行并截断，用于放进提示词。"""
+        value = " ".join(str(text or "").split())
+        if len(value) > limit:
+            return value[:limit] + "…"
+        return value
+
+    def thread_digest(
+        self, post: FeedPost, thread: FeedComment, target: FeedComment
+    ) -> str:
+        """把**整段交流过程**整理成给 AI 的上下文。
+
+        内容是：说说正文（截断）→ 父评论 → 该线程下全部子回复（按时间升序、
+        标明说话人、我自己的回复标成「我」）→ 我之前已经说过的话 →
+        本次要回复的是哪一条。
+
+        Args:
+            post: 评论所在的说说（自己的说说，作者即「我」）。
+            thread: 顶层评论。
+            target: 本次要回复的那一条。
+
+        Returns:
+            可直接作为提示词正文的多行文本。
+        """
+        self_uin = post.uin
+        lines = [
+            f"我的说说：{self._brief(post.text) or '（无正文）'}",
+            "",
+            "这条评论下的完整交流（按时间先后，标注「我」的是我自己说过的话）：",
+            f"- 评论（{thread.display_name()}）：{thread.content}",
+        ]
+        said: list[str] = []
+        for item in sorted(thread.replies, key=lambda one: one.create_time):
+            if self_uin and item.uin == self_uin:
+                lines.append(f"- 我：{item.content}")
+                said.append(item.content)
+            else:
+                lines.append(f"- 回复（{item.display_name()}）：{item.content}")
+        lines.append("")
+        if said:
+            lines.append("我之前已经说过的话（不要重复这些意思）：")
+            lines.extend(f"- {text}" for text in said)
+            lines.append("")
+        kind = "评论" if str(target.tid) == str(thread.tid) else "回复"
+        lines.append(
+            f"本次要回复的是：{target.display_name()} 的这条{kind}「{target.content}」"
+        )
+        return "\n".join(lines)
+
+    async def _generate_reply(
+        self, post: FeedPost, thread: FeedComment, target: FeedComment
+    ) -> str:
+        """用 AI 生成一条评论回复（结合整段交流，不是只看最后一句）。
 
         Args:
             post: 评论所在的说说。
-            comment: 被回复的评论。
+            thread: 顶层评论，用来提供整段交流。
+            target: 本次要回复的那一条。
 
         Returns:
             回复正文。
@@ -834,21 +908,19 @@ class InteractService:
         Raises:
             RuntimeError: AI 返回内容为空时抛出。
         """
-        task = str(self.cfg.interact_reply_prompt or "").strip() or (
-            "针对对方的评论写一句得体的回复，直接回应对方提到的内容，"
-            "不要解释、不做自我描述、不分选项。"
-        )
+        task = str(self.cfg.interact_reply_prompt or "").strip() or DEFAULT_REPLY_PROMPT
         limit = max(int(self.cfg.interact_reply_max_chars or 0), 1)
 
         text = await self.ai.chat(
             system_prompt=(
                 f"{task}\n\n# 输出要求\n"
-                f"只输出回复正文本身，不要引号、不要解释，不超过 {limit} 字。"
+                f"只输出回复正文本身，不要引号、不要解释，不超过 {limit} 字。\n"
+                "结合上面给出的整段交流来回应，不要只针对最后一句孤立作答；"
+                "不要重复「我之前已经说过的话」里的意思，要接着往下说"
+                "（可以补充、可以反问一句、也可以回应对方的情绪）；"
+                "不要提及自己在查看评论记录、也不要暗示一直在关注对方。"
             ),
-            prompt=(
-                f"我的说说：{post.text or '（无正文）'}\n"
-                f"对方（{comment.display_name()}）的评论：{comment.content}"
-            ),
+            prompt=self.thread_digest(post, thread, target),
             provider_id=str(self.cfg.llm_reply_provider_id or ""),
             feature="回复",
         )
