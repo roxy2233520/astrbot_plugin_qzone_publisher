@@ -60,6 +60,7 @@ class QzoneHttpClient:
         headers: dict[str, str] | None = None,
         timeout: int | None = None,
         retry: int = 0,
+        page_is_expected: bool = False,
     ) -> dict[str, Any]:
         """发送一次带登录态的请求并返回解析后的响应。
 
@@ -71,6 +72,8 @@ class QzoneHttpClient:
             headers: 额外请求头，默认使用登录态的请求头。
             timeout: 本次请求超时（秒），默认使用客户端超时。
             retry: 内部重试计数，调用方无需传入。
+            page_is_expected: 该接口本来就可能返回页面（回复接口成功时也回页面）：
+                此时页面响应不写 error 日志，也不影响结论，由调用方自行判定。
 
         Returns:
             解析后的响应字典，附带内部 HTTP 状态码。
@@ -93,7 +96,7 @@ class QzoneHttpClient:
             status = resp.status
             text = await resp.text()
 
-        parsed = QzoneParser.parse_response(text)
+        parsed = QzoneParser.parse_response(text, page_is_expected=page_is_expected)
         meta = parsed.get(QZONE_INTERNAL_META_KEY)
         if not isinstance(meta, dict):
             meta = {}
@@ -138,6 +141,7 @@ class QzoneHttpClient:
                 headers=headers,
                 timeout=timeout,
                 retry=retry + 1,
+                page_is_expected=page_is_expected,
             )
 
         return parsed

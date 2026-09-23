@@ -188,20 +188,23 @@ class FeedComment:
             create_time=_as_int(raw.get("create_time") or raw.get("createTime")),
             parent_tid=str(raw.get("parent_tid") or "").strip(),
         )
-        comment.replies = cls._parse_replies(raw.get("list_3"), parent_tid=tid)
+        comment.replies = cls._parse_replies(
+            raw.get("list_3") or raw.get("list"), parent_tid=tid
+        )
         return comment
 
     @classmethod
     def _parse_replies(
         cls, items: object, *, parent_tid: str = ""
     ) -> list["FeedComment"]:
-        """解析一条评论下的子回复（``list_3``）。
+        """解析一条评论下的子回复。
 
-        子回复缺 id 时同样保留：判断「这条评论下是否已经有我的回复」只需要
-        uin 与正文；真要回复它时再按评论 id 规则挡下。
+        子回复字段名以 ``list_3`` 为主（空间评论对象的写法），个别返回用
+        ``list``，因此两者都接受。子回复缺 id 时同样保留：判断「这条评论下
+        是否已经有我的回复」只需要 uin 与正文；真要回复它时再按评论 id 规则处理。
 
         Args:
-            items: 评论项里的 ``list_3``。
+            items: 评论项里的 ``list_3``（或 ``list``）。
             parent_tid: 父评论的 tid，写进子回复的 ``parent_tid``。
 
         Returns:

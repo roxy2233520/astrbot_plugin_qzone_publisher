@@ -370,6 +370,8 @@ class QzoneAPI(QzoneHttpClient):
                 "paramstr": 2,
                 "qzreferrer": f"{self.BASE_URL}/{ctx.uin}/main",
             },
+            # 这个接口成功时也回 HTML 页面，页面响应只写 debug 日志，结论交给回查
+            page_is_expected=True,
         )
         resp = ApiResponse.from_raw(raw)
         meta = raw.get(QZONE_INTERNAL_META_KEY)

@@ -422,8 +422,9 @@ class InteractService:
         """检查评论 id 是否可用。
 
         实测：空间给评论的 id 就是小整数（例如 ``1``），**不是**长数字，
-        因此只挡真正不可用的两种：完全没有 id，以及与说说 id 相同
-        （后者说明解析错位，拿它去请求只会拿到错误响应）。
+        而且用这个 id 确实能回复成功。因此这里只挡真正不可用的两种：
+        完全没有 id，以及与说说 id 相同（后者说明解析错位）；
+        **其余一律放行**，短数字 id 只写一行 debug 日志，绝不跳过。
 
         Args:
             post_tid: 所在说说的 tid。
@@ -437,6 +438,8 @@ class InteractService:
             return "评论缺少 id，已跳过"
         if value == str(post_tid or "").strip():
             return f"评论 id（{value}）与说说 id 相同，疑似解析错位，已跳过"
+        if value.isdigit() and len(value) < 6:
+            logger.debug(f"评论 id（{value}）为短数字，仍按真实评论 id 使用")
         return ""
 
     @staticmethod

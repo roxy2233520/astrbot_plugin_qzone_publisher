@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-733%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-736%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -459,12 +459,15 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 - **成功与否以回查为准**：回复接口在**成功时也只返回一段 HTML 框架页**（不是 JSON），
   所以插件不看这个响应体，而是发出回复后**回查一次说说详情**
   （`emotion_cgi_msgdetail_v6`，带 `need_comment` 与 `need_private_comment`），
-  在被回复评论的子回复里找 `uin` 是自己、正文等于本次回复的那一条：
+  在被回复评论的子回复里找 `uin` 是自己、正文等于本次回复的那一条
+  （比对前去掉标点与空白，并允许前缀匹配以容忍接口截断）：
   找到才算成功并写入去重记录，找不到就算失败并在日志里写明回查结果。
   回执里的「回复 N 条」都是确认过的条数，不会再出现「其实已发出却报失败」。
-- **已经在评论下回复过就跳过**：接口会把一条评论下的回复放在子回复
-  （`list_3`）里，插件回复前先看这里有没有自己的回复，有就跳过并在日志里说明。
-  这条保护也能兜住历史上已经重复发出的回复，避免继续叠加。
+  「返回的是页面」只写进日志（这一路径记 debug 级），**不参与**成功与否的判定。
+- **已经在评论下回复过就跳过**：接口会把一条评论下的回复放在子回复里
+  （字段名 `list_3`，少数返回用 `list`，两者都认），插件回复前先看这里有没有
+  自己的回复，有就跳过并在日志里说明。这条保护也能兜住历史上已经重复发出的回复，
+  避免继续叠加。
 - 只回复文字评论：纯图片、纯表情（剥离表情标记后为空）以及自己发的评论都会被跳过。
 - **评论下的子回复同样是待回复对象**：别人在这条评论下追加的回复会单独处理，
   回复它时 `commentId` 用那条子回复自己的 id；自己写的子回复不会回复。
@@ -485,7 +488,8 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
   才判定为**登录态失效**，此时插件自动重取登录态并重试一次，仍失败才提示用 `/空间重登`。
   失败日志里会一并写出接口地址、topicId、commentId、commentUin、响应正文前 300 字与回查结果。
 - **评论 id 只挡真正不可用的**：空 id 与和说说 id 相同的会被跳过并写明原因；
-  空间给真实评论的 id 就是小整数（例如 `1`），这类正常 id 一律放行。
+  空间给真实评论的 id 就是小整数（例如 `1`），这类正常 id 一律放行并照常回复
+  （只在日志里留一行 debug 说明，不影响请求）。
 
 ### 管理员识别
 

@@ -259,7 +259,9 @@ class QzoneParser:
         return any(hint in lowered for hint in _VERIFY_PAGE_HINTS)
 
     @classmethod
-    def parse_response(cls, text: str) -> dict[str, Any]:
+    def parse_response(
+        cls, text: str, *, page_is_expected: bool = False
+    ) -> dict[str, Any]:
         """把原始响应文本解析为字典。
 
         解析顺序（逐级放宽）：
@@ -273,6 +275,8 @@ class QzoneParser:
 
         Args:
             text: 接口返回的原始文本，可能是 JSON 或 JSONP。
+            page_is_expected: 该接口本来就可能返回页面（回复接口成功时也回页面），
+                此时页面响应只写 debug 日志，不按错误记——结论由调用方（回查）决定。
 
         Returns:
             解析后的字典；解析失败时返回带 message 的错误字典。
@@ -288,7 +292,11 @@ class QzoneParser:
             end = stripped.rfind("}")
             if start == -1 or end == -1 or end < start:
                 # 完全没有 JSON 片段：多半是 HTML 页面
-                return cls._fail(stripped, missing_fragment=True)
+                return cls._fail(
+                    stripped,
+                    missing_fragment=True,
+                    page_is_expected=page_is_expected,
+                )
             body = stripped[start : end + 1]
 
         for candidate in (body, cls.relax_json(body)):
@@ -307,10 +315,16 @@ class QzoneParser:
             )
             return cls._error_payload(QZONE_MSG_NON_OBJECT_RESPONSE)
 
-        return cls._fail(stripped)
+        return cls._fail(stripped, page_is_expected=page_is_expected)
 
     @classmethod
-    def _fail(cls, raw: str, *, missing_fragment: bool = False) -> dict[str, Any]:
+    def _fail(
+        cls,
+        raw: str,
+        *,
+        missing_fragment: bool = False,
+        page_is_expected: bool = False,
+    ) -> dict[str, Any]:
         """解析彻底失败时的统一处理：写日志并给出可操作的原因。
 
         判定顺序（顺序很重要）：
@@ -327,16 +341,24 @@ class QzoneParser:
         Args:
             raw: 原始响应文本。
             missing_fragment: 是否连 JSON 片段都没有找到。
+            page_is_expected: 该接口本来就可能回页面：这类「返回页面」只写 debug 日志，
+                不当成错误（回复接口成功时也会回页面，结论由回查决定）。
 
         Returns:
             带 message 的错误响应体。
         """
         snippet = cls.visible_snippet(raw)
         if cls.is_framework_page(raw):
-            logger.error(
-                "QQ空间接口返回的是 JSONP / h5 框架页而不是数据（未重新获取登录态），"
-                f"响应片段: {snippet}｜多为接口地址或参数不对，可先升级插件版本"
-            )
+            if page_is_expected:
+                logger.debug(
+                    "QQ空间接口返回的是 JSONP / h5 框架页（该接口成功时也会回页面，"
+                    f"已按回查结果判定），响应片段: {snippet}"
+                )
+            else:
+                logger.error(
+                    "QQ空间接口返回的是 JSONP / h5 框架页而不是数据（未重新获取登录态），"
+                    f"响应片段: {snippet}｜多为接口地址或参数不对，可先升级插件版本"
+                )
             return cls._error_payload(
                 QZONE_MSG_UNEXPECTED_PAGE, code=QZONE_CODE_UNEXPECTED_PAGE
             )
@@ -357,10 +379,16 @@ class QzoneParser:
                 QZONE_MSG_VERIFY_PAGE, code=QZONE_CODE_VERIFY_PAGE
             )
         if cls.is_page_response(raw):
-            logger.error(
-                "QQ空间接口返回的是页面而不是数据（未重新获取登录态），响应片段: "
-                f"{snippet}｜多为接口地址或参数不对，可先升级插件版本"
-            )
+            if page_is_expected:
+                logger.debug(
+                    "QQ空间接口返回的是页面（该接口成功时也会回页面，"
+                    f"已按回查结果判定），响应片段: {snippet}"
+                )
+            else:
+                logger.error(
+                    "QQ空间接口返回的是页面而不是数据（未重新获取登录态），响应片段: "
+                    f"{snippet}｜多为接口地址或参数不对，可先升级插件版本"
+                )
             return cls._error_payload(
                 QZONE_MSG_UNEXPECTED_PAGE, code=QZONE_CODE_UNEXPECTED_PAGE
             )

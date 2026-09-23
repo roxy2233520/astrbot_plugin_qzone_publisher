@@ -6657,6 +6657,11 @@ async def main() -> int:
             f"{r1.summary()}/{reply_calls}",
         )
         check(
+            "判定成功时不产生任何失败日志/错误回执",
+            not r1.errors and not error_lines,
+            f"{r1.errors}/{str(error_lines)[-160:]}",
+        )
+        check(
             "确认成功后写入去重记录",
             plugin.interact.replied("S_R1", "C_R1")
             and (plugin.cfg.data_dir / "replied_comments.json").exists(),
@@ -6879,14 +6884,17 @@ async def main() -> int:
 
     plugin.interact._replied = []
     replies.clear()
-    feeds_payload[:] = [my_post("S_BAD", 1, [comment_item("1", "短数字 id 的评论")])]
-    bad_res = await plugin.interact.run_replies_once()
+    posted_replies.clear()
+    feeds_payload[:] = [
+        my_post("S_NUM1", 1, [comment_item("1", "评论 id 是 1")]),
+        my_post("S_NUM2", 2, [comment_item("2", "评论 id 是 2")]),
+    ]
+    num_res = await plugin.interact.run_replies_once()
+    posted_ids = sorted(str(item["form"].get("commentId")) for item in replies)
     check(
-        "短数字 id 的评论会被正常回复（不再被当成可疑 id 跳过）",
-        bad_res.replied == 1
-        and len(replies) == 1
-        and replies[-1]["form"].get("commentId") == "1",
-        f"{bad_res.summary()}/{replies}",
+        "评论 id 为 1 与 2 时都不被跳过，确实发出了 POST",
+        num_res.replied == 2 and len(replies) >= 1 and posted_ids == ["1", "2"],
+        f"{num_res.summary()}/请求 {len(replies)} 次/{posted_ids}",
     )
 
     plugin.interact._replied = []
@@ -6911,6 +6919,40 @@ async def main() -> int:
         "跳过时写明原因",
         any("疑似解析错位" in item for item in warning_lines),
         str(warning_lines)[-200:],
+    )
+
+    # 6) 子回复字段兼容：list_3 为主，list 也能认，parent_tid 指向父评论
+    _model_mod = _imp("core.qzone.model")
+    only_list = _model_mod.FeedComment.from_raw(
+        {
+            "uin": 999999,
+            "tid": "1",
+            "content": "父评论",
+            "list": [{"uin": 123456, "tid": "2", "content": "我的回复"}],
+        }
+    )
+    check(
+        "子回复字段兼容 list（parent_tid 指向父评论 tid）",
+        len(only_list.replies) == 1
+        and only_list.replies[0].uin == 123456
+        and only_list.replies[0].parent_tid == "1",
+        str([(item.uin, item.tid, item.parent_tid) for item in only_list.replies]),
+    )
+    both_keys = _model_mod.FeedComment.from_raw(
+        {
+            "uin": 999999,
+            "tid": "1",
+            "content": "父评论",
+            "list": [{"uin": 111111, "tid": "9", "content": "另一个字段里的回复"}],
+            "list_3": [{"uin": 123456, "tid": "2", "content": "自己的回复"}],
+        }
+    )
+    check(
+        "同时出现 list_3 与 list 时以 list_3 为准",
+        len(both_keys.replies) == 1
+        and both_keys.replies[0].tid == "2"
+        and both_keys.replies[0].parent_tid == "1",
+        str([(item.uin, item.tid, item.parent_tid) for item in both_keys.replies]),
     )
 
     plugin.publish_task.stop()
