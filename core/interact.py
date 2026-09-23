@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api import logger
@@ -133,6 +134,12 @@ class InteractService:
         self.reply_file = Path(config.data_dir) / "replied_comments.json"
         self._replied: list[str] = []
         self.load_replied()
+        # 每日回复条数（用于「今日已回几条」），与去重记录分开存
+        self.reply_count_file = Path(config.data_dir) / "reply_counts.json"
+        self._reply_counts: dict[str, int] = {}
+        self.load_reply_counts()
+        # 回复巡检轮次：仅用于日志，让用户能看出它在跑
+        self.reply_round = 0
 
     # ------------------------------------------------------------------
     # 去重记录
@@ -199,8 +206,17 @@ class InteractService:
 
     @property
     def window_days(self) -> int:
-        """时间窗口天数（至少 1 天）。"""
+        """好友互动的时间窗口天数（至少 1 天）。"""
         return max(int(self.cfg.interact_days or 0), 1)
+
+    @property
+    def reply_days(self) -> int:
+        """回复评论的时间窗口天数（至少 1 天）。
+
+        回复有自己的窗口 ``interact_reply_days``（默认 7 天），比好友互动的窗口更长：
+        旧说说下面新来的评论同样要被发现，不能被 ``interact_days`` 挡住。
+        """
+        return max(int(self.cfg.interact_reply_days or 0), 1)
 
     @staticmethod
     def _ago(created_time: int) -> str:
@@ -442,6 +458,58 @@ class InteractService:
         """累计已回复的评论条数。"""
         return len(self._replied)
 
+    # ------------------------------------------------------------------
+    # 每日回复条数（今日已回几条）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _today() -> str:
+        """今天的日期串。"""
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def load_reply_counts(self) -> None:
+        """加载每日回复条数记录。"""
+        self._reply_counts = {}
+        if not self.reply_count_file.exists():
+            return
+        try:
+            raw = json.loads(self.reply_count_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"每日回复条数记录读取失败，已忽略: {e}")
+            return
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                try:
+                    self._reply_counts[str(key)] = int(value)
+                except (TypeError, ValueError):
+                    continue
+
+    def save_reply_counts(self) -> None:
+        """原子写入每日回复条数记录，只保留最近 7 天。"""
+        try:
+            self.reply_count_file.parent.mkdir(parents=True, exist_ok=True)
+            keys = sorted(self._reply_counts)[-7:]
+            payload = {key: self._reply_counts[key] for key in keys}
+            tmp = self.reply_count_file.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self.reply_count_file)
+        except Exception as e:
+            logger.error(f"每日回复条数记录写入失败: {e}")
+
+    def count_reply(self) -> int:
+        """把「今天回复了一条」记进每日计数。"""
+        today = self._today()
+        self._reply_counts[today] = self._reply_counts.get(today, 0) + 1
+        self.save_reply_counts()
+        return self._reply_counts[today]
+
+    @property
+    def replied_today(self) -> int:
+        """今天已经回复了几条。"""
+        return int(self._reply_counts.get(self._today(), 0))
+
     @property
     def reply_limit(self) -> int:
         """每轮最多回复几条（至少 1）。"""
@@ -457,9 +525,13 @@ class InteractService:
     async def run_replies_once(self, *, force: bool = False) -> ReplyResult:
         """巡检一轮：回复自己说说下别人留下的新评论。
 
-        只处理 ``interact_days`` 天内自己发布的说说；每轮最多回复
+        只处理 ``interact_reply_days`` 天内自己发布的说说（默认 7 天，比好友互动的
+        窗口更长，避免旧说说下的新评论永远发现不了）；每轮最多回复
         ``interact_reply_max_per_run`` 条，且同一条说说每轮最多回一条；
         自己的评论、空内容评论与已回复过的评论都会被跳过。
+
+        无论本轮有没有新评论，都会写一行 info 日志（第几轮 / 检查 / 回复 / 跳过），
+        方便确认定时任务确实在跑。
 
         Args:
             force: 为 True 时忽略「已有待确认回复草稿」的占用检查。
@@ -468,16 +540,19 @@ class InteractService:
             本次巡检汇总。
         """
         result = ReplyResult()
+        self.reply_round += 1
         try:
             self_uin = await self.api.session.get_uin()
         except Exception as e:
             result.errors.append(f"无法确认自己的 QQ 号: {e}")
+            self._log_round(result, reason="无法确认自己的 QQ 号")
             return result
         if not self_uin:
             result.errors.append("无法确认自己的 QQ 号，本轮不回复评论")
+            self._log_round(result, reason="无法确认自己的 QQ 号")
             return result
 
-        days = self.window_days
+        days = self.reply_days
         cutoff = int(time.time()) - days * 86400
         limit = self.reply_limit
         count = max(int(self.cfg.interact_count or 0), 1)
@@ -486,9 +561,11 @@ class InteractService:
             resp = await self.api.get_feeds(self_uin, pos=0, num=count)
         except Exception as e:
             result.errors.append(f"读取自己的说说失败: {e}")
+            self._log_round(result, reason=f"读取自己的说说失败：{e}")
             return result
         if not resp.ok:
             result.errors.append(f"读取自己的说说失败: {resp.message or resp.code}")
+            self._log_round(result, reason="读取自己的说说失败")
             return result
 
         posts = QzoneParser.parse_feeds(resp.data)
@@ -497,10 +574,13 @@ class InteractService:
             for post in posts
             if post.created_time <= 0 or post.created_time >= cutoff
         ]
+        reason = ""
         if not posts:
-            logger.info("自己的说说列表为空，本轮不回复评论")
+            reason = "自己的说说列表为空"
         elif not fresh:
-            logger.info(f"自己的说说都在 {days} 天窗口之外，本轮不回复评论")
+            reason = (
+                f"自己的说说都在 {days} 天窗口之外（窗口由 interact_reply_days 决定）"
+            )
 
         pending = self.drafts.pending
         occupied = (
@@ -528,6 +608,7 @@ class InteractService:
                     continue
                 if not force and comment.tid == occupied:
                     result.skipped += 1
+                    reason = "有一条新评论正在等你确认草稿，本轮跳过"
                     continue
 
                 try:
@@ -537,9 +618,33 @@ class InteractService:
                 # 同一条说说每轮最多回一条
                 break
 
+        if result.replied + result.drafted >= limit:
+            reason = (
+                f"本轮达到每轮上限 {limit} 条，"
+                "剩余新评论会在下一轮继续处理（可调大「每轮最多回复几条」）"
+            )
+
         self.save_replied()
-        logger.info(f"评论回复巡检完成：{result.summary()}")
+        self._log_round(result, reason=reason)
         return result
+
+    def _log_round(self, result: ReplyResult, *, reason: str = "") -> None:
+        """写一行本轮巡检日志（无论有没有新评论都写）。
+
+        Args:
+            result: 本轮汇总。
+            reason: 未回复或跳过时的原因说明。
+        """
+        line = (
+            f"[reply] 第 {self.reply_round} 轮评论巡检：检查 {result.checked} 条，"
+            f"回复 {result.replied} 条，转草稿 {result.drafted} 条，"
+            f"跳过 {result.skipped} 条"
+        )
+        if reason:
+            line += f"｜说明：{reason}"
+        if result.errors:
+            line += f"｜错误 {len(result.errors)} 条：{result.errors[0]}"
+        logger.info(line)
 
     async def _comments_of(
         self, post: FeedPost, result: ReplyResult
@@ -612,6 +717,7 @@ class InteractService:
 
         result.replied += 1
         self.mark_replied(post.tid, comment.tid)
+        self.count_reply()
         logger.info(f"已回复 {comment.display_name()} 在 {post.tid} 下的评论")
 
     async def _generate_reply(self, post: FeedPost, comment: FeedComment) -> str:

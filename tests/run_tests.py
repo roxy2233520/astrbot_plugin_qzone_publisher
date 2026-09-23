@@ -3480,10 +3480,25 @@ async def main() -> int:
     ]
     res = await plugin.interact.run_replies_once()
     check(
-        "自己 5 天前的说说超出窗口，不回复",
+        "回复窗口默认为 7 天：5 天前的说说下的新评论照样处理",
+        res.checked == 1 and res.replied == 1 and len(replies) == 1,
+        res.summary(),
+    )
+
+    # 窗口由 interact_reply_days 决定（不是好友互动的 interact_days）
+    plugin.interact._replied = []
+    replies.clear()
+    plugin.cfg.set("interact_reply_days", 3)
+    feeds_payload[:] = [
+        my_post("S_OLD", 24 * 5, [comment_item("C_OLD", "老说说上的评论")])
+    ]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "把回复窗口调成 3 天后，5 天前的说说不再处理",
         res.checked == 0 and res.replied == 0 and not replies,
         res.summary(),
     )
+    plugin.cfg.set("interact_reply_days", 7)
 
     plugin.interact._replied = []
     replies.clear()
@@ -3645,9 +3660,25 @@ async def main() -> int:
     out = await collect(plugin.cmd_reply(FakeEvent(), ""))
     check(
         "/空间回复 无参数显示状态",
-        any("回复评论" in item and "当前状态" in item for item in out)
-        and any("每轮上限" in item for item in out),
-        str(out)[:140],
+        any("回复评论" in item and "巡检间隔" in item for item in out)
+        and any("时间窗口" in item and "每轮上限" in item for item in out),
+        str(out)[:200],
+    )
+    check(
+        "/空间回复 状态含开关、回复方式、今日已回与下次巡检",
+        any(
+            "开关：" in item
+            and "回复方式：" in item
+            and "今日已回" in item
+            and "下次巡检" in item
+            for item in out
+        ),
+        str(out)[:240],
+    )
+    check(
+        "/空间回复 状态说明没有评论推送、只能轮询",
+        any("QQ空间没有评论推送" in item for item in out),
+        str(out)[:240],
     )
     out = await collect(plugin.cmd_reply(FakeEvent(), "off"))
     check(
@@ -5724,6 +5755,176 @@ async def main() -> int:
         and len(guidance.splitlines()) <= 6
         and not _ui.has_markdown(guidance),
         guidance[:120],
+    )
+
+    # ==================================================================
+    print("\n[38] 回复评论：独立高频巡检与默认直接回复")
+
+    # 回复巡检有自己的定时任务，不再寄生在 interact_cron 上
+    plugin.api.FEEDS_URL = "http://127.0.0.1:8792/feeds"
+    plugin.api.DETAIL_URL = "http://127.0.0.1:8792/detail"
+    plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
+    plugin.cfg.set("interact_reply_cron", "*/5 8-23 * * *")
+    plugin.cfg.set("interact_reply_jitter", 60)
+    plugin.cfg.set("interact_reply_days", 7)
+    plugin.cfg.set("interact_cron", "0 21 * * *")
+
+    cron = plugin.reply_task.reconfigure(enabled=True)
+    check(
+        "回复巡检按自己的时间配置调度",
+        plugin.reply_task.name == "qzone_reply"
+        and cron == "*/5 8-23 * * *"
+        and plugin.reply_task.running,
+        f"{plugin.reply_task.name}/{cron}/{plugin.reply_task.running}",
+    )
+    check(
+        "回复巡检带自己的抖动",
+        plugin.reply_task.jitter == 60,
+        str(plugin.reply_task.jitter),
+    )
+    check(
+        "回复巡检与好友巡检是两个互不影响的任务",
+        plugin.interact_task.name == "qzone_interact"
+        and plugin.interact_task.cron == "0 21 * * *"
+        and plugin.reply_task.cron != plugin.interact_task.cron,
+        f"{plugin.interact_task.cron}/{plugin.reply_task.cron}",
+    )
+    check(
+        "巡检间隔的人话说明能读出每 N 分钟",
+        plugin.interact_reply_interval_text() == "每 5 分钟一次（*/5 8-23 * * *）",
+        plugin.interact_reply_interval_text(),
+    )
+
+    # 回复窗口默认 7 天（好友互动默认 3 天）
+    fresh_cfg = PluginConfig(StubAstrBotConfig({}), FakeContext(onebot))
+    check(
+        "回复窗口默认 7 天、好友互动仍是 3 天",
+        fresh_cfg.interact_reply_days == 7 and fresh_cfg.interact_days == 3,
+        f"{fresh_cfg.interact_reply_days}/{fresh_cfg.interact_days}",
+    )
+    check(
+        "回复巡检间隔默认每 5 分钟",
+        fresh_cfg.interact_reply_cron == "*/5 8-23 * * *"
+        and fresh_cfg.interact_reply_jitter == 60,
+        f"{fresh_cfg.interact_reply_cron}/{fresh_cfg.interact_reply_jitter}",
+    )
+    check(
+        "回复默认直接发出（draft_for_reply 默认关闭）",
+        fresh_cfg.draft_for_reply is False,
+        str(fresh_cfg.draft_for_reply),
+    )
+
+    # 每轮无论有没有新评论都写一行日志
+    logged_lines: list[str] = []
+    _stub_logger = sys.modules["astrbot.api"].logger
+    _real_info = _stub_logger.info
+    _stub_logger.info = lambda *args, **kwargs: logged_lines.append(
+        str(args[0]) if args else ""
+    )
+    try:
+        plugin.interact._replied = []
+        replies.clear()
+        feeds_payload[:] = []
+        empty_round = await plugin.interact.run_replies_once()
+    finally:
+        _stub_logger.info = _real_info
+    check(
+        "没有新评论也写一行巡检日志",
+        any("轮评论巡检" in item and "检查 0 条" in item for item in logged_lines),
+        str(logged_lines)[-200:],
+    )
+    check(
+        "空轮次日志含轮次号与说明",
+        any("第" in item and "说说列表为空" in item for item in logged_lines),
+        str(logged_lines)[-200:],
+    )
+    check(
+        "轮次计数随每次巡检递增",
+        plugin.interact.reply_round >= 1 and empty_round.replied == 0,
+        f"{plugin.interact.reply_round}/{empty_round.summary()}",
+    )
+
+    # 达到每轮上限时写明原因（剩余留到下一轮）
+    plugin.cfg.set("draft_for_reply", False)
+    plugin.cfg.set("interact_reply_max_per_run", 1)
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post(
+            "S_UI",
+            1,
+            [
+                comment_item("C_UI1", "第一条新评论"),
+                comment_item("C_UI2", "第二条新评论"),
+            ],
+        )
+    ]
+    logged_lines.clear()
+    _stub_logger.info = lambda *args, **kwargs: logged_lines.append(
+        str(args[0]) if args else ""
+    )
+    try:
+        capped = await plugin.interact.run_replies_once(force=True)
+    finally:
+        _stub_logger.info = _real_info
+    check(
+        "每轮上限生效：本轮只回一条",
+        capped.replied == 1 and len(replies) == 1,
+        f"{capped.summary()}/{len(replies)}",
+    )
+    check(
+        "被上限截断时日志写明原因并指向下一轮",
+        any("达到每轮上限" in item and "下一轮" in item for item in logged_lines),
+        str(logged_lines)[-240:],
+    )
+    plugin.cfg.set("interact_reply_max_per_run", 3)
+
+    # 指令：开启/关闭即时重建或停止该任务
+    out = await collect(plugin.cmd_reply(FakeEvent(), "off"))
+    check(
+        "/空间回复 off 即时停掉回复巡检任务",
+        plugin.cfg.interact_reply_enabled is False and not plugin.reply_task.running,
+        f"{plugin.cfg.interact_reply_enabled}/{plugin.reply_task.running}",
+    )
+    out = await collect(plugin.cmd_reply(FakeEvent(), "on"))
+    check(
+        "/空间回复 on 即时重建回复巡检任务并给出下次巡检",
+        plugin.cfg.interact_reply_enabled is True
+        and plugin.reply_task.running
+        and any("下次巡检" in item for item in out)
+        and any("每 5 分钟一次" in item for item in out),
+        str(out)[:240],
+    )
+    check(
+        "/空间回复 on 回执写明没有评论推送",
+        any("QQ空间没有评论推送" in item for item in out),
+        str(out)[:240],
+    )
+
+    # 状态行：补上巡检间隔、窗口与回复方式
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里的评论回复行含巡检间隔、窗口与回复方式",
+        any(
+            "评论回复" in item
+            and "巡检 */5 8-23 * * *" in item
+            and "窗口 7 天" in item
+            and "直接回复" in item
+            for item in out
+        ),
+        str([item for item in out if "评论回复" in item])[:240],
+    )
+
+    out = await collect(plugin.cmd_reply(FakeEvent(), "now"))
+    check(
+        "now 立即跑一轮并回报本轮结果",
+        any("评论回复完成" in item for item in out),
+        str(out)[:200],
+    )
+    check(
+        "now 不改变开关状态",
+        plugin.cfg.interact_reply_enabled is True,
+        str(plugin.cfg.interact_reply_enabled),
     )
 
     plugin.publish_task.stop()

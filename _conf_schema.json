@@ -555,6 +555,34 @@
         "type": "bool",
         "default": false
       },
+      "interact_reply_cron": {
+        "description": "评论回复的巡检间隔",
+        "hint": "每 5 分钟检查一次自己的说说有没有新评论；QQ空间没有评论推送通道，评论只能靠定时轮询发现，间隔越短发现越及时（支持 HH:MM 或 5 段 Cron）",
+        "type": "string",
+        "default": "*/5 8-23 * * *"
+      },
+      "interact_reply_jitter": {
+        "description": "评论回复的随机抖动（秒）",
+        "hint": "每轮触发后随机延后 0~N 秒，避免每次都卡在同一秒",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 600,
+          "step": 5
+        },
+        "default": 60
+      },
+      "interact_reply_days": {
+        "description": "评论回复的时间窗口（天）",
+        "hint": "只处理这么多天内自己发布的说说下的评论；比「说说的观察天数」更长，旧说说下新来的评论同样会被发现",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        },
+        "default": 7
+      },
       "llm_comment_provider_id": {
         "description": "生成评论用的提供商（可选）",
         "hint": "想给评论单独指定模型就选这里；留空则沿用上面的提供商",
@@ -764,9 +792,9 @@
       },
       "draft_for_reply": {
         "description": "回复评论也先走草稿确认",
-        "hint": "回复同样发在别人的空间里，默认先发给你确认，/空间确认 后才真正发出",
+        "hint": "开启后巡检到的新评论会先转成草稿等你确认，回复会被显著延迟；关闭（默认）则巡检到即直接回复。评论巡检每 5 分钟一轮，想即时回复就保持关闭",
         "type": "bool",
-        "default": true
+        "default": false
       },
       "draft_for_greet": {
         "description": "定时问候也走草稿确认",

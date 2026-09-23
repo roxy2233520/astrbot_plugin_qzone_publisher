@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-635%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-656%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -34,7 +34,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | AI 接入 | **只复用 AstrBot 已配置的 LLM 提供商**，插件不保存密钥、不自己发请求 |
 | 生活日程 | 自己用 AI 生成「今日穿搭 + 日程」（按天缓存、懒加载、创意池、防重复）；可选注入 system prompt |
 | 说说互动 | 定时读取关注 QQ 号**最近 N 天内最新的一条**说说（`interact_days`，**默认只读**）；最新一条超出窗口就整体跳过，不去评论几天前的老说说。可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
-| 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限，默认先转草稿确认 |
+| 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限。**默认直接回复**（`draft_for_reply` 默认关闭），并改用独立的巡检任务（`interact_reply_cron`，默认每 5 分钟一轮、窗口 7 天），不再等一天一次的互动巡检 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
 | 定时问候 | 按时间给**已同意接收的用户**私聊发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
 | 日常闲聊 | 在配置的时间窗口（默认中午 12:00-13:30、晚上 19:00-22:00）里**随机挑一个时刻**，主动给一位已同意的用户发一两句轻松搭话（`chat_open_enabled`，**默认关闭**）：每天最多几条可调，同一个人每天最多一条，支持跨零点窗口 |
@@ -139,7 +139,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 - 说说互动：在面板里把 `interact_uins` 填成要关注的 QQ 号，`interact_enabled` 打开即可开始只读巡检；
   点赞（`interact_like`）与 AI 评论（`interact_comment`）需要单独打开。
-- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开，建议保留默认的先转草稿确认。
+- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开即可；默认巡检到就直接回复，回复间隔由 `interact_reply_cron` 决定（默认每 5 分钟一轮）。
 
 ### 第七步：确认通知与管理员
 
@@ -158,6 +158,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | 今日生活日程 | `/空间日程`，`renew` 重新生成 |
 | 问候与节日祝福发了没有 | 问候通知与 `/空间状态` 的「定时问候」「节日祝福」两行（含本次将发给几人、今日已发几人） |
 | 主动闲聊发了没有 | `/空间状态` 的「主动闲聊」一行（开关、窗口、每天上限、今日已发人数、下一个窗口）或用 `/空间闲聊` 查看 |
+| 评论有没有被回复 | `/空间回复` 里的「今日已回」与「下次巡检」，以及插件日志里的 `[reply] 第 N 轮评论巡检` |
 | 巡检做了什么 | `interact_notify` 打开后每次巡检结束会发一条汇总；好友说说与自己说说下的评论都会覆盖 |
 | 主动消息的同意情况 | `/空间状态` 的「主动消息同意」一行，以及问候通知里的「因未接受主动消息跳过 N 人」 |
 
@@ -187,7 +188,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `/空间开关 [on\|off]` | 管理员 | 定时发布开关 |
 | `/空间互动 [on\|off]` | 管理员 | 说说巡检开关（点赞/评论在配置里单独开） |
 | `/空间读说说 [force]` | 管理员 | 立刻巡检一轮（好友说说 + 自己说说下的评论） |
-| `/空间回复 [on\|off\|now]` | 管理员 | 查看或开关「回复自己说说下的评论」，`now` 立刻跑一轮 |
+| `/空间回复 [on\|off\|now]` | 管理员 | 查看或开关「回复自己说说下的评论」（不带参数显示开关、巡检间隔、时间窗口、回复方式、每轮上限、今日已回与下次巡检；`on` / `off` 会即时重建或停止该巡检任务），`now` 立刻跑一轮 |
 | `/空间日程 [renew]` | 所有人 | 查看今日生活日程，`renew` 重新生成 |
 | `/空间搜索 [关键词]` | 管理员 | 用 AstrBot 自带联网搜索测一条（不发说说）；不带参数看接入状态 |
 | `/空间确认` / `/空间放弃` / `/空间重写` | 管理员 | 处理待确认草稿 |
@@ -414,14 +415,28 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 `interact_reply_enabled` 控制是否回复自己说说下的评论（默认关闭）。边界如下：
 
-- 只处理 `interact_days` 天内**自己发布的**说说；说说列表没带评论明细时，会再请求一次说说详情补取，
+- **没有评论推送，只能轮询**：OneBot(NapCat) 只推送 QQ 消息事件，QQ空间的新评论没有
+  推送或回调通道，因此评论只能靠定时轮询发现。回复巡检是**独立任务**
+  （`interact_reply_cron`，默认 `*/5 8-23 * * *` 即白天到晚上每 5 分钟一轮，
+  另有 `interact_reply_jitter` 随机抖动），不再搭在一天一次的好友巡检上；
+  发现延迟的上限就是这一轮的间隔。
+- **回复有自己的时间窗口** `interact_reply_days`（默认 7 天）：只处理这么多天内
+  **自己发布的**说说，比好友互动的 `interact_days`（默认 3 天）更长，
+  旧说说下新来的评论同样会被发现；说说列表没带评论明细时，会再请求一次说说详情补取，
   两次都拿不到就跳过这条说说。
 - 只回复文字评论：纯图片、纯表情（剥离表情标记后为空）以及自己发的评论都会被跳过。
-- 回复发在别人的空间里且公开可见，默认走草稿确认；`draft_for_reply` 关闭后才会直接发出。
+- **默认直接回复**：`draft_for_reply` 默认关闭，巡检到新评论就直接发出；
+  打开后回复会先转成草稿等你确认，会显著延迟。
 - 同一条评论只回复一次，记录在 `<数据目录>/replied_comments.json`；
+  每日回复条数记在 `<数据目录>/reply_counts.json`（`/空间回复` 里的「今日已回」）；
   草稿被放弃时不会记为已回复，下次巡检仍会重试。
-- 每轮总数由 `interact_reply_max_per_run` 限制，同一条说说每轮最多回复一条，
-  回复字数上限为 `interact_reply_max_chars`，提示词为 `interact_reply_prompt`。
+- 每轮总数由 `interact_reply_max_per_run` 限制（默认 3 条），同一条说说每轮最多回复一条，
+  被上限截断的新评论会在下一轮继续处理；回复字数上限为 `interact_reply_max_chars`，
+  提示词为 `interact_reply_prompt`。
+- **每轮都有日志**：无论有没有新评论，都会写一行
+  `[reply] 第 N 轮评论巡检：检查 … 回复 … 跳过 …`；发现新评论却没回复时会写明原因
+  （例如达到每轮上限、正在等你确认草稿）。用 `/空间回复` 可以查看开关、巡检间隔、
+  时间窗口、回复方式、每轮上限、今日已回与下次巡检。
 
 ### 管理员识别
 
@@ -453,7 +468,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | :--- | :--- | :--- |
 | `draft_enabled` | `false` | 定时发说说先转草稿，人工确认后才发 |
 | `draft_for_comment` | `true` | 自动评论也先转草稿 |
-| `draft_for_reply` | `true` | 回复评论也先转草稿 |
+| `draft_for_reply` | `false` | 回复评论是否先转草稿：**默认关闭 = 巡检到即直接回复**；打开后回复会先等你确认，会显著延迟 |
 | `draft_for_greet` | `false` | 定时问候也先转草稿（你确认后才私聊发给问候对象） |
 | `draft_timeout_minutes` | `0` | 大于 0 时草稿超时无人处理会**自动放行**并通知你；0 = 必须人工处理 |
 | `draft_admin` / `draft_umo` | `true` / 空 | 草稿发给谁 |
@@ -587,7 +602,10 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_skip_self` | `true` | 跳过自己发的 |
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
-| `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复，建议保留「回复也先确认」 |
+| `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复；默认巡检到就直接回复 |
+| `interact_reply_cron` | `*/5 8-23 * * *` | **评论回复的巡检间隔**：默认白天到晚上每 5 分钟检查一次自己的说说有没有新评论。QQ空间没有评论推送通道，评论只能靠定时轮询发现；支持 `HH:MM` 或 5 段 Cron |
+| `interact_reply_jitter` | `60` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒，避免卡在同一秒 |
+| `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |
 | `llm_reply_provider_id` | 空 | 回复单独指定模型提供商（留空用全局） |
 | `interact_reply_prompt` | 见默认值 | 回复提示词 |
 | `interact_reply_max_chars` | `80` | 回复最大字数 |
@@ -615,7 +633,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `draft_admin` | `true` | 草稿私聊插件内管理员（回退 AstrBot 的 `admins_id`） |
 | `draft_umo` | 空 | 草稿额外发到的会话，格式 `平台ID:消息类型:会话ID` |
 | `draft_for_comment` | `true` | 自动评论也先转草稿 |
-| `draft_for_reply` | `true` | 回复评论也先转草稿（**默认开**：回复同样发在别人空间里，先过目更稳妥） |
+| `draft_for_reply` | `false` | 回复评论是否先转草稿：**默认关闭**（巡检到即直接回复）；打开后回复先等你确认，会显著延迟 |
 | `draft_for_greet` | `false` | 定时问候也先转草稿 |
 | `draft_timeout_minutes` | `0` | 大于 0 时草稿超时无人处理会**自动放行**并通知你；0 = 必须人工处理 |
 
@@ -660,6 +678,7 @@ astrbot_plugin_qzone_publisher/
 ├── user_prefs.json        每个私聊用户的主动消息偏好
 ├── publish_angles.json    每天用过的创作角度（避免同一天内角度重复）
 ├── replied_comments.json  已回复过的评论（去重）
+├── reply_counts.json      每日回复条数（指令里的「今日已回几条」）
 ├── interacted_tids.json   已处理过的说说（去重用）
 └── token_usage.json       按天累计的 AI 用量估算（`/空间用量` 读取）
 ```

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import time
 from datetime import date, datetime
 from typing import Any
@@ -67,6 +68,7 @@ _RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"
 _NOW_FLAGS = {"now", "run", "立刻", "立即", "现在"}
 _PUBLISH_TASK = "qzone_auto_publish"
 _INTERACT_TASK = "qzone_interact"
+_REPLY_TASK = "qzone_reply"
 _GREET_MORNING_TASK = "qzone_greet_morning"
 _GREET_NIGHT_TASK = "qzone_greet_night"
 _HOLIDAY_TASK = "qzone_greet_holiday"
@@ -134,6 +136,15 @@ class QzonePublisherPlugin(Star):
             jitter_key="interact_jitter",
             enabled_key="interact_enabled",
         )
+        # 回复自己的评论：独立任务 + 自己的时间窗口，默认每 5 分钟轮询一次
+        self.reply_task = CronTask.from_config(
+            self.cfg,
+            name=_REPLY_TASK,
+            job=self._auto_reply,
+            cron_key="interact_reply_cron",
+            jitter_key="interact_reply_jitter",
+            enabled_key="interact_reply_enabled",
+        )
         self.greet_morning_task = CronTask.from_config(
             self.cfg,
             name=_GREET_MORNING_TASK,
@@ -168,6 +179,7 @@ class QzonePublisherPlugin(Star):
         """插件加载时启动所有定时任务，并接上未处理完的草稿计时。"""
         self.publish_task.start()
         self.interact_task.start()
+        self.reply_task.start()
         self.greet_morning_task.start()
         self.greet_night_task.start()
         self.holiday_task.start()
@@ -218,6 +230,7 @@ class QzonePublisherPlugin(Star):
         self._cancel_draft_timer()
         self.publish_task.stop()
         self.interact_task.stop()
+        self.reply_task.stop()
         self.greet_morning_task.stop()
         self.greet_night_task.stop()
         self.holiday_task.stop()
@@ -475,7 +488,11 @@ class QzonePublisherPlugin(Star):
         await self._dispatch_post(text, source=source, prefix="定时发布")
 
     async def _auto_interact(self) -> None:
-        """定时互动任务：读 / 赞 / 评好友说说，并回复自己说说下的评论。"""
+        """定时互动任务：读 / 赞 / 评好友说说。
+
+        回复自己说说下的评论是**独立任务**（``qzone_reply``，按
+        ``interact_reply_cron`` 高频轮询），不再搭在这次巡检上。
+        """
         lines: list[str] = []
 
         if self.interact.targets:
@@ -488,14 +505,6 @@ class QzonePublisherPlugin(Star):
         else:
             logger.info("未配置 interact_uins，跳过本轮好友说说巡检")
 
-        if bool(self.cfg.interact_reply_enabled):
-            reply = await self.interact.run_replies_once()
-            lines.append(
-                plain_receipt(
-                    "评论回复完成", reply.summary().splitlines(), icon=ICON_OK
-                )
-            )
-
         if lines and bool(self.cfg.interact_notify):
             await self._notify(f"\n{DIVIDER}\n".join(lines))
 
@@ -503,6 +512,26 @@ class QzonePublisherPlugin(Star):
         if pending is not None and pending.kind in ("comment", "reply"):
             await self._send_draft(pending)
             await self._arm_draft_timer(pending)
+
+    async def _auto_reply(self) -> None:
+        """定时任务：按 ``interact_reply_cron`` 轮询自己说说下的新评论并回复。
+
+        QQ空间没有评论推送通道（OneBot 只推送 QQ 消息事件），因此评论只能靠轮询发现，
+        所以这个任务默认每 5 分钟跑一轮；每轮无论有没有新评论都会写一行日志。
+        """
+        if not bool(self.cfg.interact_reply_enabled):
+            return
+        try:
+            result = await self.interact.run_replies_once()
+        except Exception as e:
+            logger.error(f"[reply] 本轮评论巡检异常: {e}")
+            return
+        if (result.replied or result.drafted) and bool(self.cfg.interact_notify):
+            await self._notify(
+                plain_receipt(
+                    "评论回复完成", result.summary().splitlines(), icon=ICON_OK
+                )
+            )
 
     async def _greet_morning(self) -> None:
         """定时任务：群发早安问候。"""
@@ -652,6 +681,21 @@ class QzonePublisherPlugin(Star):
             f"今日已发 {self.greet.sent_today(f'holiday:{today.isoformat()}')} 人"
         )
         return "｜".join(parts)
+
+    def interact_reply_interval_text(self) -> str:
+        """评论巡检间隔的人话说明（例如「每 5 分钟一次（*/5 8-23 * * *）」）。"""
+        cron = str(self.reply_task.cron or "").strip()
+        if not cron:
+            return "未设置（不会自动巡检）"
+        fields = cron.split()
+        if len(fields) == 5:
+            minute, hour = fields[0], fields[1]
+            step = re.match(r"^\*/(\d+)$", minute)
+            if step:
+                return f"每 {int(step.group(1))} 分钟一次（{cron}）"
+            if minute.isdigit() and hour.isdigit():
+                return f"每天 {int(hour):02d}:{int(minute):02d}（{cron}）"
+        return f"按 {cron}"
 
     def next_chat_window_text(self) -> str:
         """下一个主动闲聊窗口的时刻文本。
@@ -1518,7 +1562,15 @@ class QzonePublisherPlugin(Star):
         task_lines.append(kv("下次巡检", self.interact_task.next_run_time))
         if not self.interact.targets:
             task_lines.append(kv("提醒", "还没配置 interact_uins，巡检不会做任何事"))
-        task_lines.append(kv("评论回复", self.interact.reply_mode_text()))
+        task_lines.append(
+            kv(
+                "评论回复",
+                f"{self.interact.reply_mode_text()}"
+                f"｜巡检 {self.reply_task.cron or '未设置'}"
+                f"｜窗口 {self.interact.reply_days} 天"
+                f"｜{'先确认' if bool(self.cfg.draft_for_reply) else '直接回复'}",
+            )
+        )
 
         # 区块 4：草稿确认
         draft_lines = [
@@ -1927,16 +1979,34 @@ class QzonePublisherPlugin(Star):
         if not flag:
             section = Section(icon=ICON_INFO, label="回复评论")
             section.add(
-                kv("当前状态", self.interact.reply_mode_text()),
-                kv("范围", f"{self.interact.window_days} 天内自己发的说说"),
+                kv("开关", "开启" if bool(self.cfg.interact_reply_enabled) else "关闭"),
+                kv("巡检间隔", self.interact_reply_interval_text()),
+                kv(
+                    "时间窗口",
+                    f"{self.interact.reply_days} 天内自己发的说说"
+                    "（旧说说下的新评论同样会被发现）",
+                ),
+                kv(
+                    "回复方式",
+                    "先转草稿等确认"
+                    if bool(self.cfg.draft_for_reply)
+                    else "巡检到即直接回复",
+                ),
                 kv(
                     "每轮上限",
-                    f"{self.interact.reply_limit} 条；每条说说每轮最多回 1 条",
+                    f"{self.interact.reply_limit} 条"
+                    "；同一条说说每轮最多回 1 条，多余的在下一轮继续",
+                ),
+                kv("今日已回", f"{self.interact.replied_today} 条"),
+                kv("下次巡检", self.reply_task.next_run_time),
+                kv(
+                    "说明",
+                    "QQ空间没有评论推送，评论只能靠定时轮询发现",
                 ),
                 kv(
                     "用法",
                     f"{quote_command('空间回复 on')}或"
-                    f"{quote_command('空间回复 off')}；立即跑一轮用"
+                    f"{quote_command('空间回复 off')}开关；立即跑一轮用"
                     f"{quote_command('空间回复 now')}",
                 ),
             )
@@ -1945,15 +2015,23 @@ class QzonePublisherPlugin(Star):
 
         if flag in _ON_FLAGS:
             self.cfg.set("interact_reply_enabled", True)
+            cron = self.reply_task.reconfigure(enabled=True)
             yield event.plain_result(
                 plain_receipt(
                     "回复评论已开启",
                     [
-                        kv("当前状态", self.interact.reply_mode_text()),
+                        kv("巡检间隔", self.interact_reply_interval_text()),
+                        kv("下次巡检", self.reply_task.next_run_time),
                         kv(
-                            "执行时间",
-                            "随「说说互动」的时间表"
-                            f"（{self.interact_task.cron or '未设置'}）",
+                            "回复方式",
+                            "先转草稿等确认"
+                            if bool(self.cfg.draft_for_reply)
+                            else "巡检到即直接回复",
+                        ),
+                        kv(
+                            "说明",
+                            "QQ空间没有评论推送，评论只能靠定时轮询发现"
+                            + ("" if cron else "；当前时间配置不可用，请检查巡检间隔"),
                         ),
                     ],
                     icon=ICON_OK,
@@ -1963,7 +2041,14 @@ class QzonePublisherPlugin(Star):
 
         if flag in _OFF_FLAGS:
             self.cfg.set("interact_reply_enabled", False)
-            yield event.plain_result(plain_receipt("回复评论已关闭", icon=ICON_WARN))
+            self.reply_task.reconfigure(enabled=False)
+            yield event.plain_result(
+                plain_receipt(
+                    "回复评论已关闭",
+                    [kv("说明", "评论巡检任务已停止，不再回复新评论")],
+                    icon=ICON_WARN,
+                )
+            )
             return
 
         if flag in _NOW_FLAGS:
