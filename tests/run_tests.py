@@ -1305,7 +1305,15 @@ async def main() -> int:
 
     async def handle_feeds(request):
         feeds_calls.append(dict(request.query))
-        return web.json_response({"code": 0, "msglist": feeds_payload})
+        # 列表接口同样会带上评论的子回复（list_3），因此这里也补上自己的回复，
+        # 以便验证「评论下已经有我的回复就跳过」这条保护。
+        msglist = []
+        for post in feeds_payload:
+            row = dict(post)
+            if row.get("commentlist"):
+                row["commentlist"] = _augment_comments(row["commentlist"])
+            msglist.append(row)
+        return web.json_response({"code": 0, "msglist": msglist})
 
     async def handle_like(request):
         form = await request.post()
@@ -1314,20 +1322,93 @@ async def main() -> int:
 
     async def handle_comment(request):
         form = await request.post()
-        comments.append({"form": dict(form), "query": dict(request.query)})
+        comments.append(
+            {
+                "form": dict(form),
+                "query": dict(request.query),
+                "headers": dict(request.headers),
+            }
+        )
         return web.json_response({"code": 0})
 
     async def handle_publish_fail(request):
         return web.json_response({"code": -10000, "message": "发太快了"})
 
+    # 假空间「真的收到了」的回复。真实接口成功时也只回 HTML 框架页，
+    # 因此回复成功与否只能靠回查详情确认；这里就用这份记录生成回查结果。
+    posted_replies: list[dict] = []
+
+    def _remember_reply(form: dict, query: dict, headers: dict) -> None:
+        entry = {"form": form, "query": query, "headers": headers}
+        replies.append(entry)
+        posted_replies.append(entry)
+
+    async def _accept_reply(request) -> None:
+        """记下这次回复：假空间确实收到了。"""
+        _remember_reply(
+            dict(await request.post()), dict(request.query), dict(request.headers)
+        )
+
+    def _own_replies_for(row_tid: str, subs: list[dict]) -> list[dict]:
+        """回查时补在评论下的「我的回复」。
+
+        被回复的对象可能是这条评论本身，也可能是它下面的某条子回复，
+        两种情况都要把「我的回复」挂进这条评论的 ``list_3``。
+        """
+        items = []
+        for entry in posted_replies:
+            target = str(entry["form"].get("commentId") or "")
+            if target != str(row_tid) and not any(
+                str(sub.get("tid")) == target for sub in subs
+            ):
+                continue
+            items.append(
+                {
+                    "uin": SELF_UIN,
+                    "name": "我自己",
+                    "tid": f"R{len(items) + 1}_{target}",
+                    "content": str(entry["form"].get("content") or ""),
+                    "createTime": now_ts,
+                    "parent_tid": target,
+                }
+            )
+        return items
+
+    def _augment_comments(items: object) -> list[dict]:
+        """把「我的回复」补进评论明细的 list_3（列表接口与详情接口都会带）。"""
+        rows = []
+        for item in items if isinstance(items, list) else []:
+            row = dict(item)
+            subs = list(row.get("list_3") or [])
+            own = _own_replies_for(str(row.get("tid") or ""), subs)
+            if own:
+                row["list_3"] = [*subs, *own]
+            rows.append(row)
+        return rows
+
+    def _detail_commentlist(tid: str) -> list[dict]:
+        """回查用的评论明细：按 tid 找该说说的评论，并补上自己已发出的回复。"""
+        if detail_comments:
+            source = detail_comments
+        else:
+            source = next(
+                (
+                    post.get("commentlist") or []
+                    for post in feeds_payload
+                    if str(post.get("tid")) == str(tid)
+                ),
+                [],
+            )
+        return _augment_comments(source)
+
     async def handle_reply(request):
-        form = await request.post()
-        replies.append({"form": dict(form), "query": dict(request.query)})
+        await _accept_reply(request)
         return web.json_response({"code": 0})
 
     async def handle_detail(request):
         details.append(dict(request.query))
-        return web.json_response({"code": 0, "commentlist": detail_comments})
+        tid = str(request.query.get("tid") or "")
+        return web.json_response({"code": 0, "commentlist": _detail_commentlist(tid)})
 
     async def handle_publish_ok(request):
         form = await request.post()
@@ -1376,26 +1457,40 @@ async def main() -> int:
         reply_calls[key] = reply_calls.get(key, 0) + 1
         return reply_calls[key]
 
+    # 实测：回复接口**成功时也是这段 HTML 框架页**，不是 JSON
+    FRAMEWORK_PAGE = (
+        "<html><head></head><body>"
+        '<script type="text/javascript"> var cb;'
+        'try{document.domain="h5.qzone.qq.com";cb=frameElement.callback;}'
+        "catch(e){}</script></body></html>"
+    )
+
     async def handle_reply_h5_page(request):
-        """模拟 h5 域的 JSONP 框架页：不是数据，也不该被当成登录失效。"""
+        """回复成功但只回 HTML 框架页（假空间确实收到了这条回复）。"""
         _bump("h5_page")
-        return web.Response(
-            text=(
-                "<html><head></head><body>"
-                '<script type="text/javascript"> var cb;'
-                'try{document.domain="h5.qzone.qq.com";cb=frameElement.callback;}'
-                "catch(e){}</script></body></html>"
-            ),
-            content_type="text/html",
-        )
+        await _accept_reply(request)
+        return web.Response(text=FRAMEWORK_PAGE, content_type="text/html")
+
+    async def handle_reply_void(request):
+        """回 HTML 框架页但假空间其实没收到：回查必然找不到，应判为失败。"""
+        _bump("void")
+        return web.Response(text=FRAMEWORK_PAGE, content_type="text/html")
 
     async def handle_reply_ptlogin(request):
-        """第一次返回登录页（登录特征），第二次返回正常数据。"""
+        """第一次返回登录页（ptlogin 特征），第二次正常并记下回复。"""
         if _bump("ptlogin") == 1:
             return web.Response(
                 text="<html><body>ptlogin2.qq.com 请先登录</body></html>",
                 content_type="text/html",
             )
+        await _accept_reply(request)
+        return web.json_response({"code": 0})
+
+    async def handle_reply_code_3000(request):
+        """第一次返回业务码 -3000（登录态失效），第二次正常并记下回复。"""
+        if _bump("code_3000") == 1:
+            return web.json_response({"code": -3000, "message": "登录态已失效"})
+        await _accept_reply(request)
         return web.json_response({"code": 0})
 
     async def handle_reply_forbidden(request):
@@ -1408,9 +1503,10 @@ async def main() -> int:
         )
 
     async def handle_reply_unauthorized(request):
-        """第一次 401，第二次正常。"""
+        """第一次 401，第二次正常并记下回复。"""
         if _bump("unauthorized") == 1:
             return web.Response(text="", status=401)
+        await _accept_reply(request)
         return web.json_response({"code": 0})
 
     app2 = web.Application()
@@ -1424,7 +1520,9 @@ async def main() -> int:
     app2.router.add_post("/publish_login_page_always", handle_publish_login_page_always)
     app2.router.add_post("/publish_garbage", handle_publish_garbage)
     app2.router.add_post("/reply_h5_page", handle_reply_h5_page)
+    app2.router.add_post("/reply_void", handle_reply_void)
     app2.router.add_post("/reply_ptlogin", handle_reply_ptlogin)
+    app2.router.add_post("/reply_code_3000", handle_reply_code_3000)
     app2.router.add_post("/reply_forbidden", handle_reply_forbidden)
     app2.router.add_post("/reply_unauthorized", handle_reply_unauthorized)
     app2.router.add_post("/reply", handle_reply)
@@ -3572,8 +3670,8 @@ async def main() -> int:
 
     res = await plugin.interact.run_replies_once()
     check(
-        "同一条评论第二轮不再回复",
-        res.replied == 0 and res.skipped == 1 and len(replies) == 1,
+        "同一条评论第二轮不再回复（评论与它下面我自己的回复都被跳过）",
+        res.replied == 0 and res.skipped == 2 and len(replies) == 1,
         res.summary(),
     )
     check(
@@ -3645,8 +3743,13 @@ async def main() -> int:
     res = await plugin.interact.run_replies_once()
     check(
         "列表没带评论明细时回退到详情接口",
-        len(details) == 1 and details[-1].get("tid") == "S7" and res.replied == 1,
+        len(details) == 2 and details[0].get("tid") == "S7" and res.replied == 1,
         f"{details} / {res.summary()}",
+    )
+    check(
+        "回复后会再回查一次详情确认（详情被请求两次）",
+        len(details) == 2 and all(item.get("tid") == "S7" for item in details),
+        str(details),
     )
     detail_comments.clear()
 
@@ -5197,18 +5300,44 @@ async def main() -> int:
     )
 
     for raw, label in (
-        ("<html><head><title>QQ登录</title></head></html>", "HTML 登录页"),
+        (
+            "<html><head><title>QQ登录</title></head><body>请先登录</body></html>",
+            "HTML 登录页",
+        ),
         ("ptlogin2.qq.com 请先登录", "ptlogin 提示"),
-        ("<!DOCTYPE html><body>安全验证</body>", "DOCTYPE 风控页"),
+        ("<html><body>登录态已失效，请重新登录</body></html>", "登录失效提示"),
     ):
         payload = _P.parse_response(raw)
         check(
-            f"{label} 判定为登录态 / 风控",
+            f"{label} 判定为登录态失效",
             payload.get("code") == _const_mod.QZONE_CODE_LOGIN_REQUIRED
             and "登录态可能已失效" in str(payload.get("message"))
             and "/空间重登" in str(payload.get("message")),
             str(payload),
         )
+
+    # 回复接口成功时回的就是这段框架页：既不能算成功，也绝不能算登录失效
+    framework_page = (
+        "<html><head></head><body>"
+        '<script type="text/javascript"> var cb;'
+        'try{document.domain="h5.qzone.qq.com";cb=frameElement.callback;}'
+        "catch(e){}</script></body></html>"
+    )
+    payload = _P.parse_response(framework_page)
+    check(
+        "h5 框架页判定为「返回页面」而不是登录失效",
+        payload.get("code") == _const_mod.QZONE_CODE_UNEXPECTED_PAGE
+        and _P.is_framework_page(framework_page)
+        and not _P.is_login_page(framework_page),
+        str(payload),
+    )
+    payload = _P.parse_response("<!DOCTYPE html><body>安全验证</body>")
+    check(
+        "验证 / 风控页单独分类，不触发重登",
+        payload.get("code") == _const_mod.QZONE_CODE_VERIFY_PAGE
+        and "验证" in str(payload.get("message")),
+        str(payload),
+    )
 
     payload = _P.parse_response("这不是数据，只是一段没有结构的返回")
     check(
@@ -6452,7 +6581,7 @@ async def main() -> int:
     )
 
     # ==================================================================
-    print("\n[41] 回复接口域名与失败分类")
+    print("\n[41] 回复以回查为准 + 子回复去重 + 失败分类")
 
     _const2 = _imp("core.qzone.constants")
 
@@ -6494,85 +6623,207 @@ async def main() -> int:
     _stub_logger = sys.modules["astrbot.api"].logger
     real_error = _stub_logger.error
     real_warning = _stub_logger.warning
+    real_info = _stub_logger.info
     error_lines: list[str] = []
     warning_lines: list[str] = []
+    info_lines: list[str] = []
     _stub_logger.error = lambda *args, **kwargs: error_lines.append(
         str(args[0]) if args else ""
     )
     _stub_logger.warning = lambda *args, **kwargs: warning_lines.append(
         str(args[0]) if args else ""
     )
+    _stub_logger.info = lambda *args, **kwargs: info_lines.append(
+        str(args[0]) if args else ""
+    )
     try:
-        # 1) h5 框架页：判定为「返回页面」，不重登、不重试
-        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_h5_page"
+        # 1) 回复成功时接口也只回 HTML 框架页：判定完全以「回查」为准
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        plugin.api.DETAIL_URL = f"{AI_BASE}/detail"
+        posted_replies.clear()
+        reply_calls.clear()
+        replies.clear()
+        invalidated["count"] = 0
+        error_lines.clear()
+        info_lines.clear()
+        plugin.interact._replied = []
+        feeds_payload[:] = [
+            my_post("S_R1", 1, [comment_item("C_R1", "框架页也成功的评论", uin=888888)])
+        ]
+        r1 = await plugin.interact.run_replies_once()
+        check(
+            "回复只回 HTML 框架页 + 回查能找到自己的回复 → 判定成功",
+            r1.replied == 1 and not r1.errors and reply_calls.get("h5_page") == 1,
+            f"{r1.summary()}/{reply_calls}",
+        )
+        check(
+            "确认成功后写入去重记录",
+            plugin.interact.replied("S_R1", "C_R1")
+            and (plugin.cfg.data_dir / "replied_comments.json").exists(),
+            str(plugin.interact._replied),
+        )
+        check(
+            "成功日志写明是回查确认的",
+            any(
+                "回复评论已确认" in item and "回查结果=" in item for item in info_lines
+            ),
+            str(info_lines)[-200:],
+        )
+
+        # 2) 去重记录已丢，但回查里能看到自己的回复 → 直接跳过、绝不再发一次
+        plugin.interact._replied = []
+        replies.clear()
+        info_lines.clear()
+        r2 = await plugin.interact.run_replies_once()
+        check(
+            "评论下已经有我的回复 → 跳过且不再发出请求",
+            r2.replied == 0 and not replies and r2.skipped >= 1,
+            f"{r2.summary()}/{replies}",
+        )
+        check(
+            "跳过时写日志说明已有自己的回复",
+            any("已经有我的回复" in item for item in info_lines),
+            str(info_lines)[-200:],
+        )
+
+        # 3) 框架页但回查找不到 → 失败，且不重取登录态、不重试
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_void"
+        plugin.interact._replied = []
+        replies.clear()
         reply_calls.clear()
         invalidated["count"] = 0
         error_lines.clear()
-        page_resp = await plugin.api.reply(123456, "TID_A", "CID_A", 10001, "测试回复")
+        feeds_payload[:] = [
+            my_post("S_R3", 1, [comment_item("C_R3", "回查找不到的评论", uin=888888)])
+        ]
+        r3 = await plugin.interact.run_replies_once()
         check(
-            "h5 框架页判为「返回页面」而不是登录失效",
-            (not page_resp.ok)
-            and page_resp.code == _const2.QZONE_CODE_UNEXPECTED_PAGE
-            and "页面" in str(page_resp.message),
-            f"{page_resp.code}/{page_resp.message}",
+            "框架页但回查找不到自己的回复 → 判定失败且只请求一次",
+            r3.replied == 0 and bool(r3.errors) and reply_calls.get("void") == 1,
+            f"{r3.summary()}/{reply_calls}",
         )
         check(
-            "页面响应不触发重新获取登录态",
+            "回查找不到时不重取登录态、不重试",
             invalidated["count"] == 0,
             str(invalidated["count"]),
         )
         check(
-            "页面响应只请求一次（不重试）",
-            reply_calls.get("h5_page") == 1,
-            str(reply_calls),
+            "失败原因写「无法确认」而不是登录失效",
+            any("无法确认" in item for item in r3.errors)
+            and all("登录态" not in item for item in r3.errors),
+            str(r3.errors)[:200],
         )
         check(
-            "回复失败日志含 URL、topicId、commentId、commentUin 与响应片段",
+            "未确认的回复不写入去重记录",
+            not plugin.interact.replied("S_R3", "C_R3"),
+            str(plugin.interact._replied),
+        )
+        check(
+            "失败日志含 URL、topicId、commentId、commentUin、响应片段与回查结果",
             any(
-                "reply_h5_page" in item
-                and "topicId=123456_TID_A__1" in item
-                and "commentId=CID_A" in item
-                and "commentUin=10001" in item
+                "reply_void" in item
+                and "topicId=123456_S_R3__1" in item
+                and "commentId=C_R3" in item
+                and "commentUin=888888" in item
                 and "frameElement" in item
+                and "回查结果=" in item
                 for item in error_lines
             ),
-            str(error_lines)[-240:],
+            str(error_lines)[-260:],
         )
 
-        # 2) 登录页：仍走「自动重登 + 重试一次」
-        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_ptlogin"
-        reply_calls.clear()
-        invalidated["count"] = 0
-        login_resp = await plugin.api.reply(123456, "TID_B", "CID_B", 10001, "测试回复")
+        # 4) 子回复：别人的子回复也是待回复对象，commentId 用它自己的 tid
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        posted_replies.clear()
+        replies.clear()
+        detail_comments.clear()
+        plugin.interact._replied = ["S_R4_C_R4"]
+        feeds_payload[:] = [
+            my_post(
+                "S_R4",
+                1,
+                [
+                    comment_item(
+                        "C_R4",
+                        "父评论",
+                        uin=888888,
+                        list_3=[
+                            comment_item(
+                                "C_R4_SUB", "别人的子回复", uin=777777, name="小刚"
+                            )
+                        ],
+                    )
+                ],
+            )
+        ]
+        r4 = await plugin.interact.run_replies_once()
         check(
-            "登录页仍判定为登录态失效并重登重试一次",
-            login_resp.ok
-            and reply_calls.get("ptlogin") == 2
-            and invalidated["count"] == 1,
-            f"{login_resp.ok}/{reply_calls}/{invalidated['count']}",
-        )
-
-        # 3) HTTP 401：同样自动重登重试一次
-        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_unauthorized"
-        reply_calls.clear()
-        invalidated["count"] = 0
-        unauth_resp = await plugin.api.reply(
-            123456, "TID_C", "CID_C", 10001, "测试回复"
+            "父评论已回过时，别人的子回复被当作新的待回复对象",
+            r4.replied == 1 and len(replies) == 1,
+            f"{r4.summary()}/{replies}",
         )
         check(
-            "HTTP 401 走自动重登并重试一次",
-            unauth_resp.ok
-            and reply_calls.get("unauthorized") == 2
-            and invalidated["count"] == 1,
-            f"{unauth_resp.ok}/{reply_calls}/{invalidated['count']}",
+            "回复子回复时 commentId 与 commentUin 用子回复自己的",
+            replies[-1]["form"].get("commentId") == "C_R4_SUB"
+            and replies[-1]["form"].get("commentUin") == "777777",
+            str(replies[-1]["form"])[:200],
         )
 
-        # 4) HTTP 403：单独文案，且不重登、不重试
-        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply_forbidden"
+        # 5) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
+        comments.clear()
+        replies.clear()
+        posted_replies.clear()
+        await plugin.api.comment(SELF_UIN, "S_HDR", "请求头对比用评论")
+        await plugin.api.reply(SELF_UIN, "S_HDR", "CID_HDR", 10001, "请求头对比用回复")
+        comment_headers = comments[-1]["headers"] if comments else {}
+        reply_headers = replies[-1]["headers"] if replies else {}
+
+        def _picked_headers(raw: dict) -> dict:
+            lowered = {str(key).lower(): str(value) for key, value in raw.items()}
+            return {
+                key: lowered.get(key, "")
+                for key in ("referer", "origin", "user-agent", "host")
+            }
+
+        check(
+            "回复请求头与评论请求头一致（未使用 h5 专用请求头）",
+            bool(comment_headers)
+            and _picked_headers(reply_headers) == _picked_headers(comment_headers)
+            and _picked_headers(reply_headers)["referer"].endswith(str(SELF_UIN)),
+            f"{_picked_headers(reply_headers)} / {_picked_headers(comment_headers)}",
+        )
+
+        # 6) 登录失效类（登录页 / -3000 / 401）仍自动重取登录态并重试一次
+        detail_comments[:] = [
+            comment_item("CID_LOGIN", "登录类重试的评论", uin=888888, name="小红")
+        ]
+        for key, url in (
+            ("ptlogin", f"{AI_BASE}/reply_ptlogin"),
+            ("code_3000", f"{AI_BASE}/reply_code_3000"),
+            ("unauthorized", f"{AI_BASE}/reply_unauthorized"),
+        ):
+            plugin.api.REPLY_URL = url
+            reply_calls.clear()
+            invalidated["count"] = 0
+            posted_replies.clear()
+            resp = await plugin.api.reply(
+                SELF_UIN, "S_LOGIN", "CID_LOGIN", 888888, "登录类重试的回复"
+            )
+            check(
+                f"{key}：自动重取登录态、重试一次并回查确认成功",
+                resp.ok and reply_calls.get(key) == 2 and invalidated["count"] == 1,
+                f"{resp.ok}/{reply_calls}/{invalidated['count']}",
+            )
+        detail_comments.clear()
+
+        # 7) HTTP 403：单独文案，且不重登、不重试
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_forbidden"
         reply_calls.clear()
         invalidated["count"] = 0
+        error_lines.clear()
         forbidden_resp = await plugin.api.reply(
-            123456, "TID_D", "CID_D", 10001, "测试回复"
+            SELF_UIN, "S_403", "CID_403", 10001, "测试回复"
         )
         check(
             "HTTP 403 给出单独文案",
@@ -6586,11 +6837,25 @@ async def main() -> int:
             reply_calls.get("forbidden") == 1 and invalidated["count"] == 0,
             f"{reply_calls}/{invalidated['count']}",
         )
+        check(
+            "403 的失败日志同样带全排查字段",
+            any(
+                "reply_forbidden" in item
+                and "topicId=123456_S_403__1" in item
+                and "commentId=CID_403" in item
+                and "回查结果=" in item
+                for item in error_lines
+            ),
+            str(error_lines)[-240:],
+        )
     finally:
         _stub_logger.error = real_error
         _stub_logger.warning = real_warning
+        _stub_logger.info = real_info
         plugin.session.invalidate = real_invalidate
-        plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply"
+        plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
+        posted_replies.clear()
 
     # 5) 评论 id 校验
     check(
@@ -6599,43 +6864,52 @@ async def main() -> int:
         plugin.interact.comment_id_problem("S1", ""),
     )
     check(
-        "极短纯数字评论 id 被挡下",
-        plugin.interact.comment_id_problem("S1", "1") != ""
-        and plugin.interact.comment_id_problem("S1", "23") != "",
-        plugin.interact.comment_id_problem("S1", "1"),
-    )
-    check(
         "与说说 id 相同的评论 id 被挡下",
         "说说 id 相同" in plugin.interact.comment_id_problem("S1", "S1"),
         plugin.interact.comment_id_problem("S1", "S1"),
     )
     check(
-        "正常评论 id 通过校验",
-        plugin.interact.comment_id_problem("S1", "C1") == ""
-        and plugin.interact.comment_id_problem("S1", "8f0a1b2c3d") == ""
-        and plugin.interact.comment_id_problem("S1", "123456789") == "",
+        "短数字评论 id 放行（空间给的真实评论 id 就是小整数）",
+        plugin.interact.comment_id_problem("S1", "1") == ""
+        and plugin.interact.comment_id_problem("S1", "23") == ""
+        and plugin.interact.comment_id_problem("S1", "C1") == ""
+        and plugin.interact.comment_id_problem("S1", "8f0a1b2c3d") == "",
         "正常 id",
     )
 
     plugin.interact._replied = []
     replies.clear()
-    feeds_payload[:] = [my_post("S_BAD", 1, [comment_item("1", "可疑 id 的评论")])]
+    feeds_payload[:] = [my_post("S_BAD", 1, [comment_item("1", "短数字 id 的评论")])]
+    bad_res = await plugin.interact.run_replies_once()
+    check(
+        "短数字 id 的评论会被正常回复（不再被当成可疑 id 跳过）",
+        bad_res.replied == 1
+        and len(replies) == 1
+        and replies[-1]["form"].get("commentId") == "1",
+        f"{bad_res.summary()}/{replies}",
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post("S_SAME", 1, [comment_item("S_SAME", "id 与说说相同的评论")])
+    ]
     warning_lines.clear()
     _stub_logger.warning = lambda *args, **kwargs: warning_lines.append(
         str(args[0]) if args else ""
     )
     try:
-        bad_res = await plugin.interact.run_replies_once()
+        same_res = await plugin.interact.run_replies_once()
     finally:
         _stub_logger.warning = real_warning
     check(
-        "可疑评论 id 被跳过且不发出请求",
-        bad_res.replied == 0 and bad_res.skipped == 1 and not replies,
-        f"{bad_res.summary()}/{replies}",
+        "与说说 id 相同的评论被跳过且不发出请求",
+        same_res.replied == 0 and same_res.skipped == 1 and not replies,
+        f"{same_res.summary()}/{replies}",
     )
     check(
-        "跳过可疑 id 时写明原因",
-        any("疑似不是真实评论 id" in item for item in warning_lines),
+        "跳过时写明原因",
+        any("疑似解析错位" in item for item in warning_lines),
         str(warning_lines)[-200:],
     )
 

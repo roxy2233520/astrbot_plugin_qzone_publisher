@@ -14,9 +14,14 @@ from astrbot.api import logger
 
 from .client import QzoneHttpClient
 from .constants import (
+    QZONE_CODE_FORBIDDEN,
     QZONE_CODE_IMAGE_EXPIRED,
+    QZONE_CODE_REPLY_UNCONFIRMED,
+    QZONE_CODE_UNEXPECTED_PAGE,
     QZONE_CODE_UNKNOWN,
     QZONE_INTERNAL_META_KEY,
+    QZONE_MSG_FORBIDDEN,
+    QZONE_MSG_REPLY_UNCONFIRMED,
 )
 from .model import USER_AGENT, ApiResponse
 from .parser import QzoneParser
@@ -47,9 +52,10 @@ class QzoneAPI(QzoneHttpClient):
         "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
         "/cgi-bin/emotion_cgi_re_feeds"
     )
-    # 回复评论用与评论相同的 user 域 CGI（只多了 commentId / commentUin）。
-    # 曾用 h5.qzone.qq.com：那里返回的是 h5 的 JS 框架页而不是数据，会被误判成登录失效
-    # 并触发无用的重登重试，因此固定走 user 域这条已验证可用的路径。
+    # 回复评论用与评论完全相同的 user 域 CGI（只多了 commentId / commentUin）。
+    # 实测：这个接口**成功时回的是 HTML 框架页而不是 JSON**，所以回复是否成功
+    # 一律以「回查评论详情能否找到自己的回复」为准，不看这个响应体。
+    # 请求头也与 comment() 完全一致（不传 h5 专用请求头，传了反而更容易拿到短框架页）。
     REPLY_URL = (
         "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
         "/cgi-bin/emotion_cgi_re_feeds"
@@ -314,7 +320,18 @@ class QzoneAPI(QzoneHttpClient):
         comment_uin: int | str,
         content: str,
     ) -> ApiResponse:
-        """回复自己说说下的一条评论。
+        """回复自己说说下的一条评论，并以回查评论详情确认是否真的发出去了。
+
+        实测结论：这个接口**成功时也不返回 JSON，而是一段 HTML 框架页**
+        （``document.domain="…"; cb=frameElement.callback;``），因此响应体既不能
+        用来判定成功，也不能用来判定登录失效。这里改为「发出请求 + 回查确认」：
+
+        1. POST 回复接口（请求头与 ``comment()`` 完全一致，不传 h5 专用头）；
+        2. 回查 ``emotion_cgi_msgdetail_v6``（``need_comment=1``、
+           ``need_private_comment=1``），在被回复评论的子回复（``list_3``）里
+           查找 ``uin`` 是自己、正文等于本次回复的那一条；
+        3. 找到即判定成功，调用方据此写去重记录；找不到即判定失败，
+           但**不会**因为「响应是 HTML」就判定为登录失效，也不会重取登录态。
 
         Args:
             uin: 说说作者（自己）的 QQ 号。
@@ -324,7 +341,7 @@ class QzoneAPI(QzoneHttpClient):
             content: 回复正文。
 
         Returns:
-            统一响应对象。
+            统一响应对象；成功表示「已回查确认自己的回复确实在评论下」。
         """
         ctx = await self.session.get_ctx()
         topic_id = f"{uin}_{tid}__1"
@@ -355,18 +372,99 @@ class QzoneAPI(QzoneHttpClient):
             },
         )
         resp = ApiResponse.from_raw(raw)
-        if not resp.ok:
-            # 评论 id 属于公开数据：把实际请求参数与响应片段写进日志，便于下次一眼判断
-            meta = raw.get(QZONE_INTERNAL_META_KEY)
-            snippet = ""
-            if isinstance(meta, dict):
-                snippet = str(meta.get("snippet") or "")
-            logger.error(
-                f"回复评论失败: url={self.REPLY_URL}｜topicId={topic_id}"
+        meta = raw.get(QZONE_INTERNAL_META_KEY)
+        snippet = str(meta.get("snippet") or "") if isinstance(meta, dict) else ""
+        post_note = self._reply_post_note(resp)
+
+        found, confirm_note = await self._confirm_reply(
+            ctx.uin, tid, comment_tid, content
+        )
+        if found:
+            logger.info(
+                f"回复评论已确认: url={self.REPLY_URL}｜topicId={topic_id}"
                 f"｜commentId={comment_tid}｜commentUin={comment_uin}"
-                f"｜原因={resp.message or resp.code}｜响应片段: {snippet}"
+                f"｜接口={post_note}｜回查结果={confirm_note}"
             )
-        return resp
+            return ApiResponse(
+                ok=True,
+                code=0,
+                message=None,
+                data={"confirmed": True, "detail": confirm_note},
+                raw=raw,
+            )
+
+        # HTTP 403 有单独文案；其余情况（含「回的是 HTML 页面」）都按「回查没确认」回报
+        denied = resp.code == QZONE_CODE_FORBIDDEN
+        logger.error(
+            f"回复评论失败: url={self.REPLY_URL}｜topicId={topic_id}"
+            f"｜commentId={comment_tid}｜commentUin={comment_uin}"
+            f"｜原因={post_note}｜回查结果={confirm_note}｜响应片段: {snippet}"
+        )
+        return ApiResponse(
+            ok=False,
+            code=QZONE_CODE_FORBIDDEN if denied else QZONE_CODE_REPLY_UNCONFIRMED,
+            message=QZONE_MSG_FORBIDDEN if denied else QZONE_MSG_REPLY_UNCONFIRMED,
+            data={},
+            raw=raw,
+        )
+
+    @staticmethod
+    def _reply_post_note(resp: ApiResponse) -> str:
+        """把回复 POST 的返回归纳成一句给日志用的话。
+
+        页面响应（``-3002``）既不算成功也不算失败：实测成功时也是页面。
+
+        Args:
+            resp: 回复接口的统一响应对象。
+
+        Returns:
+            日志用的短说明。
+        """
+        if resp.ok:
+            return "接口返回成功"
+        if resp.code == QZONE_CODE_UNEXPECTED_PAGE:
+            return "接口返回页面（按回查结果判定）"
+        if resp.code == QZONE_CODE_FORBIDDEN:
+            return QZONE_MSG_FORBIDDEN
+        return str(resp.message or resp.code)
+
+    async def _confirm_reply(
+        self, own_uin: int, tid: str, comment_tid: str, content: str
+    ) -> tuple[bool, str]:
+        """回查说说详情，确认自己的回复是否真的出现在该评论下。
+
+        Args:
+            own_uin: 自己的 QQ 号。
+            tid: 说说 ID。
+            comment_tid: 被回复评论的 ID。
+            content: 本次发出的回复正文。
+
+        Returns:
+            二元组 (是否确认成功, 给日志看的一句说明)。
+        """
+        try:
+            resp = await self.get_detail(tid)
+        except Exception as e:
+            return False, f"回查异常（{e}）"
+        if not resp.ok:
+            return False, f"回查失败（{resp.message or resp.code}）"
+
+        comments = QzoneParser.parse_comments(resp.data)
+        matched = QzoneParser.find_own_reply(comments, comment_tid, own_uin, content)
+        if matched is not None:
+            return (
+                True,
+                f"在该评论的子回复里找到本次回复（tid={matched.tid or '未知'}）",
+            )
+        target = next(
+            (item for item in comments if str(item.tid) == str(comment_tid)), None
+        )
+        if target is not None:
+            return (
+                False,
+                f"该评论下没有找到本次回复（已取到 {len(target.replies)} 条子回复）",
+            )
+        return False, f"没有找到该评论（本次取到 {len(comments)} 条评论）"
 
     async def get_detail(self, tid: str) -> ApiResponse:
         """取一条说说的详情，用于拿列表接口没带全的评论明细。

@@ -9,9 +9,15 @@
 免得去评论几天前的老说说。
 
 **回复自己说说下的评论**（``interact_reply_enabled``，默认关闭）：
-只处理自己 ``interact_days`` 天内发布的说说，别人的评论才回复；
+只处理自己 ``interact_reply_days`` 天内发布的说说，别人的评论才回复；
+评论与它下面的子回复（接口的 ``list_3``）都会被视为待回复对象，
+回复子回复时 ``commentId`` 用子回复自己的 tid；
 同一条评论只回复一次，每轮最多 ``interact_reply_max_per_run`` 条，
 且同一条说说每轮最多回一条；回复一律直接发出，不经过草稿确认。
+
+**回复是否成功以回查为准**：回复接口实测「成功时也返回 HTML 框架页」，
+因此发出请求后会回查说说详情，只有在该评论的子回复里找到自己的回复才算成功；
+评论下已经有自己的回复时直接跳过，避免重复叠加。
 
 去重依据分别是 ``uin_tid``（好友互动）与 ``说说tid_评论tid``（回复），
 存在 ``<插件数据目录>/interacted_tids.json`` 与 ``replied_comments.json``。
@@ -79,10 +85,10 @@ class ReplyResult:
     """一次「回复自己说说下评论」巡检的汇总。
 
     Attributes:
-        checked: 检查过的评论条数。
-        replied: 已回复条数。
-        drafted: 转入草稿箱的条数。
-        skipped: 跳过条数（自己的评论 / 空内容 / 已回复过 / 已占用草稿）。
+        checked: 检查过的评论条数（含子回复）。
+        replied: 已回复条数（均经回查确认）。
+        drafted: 转入草稿箱的条数（回复不走草稿，恒为 0）。
+        skipped: 跳过条数（自己的评论 / 空内容 / 已回复过 / 已有自己的回复）。
         errors: 出错信息。
     """
 
@@ -413,10 +419,11 @@ class InteractService:
 
     @staticmethod
     def comment_id_problem(post_tid: str, comment_tid: str) -> str:
-        """检查评论 id 是否像是真实 id。
+        """检查评论 id 是否可用。
 
-        日志里出现过 ``/1``、``/2`` 这种极短 id，多半是把序号或索引当成了评论 id；
-        拿可疑 id 去请求只会拿到错误响应，因此先在这里挡下来。
+        实测：空间给评论的 id 就是小整数（例如 ``1``），**不是**长数字，
+        因此只挡真正不可用的两种：完全没有 id，以及与说说 id 相同
+        （后者说明解析错位，拿它去请求只会拿到错误响应）。
 
         Args:
             post_tid: 所在说说的 tid。
@@ -429,10 +436,54 @@ class InteractService:
         if not value:
             return "评论缺少 id，已跳过"
         if value == str(post_tid or "").strip():
-            return f"评论 id（{value}）与说说 id 相同，疑似把序号当成评论 id，已跳过"
-        if value.isdigit() and len(value) < 6:
-            return f"评论 id（{value}）是过短的纯数字，疑似不是真实评论 id，已跳过"
+            return f"评论 id（{value}）与说说 id 相同，疑似解析错位，已跳过"
         return ""
+
+    @staticmethod
+    def reply_candidates(comment: FeedComment) -> list[FeedComment]:
+        """一条评论下所有可回复的对象：评论本身，以及它下面的子回复。
+
+        子回复来自接口的 ``list_3``；别人的子回复同样是新的待回复对象，
+        回复它时 ``commentId`` 用该子回复自己的 tid。
+
+        Args:
+            comment: 顶层评论。
+
+        Returns:
+            候选列表，父评论在前、子回复按接口顺序在后。
+        """
+        return [comment, *comment.replies]
+
+    @staticmethod
+    def has_own_reply(
+        thread: FeedComment, candidate: FeedComment, self_uin: int
+    ) -> bool:
+        """该评论（或它的子回复）下面是否已经有我发出的回复。
+
+        只要这条评论的 ``list_3`` 里出现我自己的回复，就认为这条线程已经处理过：
+        评论本身不再回复，它下面别人的子回复也一并跳过——宁可少回一次，
+        也不要在已有重复回复的基础上继续叠加。``parent_tid`` 指向别的子回复时
+        不算（那是另一条分支）。
+
+        Args:
+            thread: 顶层评论。
+            candidate: 本次准备回复的对象。
+            self_uin: 自己的 QQ 号。
+
+        Returns:
+            已经有我的回复时返回 True。
+        """
+        if not self_uin:
+            return False
+        for sub in thread.replies:
+            if sub.uin != self_uin:
+                continue
+            parent = str(sub.parent_tid).strip()
+            # 子回复多半不带 parent_tid，解析时会填成父评论的 tid；
+            # 两种都算「这条线程已经有我的回复」。
+            if not parent or parent in (candidate.tid, thread.tid):
+                return True
+        return False
 
     @staticmethod
     def _reply_key(post_tid: str, comment_tid: str) -> str:
@@ -542,7 +593,10 @@ class InteractService:
         """给状态与指令用的回复模式描述。"""
         if not bool(self.cfg.interact_reply_enabled):
             return "关闭"
-        return f"开启（每轮最多 {self.reply_limit} 条，巡检到即直接回复，已回复 {self.replied_count} 条）"
+        return (
+            f"开启（每轮最多 {self.reply_limit} 条，巡检到即直接回复并回查确认，"
+            f"已回复 {self.replied_count} 条）"
+        )
 
     async def run_replies_once(self, *, force: bool = False) -> ReplyResult:
         """巡检一轮：回复自己说说下别人留下的新评论。
@@ -550,13 +604,17 @@ class InteractService:
         只处理 ``interact_reply_days`` 天内自己发布的说说（默认 7 天，比好友互动的
         窗口更长，避免旧说说下的新评论永远发现不了）；每轮最多回复
         ``interact_reply_max_per_run`` 条，且同一条说说每轮最多回一条；
-        自己的评论、空内容评论与已回复过的评论都会被跳过。
+        自己的评论、空内容评论、已回复过的评论，以及**评论下已经有自己回复**的，
+        都会被跳过；评论下的子回复同样会被当作待回复对象。
+
+        回复是否成功以「回查评论详情能否找到自己的回复」为准，
+        因此回执里的「回复 N 条」都是确认过的条数。
 
         无论本轮有没有新评论，都会写一行 info 日志（第几轮 / 检查 / 回复 / 跳过），
         方便确认定时任务确实在跑。
 
         Args:
-            force: 为 True 时忽略「已有待确认回复草稿」的占用检查。
+            force: 保留参数以兼容旧调用；回复早已不走草稿，当前它不再改变行为。
 
         Returns:
             本次巡检汇总。
@@ -609,34 +667,9 @@ class InteractService:
                 break
 
             comments = await self._comments_of(post, result)
-            for comment in comments:
-                if result.replied >= limit:
-                    break
-
-                result.checked += 1
-                if comment.uin == self_uin:
-                    result.skipped += 1
-                    continue
-                if not comment.content.strip():
-                    result.skipped += 1
-                    continue
-                # 评论 id 可疑时先挡下来：拿错 id 去请求只会浪费一次请求并拿到错误响应
-                problem = self.comment_id_problem(post.tid, comment.tid)
-                if problem:
-                    result.skipped += 1
-                    reason = problem
-                    logger.warning(f"[reply] {post.tid} 下的{problem}")
-                    continue
-                if self.replied(post.tid, comment.tid):
-                    result.skipped += 1
-                    continue
-
-                try:
-                    await self._reply_to_comment(post, comment, result)
-                except Exception as e:
-                    result.errors.append(f"{post.tid}/{comment.tid}: {e}")
-                # 同一条说说每轮最多回一条
-                break
+            note = await self._reply_in_post(post, comments, self_uin, result, limit)
+            if note:
+                reason = note
 
         if result.replied >= limit:
             reason = (
@@ -647,6 +680,64 @@ class InteractService:
         self.save_replied()
         self._log_round(result, reason=reason)
         return result
+
+    async def _reply_in_post(
+        self,
+        post: FeedPost,
+        comments: list[FeedComment],
+        self_uin: int,
+        result: ReplyResult,
+        limit: int,
+    ) -> str:
+        """处理一条说说下的评论与子回复，最多回复一条。
+
+        Args:
+            post: 目标说说。
+            comments: 该说说下的顶层评论。
+            self_uin: 自己的 QQ 号。
+            result: 本轮汇总。
+            limit: 每轮最多回复几条。
+
+        Returns:
+            给本轮日志用的说明；没有值得说明的事情时返回空串。
+        """
+        note = ""
+        for thread in comments:
+            for candidate in self.reply_candidates(thread):
+                if result.replied >= limit:
+                    return note
+
+                result.checked += 1
+                if candidate.uin == self_uin:
+                    result.skipped += 1
+                    continue
+                if not candidate.content.strip():
+                    result.skipped += 1
+                    continue
+                # 评论 id 不可用时先挡下来：拿错 id 去请求只会白打一次请求
+                problem = self.comment_id_problem(post.tid, candidate.tid)
+                if problem:
+                    result.skipped += 1
+                    note = problem
+                    logger.warning(f"[reply] {post.tid} 下的{problem}")
+                    continue
+                if self.replied(post.tid, candidate.tid):
+                    result.skipped += 1
+                    continue
+                # 这条评论下已经有我的回复：跳过，避免继续叠加重复回复
+                if self.has_own_reply(thread, candidate, self_uin):
+                    result.skipped += 1
+                    note = f"{post.tid} 下评论 {candidate.tid} 已经有我的回复，本轮跳过"
+                    logger.info(f"[reply] {note}")
+                    continue
+
+                try:
+                    await self._reply_to_comment(post, candidate, result)
+                except Exception as e:
+                    result.errors.append(f"{post.tid}/{candidate.tid}: {e}")
+                # 同一条说说每轮最多回一条
+                return f"{post.tid} 下已回复一条（同一条说说每轮最多回一条）"
+        return note
 
     def _log_round(self, result: ReplyResult, *, reason: str = "") -> None:
         """写一行本轮巡检日志（无论有没有新评论都写）。
@@ -698,11 +789,14 @@ class InteractService:
     async def _reply_to_comment(
         self, post: FeedPost, comment: FeedComment, result: ReplyResult
     ) -> None:
-        """生成一条回复，并按配置直接发出或转入草稿。
+        """生成一条回复并直接发出。
+
+        ``api.reply()`` 成功即代表**已回查确认**自己的回复出现在该评论下，
+        因此只有这时才写去重记录与今日计数。
 
         Args:
             post: 评论所在的说说。
-            comment: 被回复的评论。
+            comment: 被回复的评论（也可能是别人写的子回复）。
             result: 本轮汇总，用于累计结果与错误。
         """
         content = await self._generate_reply(post, comment)
@@ -720,7 +814,9 @@ class InteractService:
         result.replied += 1
         self.mark_replied(post.tid, comment.tid)
         self.count_reply()
-        logger.info(f"已回复 {comment.display_name()} 在 {post.tid} 下的评论")
+        logger.info(
+            f"已回复 {comment.display_name()} 在 {post.tid} 下的评论（回查已确认）"
+        )
 
     async def _generate_reply(self, post: FeedPost, comment: FeedComment) -> str:
         """用 AI 生成一条评论回复。

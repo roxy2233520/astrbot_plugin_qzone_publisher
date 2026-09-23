@@ -2,8 +2,12 @@
 
 QQ空间的接口返回并非常规 JSON：可能是 JSONP 包裹、包含 undefined 字面量、
 单引号字符串或无引号键，失败时还可能直接回一整页 HTML（登录页 / 风控页）。
-因此这里按「逐级放宽」的顺序尝试解析，并在彻底失败时把响应片段写进日志，
-同时区分「登录态失效 / 被风控」与「格式无法识别」两种原因，便于回执给出可操作的建议。
+**回复接口成功时回的也是 HTML 框架页（不是 JSON）**，因此回复是否成功不能看
+响应体，只能靠回查评论详情确认；这里提供的 ``find_own_reply`` 就是做这件事的。
+
+解析按「逐级放宽」的顺序尝试，并在彻底失败时把响应片段写进日志，
+同时区分「登录态失效 / 被风控」「验证页面」「返回的是页面」与「格式无法识别」，
+便于回执给出可操作的建议。
 """
 
 import json
@@ -16,11 +20,13 @@ from .constants import (
     QZONE_CODE_LOGIN_REQUIRED,
     QZONE_CODE_UNEXPECTED_PAGE,
     QZONE_CODE_UNKNOWN,
+    QZONE_CODE_VERIFY_PAGE,
     QZONE_MSG_EMPTY_RESPONSE,
     QZONE_MSG_LOGIN_REQUIRED,
     QZONE_MSG_NON_OBJECT_RESPONSE,
     QZONE_MSG_UNEXPECTED_PAGE,
     QZONE_MSG_UNKNOWN_FORMAT,
+    QZONE_MSG_VERIFY_PAGE,
 )
 from .model import FeedComment, FeedPost
 
@@ -30,16 +36,26 @@ _JSONP_PATTERN = re.compile(r"^[^(){]{0,64}\(\s*(\{.*\})\s*\)\s*;?\s*$", re.DOTA
 _UNQUOTED_KEY_PATTERN = re.compile(r"([{,]\s*)([A-Za-z_$][\w$]*)(\s*:)")
 # 尾逗号：,] 或 ,}
 _TRAILING_COMMA_PATTERN = re.compile(r",(\s*[}\]])")
-# 判定「登录态真的失效了」的特征：只有命中这些才值得重新获取 Cookie 并重试
+# 判定「登录态真的失效了」的特征。实测表明：回复接口成功时回的是 HTML 框架页，
+# 所以这里只认登录页本身的特征（ptlogin、请先登录…），不再用「登录」「login」这类
+# 过于宽泛的字符串，避免把框架页 / 普通页面误判成登录失效而触发无用的重登重试。
 _LOGIN_PAGE_HINTS = (
     "ptlogin",
     "请先登录",
     "请登录",
-    "登录",
-    "验证",
-    "安全",
+    "重新登录",
+    "登录态已失效",
+    "登录已失效",
+)
+# 验证 / 风控页面：也不是登录失效，重取登录态帮不上忙，单独分类
+_VERIFY_PAGE_HINTS = (
+    "安全验证",
+    "验证码",
+    "身份验证",
     "风控",
-    "login",
+    "操作过于频繁",
+    "操作频繁",
+    "异常访问",
 )
 # 判定「返回的是页面而不是数据」的特征：JSONP / h5 框架页。
 # 这些特征不会出现在登录页上，因此优先按「页面」处理，不触发重登。
@@ -58,6 +74,10 @@ _PAGE_HINTS = (
     "forbidden",
     "blocked",
 )
+# 比对回复正文前去掉空白与标点：接口回显时可能多出空格或标点
+_PUNCT_PATTERN = re.compile(r"[\s\W_]+")
+# 前缀匹配允许的最短长度：太短容易把两条不同的回复当成同一条
+_MIN_PREFIX = 4
 
 
 class QzoneParser:
@@ -223,6 +243,21 @@ class QzoneParser:
         lowered = str(text or "").lower()
         return any(hint in lowered for hint in _PAGE_HINTS)
 
+    @staticmethod
+    def is_verify_page(text: str) -> bool:
+        """判断响应是否像验证 / 风控页面。
+
+        这类页面同样不是登录失效：重取登录态解决不了，只会多打一次请求。
+
+        Args:
+            text: 原始响应文本。
+
+        Returns:
+            命中验证 / 风控特征时返回 True。
+        """
+        lowered = str(text or "").lower()
+        return any(hint in lowered for hint in _VERIFY_PAGE_HINTS)
+
     @classmethod
     def parse_response(cls, text: str) -> dict[str, Any]:
         """把原始响应文本解析为字典。
@@ -281,11 +316,13 @@ class QzoneParser:
         判定顺序（顺序很重要）：
 
         1. 命中 JSONP / h5 框架页特征（``frameElement.callback``、``document.domain``…）→
-           判定为「返回的是页面而不是数据」，**不**触发重登；
-        2. 命中明确登录特征（``ptlogin`` / 请先登录…）→ 判定为登录态失效，
+           判定为「返回的是页面而不是数据」，**不**触发重登。
+           注意：回复接口成功时回的也是这种框架页，因此这一条绝不能升级成登录失效；
+        2. 命中登录页特征（``ptlogin`` / 请先登录…）→ 判定为登录态失效，
            传输层会重新获取 Cookie 并重试一次；
-        3. 其它 HTML 页面 → 同样按「返回的是页面」处理；
-        4. 都不是 → 报「响应格式无法识别」。
+        3. 命中验证 / 风控页特征 → 单独分类，同样不重登；
+        4. 其它 HTML 页面 → 同样按「返回的是页面」处理；
+        5. 都不是 → 报「响应格式无法识别」。
 
         Args:
             raw: 原始响应文本。
@@ -311,6 +348,14 @@ class QzoneParser:
             return cls._error_payload(
                 QZONE_MSG_LOGIN_REQUIRED, code=QZONE_CODE_LOGIN_REQUIRED
             )
+        if cls.is_verify_page(raw):
+            logger.error(
+                "QQ空间返回的像是验证 / 风控页面（不是数据，未重新获取登录态），"
+                f"响应片段: {snippet}｜建议稍后重试或降低请求频率"
+            )
+            return cls._error_payload(
+                QZONE_MSG_VERIFY_PAGE, code=QZONE_CODE_VERIFY_PAGE
+            )
         if cls.is_page_response(raw):
             logger.error(
                 "QQ空间接口返回的是页面而不是数据（未重新获取登录态），响应片段: "
@@ -322,6 +367,73 @@ class QzoneParser:
         reason = "缺少 JSON 片段" if missing_fragment else "JSON 解析失败"
         logger.error(f"QQ空间响应{reason}，格式无法识别，响应片段: {snippet}")
         return cls._error_payload(QZONE_MSG_UNKNOWN_FORMAT)
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """去掉空白与标点后的正文，用于比对「这条回复是不是我发的」。
+
+        Args:
+            text: 原始正文。
+
+        Returns:
+            只保留字母、数字与汉字的文本（统一小写）。
+        """
+        return _PUNCT_PATTERN.sub("", str(text or "")).lower()
+
+    @classmethod
+    def reply_text_matches(cls, found: str, sent: str) -> bool:
+        """判断回查到的回复正文是否就是本次发出的那条。
+
+        先用去标点后完全相等判断；接口偶尔会截断正文，因此再放宽为前缀匹配
+        （较短一方至少 ``_MIN_PREFIX`` 个字符，避免过短误判）。
+
+        Args:
+            found: 回查到的正文。
+            sent: 本次发出的正文。
+
+        Returns:
+            认为是同一条时返回 True。
+        """
+        left = cls.normalize_text(found)
+        right = cls.normalize_text(sent)
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+        return len(shorter) >= _MIN_PREFIX and longer.startswith(shorter)
+
+    @classmethod
+    def find_own_reply(
+        cls,
+        comments: list[FeedComment],
+        comment_tid: str,
+        own_uin: int,
+        content: str,
+    ) -> FeedComment | None:
+        """在评论明细里查找「我自己刚发出的那条回复」。
+
+        优先在目标评论的 ``list_3``（子回复）里找；如果评论 id 没能对上
+        （列表接口与详情接口的评论 id 偶尔不同源），再退化为在所有评论的子回复里找。
+
+        Args:
+            comments: 回查拿到的评论明细。
+            comment_tid: 被回复评论的 id。
+            own_uin: 自己的 QQ 号。
+            content: 本次发出的回复正文。
+
+        Returns:
+            命中的子回复；没找到时返回 None。
+        """
+        target = next(
+            (item for item in comments if str(item.tid) == str(comment_tid)), None
+        )
+        scope = [target] if target is not None else comments
+        for comment in scope:
+            for sub in comment.replies:
+                if sub.uin == own_uin and cls.reply_text_matches(sub.content, content):
+                    return sub
+        return None
 
     @staticmethod
     def parse_upload_result(payload: dict[str, Any]) -> tuple[str, str]:

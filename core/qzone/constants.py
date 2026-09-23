@@ -15,6 +15,11 @@ QZONE_CODE_LOGIN_REQUIRED = -3001
 QZONE_CODE_UNEXPECTED_PAGE = -3002
 # HTTP 403：请求被拒绝，常见原因是频率过高或参数不被接受，同样不盲目重登。
 QZONE_CODE_FORBIDDEN = -3003
+# 回复请求发出去了，但回查评论详情没找到自己的回复：无法确认是否成功，
+# 不能据此判定登录失效，也不能当成成功（否则会重复回复）。
+QZONE_CODE_REPLY_UNCONFIRMED = -3004
+# 验证 / 风控页面：同样不是登录失效，重取登录态没有意义，因此单独分类。
+QZONE_CODE_VERIFY_PAGE = -3005
 
 # HTTP 状态码别名
 HTTP_STATUS_UNAUTHORIZED = int(HTTPStatus.UNAUTHORIZED)
@@ -41,6 +46,15 @@ QZONE_MSG_UNEXPECTED_PAGE = (
 # HTTP 403：不盲目重登，提示稍后重试
 QZONE_MSG_FORBIDDEN = (
     "请求被拒绝（403）：可能是访问频率过高或接口参数不被接受，可稍后重试"
+)
+# 验证 / 风控页面：不是登录失效，重取登录态帮不上忙
+QZONE_MSG_VERIFY_PAGE = (
+    "接口返回的是验证 / 风控页面（未重取登录态），建议稍后重试或降低请求频率"
+)
+# 回复以「回查评论详情」为准：没查到自己的回复就无法确认，不能算成功
+QZONE_MSG_REPLY_UNCONFIRMED = (
+    "回复请求已发出，但回查评论详情没有找到自己的回复，暂时无法确认是否成功；"
+    "可稍后到空间里确认，或调大巡检间隔后重试"
 )
 # 既不是 JSON、也不像登录 / 风控页面：只说明格式无法识别（响应片段已进日志）
 QZONE_MSG_UNKNOWN_FORMAT = "响应格式无法识别（已记录响应片段，详见日志）"

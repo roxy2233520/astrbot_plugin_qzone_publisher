@@ -158,6 +158,7 @@ class FeedComment:
         content: 评论正文（已剥离表情标记）。
         create_time: 评论时间戳。
         parent_tid: 被回复的评论 ID（子评论时存在）。
+        replies: 该评论下的子回复（接口的 ``list_3``）。
     """
 
     uin: int
@@ -166,6 +167,7 @@ class FeedComment:
     content: str = ""
     create_time: int = 0
     parent_tid: str = ""
+    replies: list["FeedComment"] = field(default_factory=list)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "FeedComment":
@@ -175,16 +177,57 @@ class FeedComment:
             raw: commentlist 里的一项。
 
         Returns:
-            构造好的 FeedComment。
+            构造好的 FeedComment（含 ``list_3`` 里的子回复）。
         """
-        return cls(
+        tid = str(raw.get("tid") or raw.get("commentid") or "").strip()
+        comment = cls(
             uin=_as_int(raw.get("uin")),
-            tid=str(raw.get("tid") or raw.get("commentid") or "").strip(),
+            tid=tid,
             nickname=str(raw.get("name") or raw.get("nickname") or "").strip(),
             content=strip_em_tags(str(raw.get("content") or "")),
             create_time=_as_int(raw.get("create_time") or raw.get("createTime")),
             parent_tid=str(raw.get("parent_tid") or "").strip(),
         )
+        comment.replies = cls._parse_replies(raw.get("list_3"), parent_tid=tid)
+        return comment
+
+    @classmethod
+    def _parse_replies(
+        cls, items: object, *, parent_tid: str = ""
+    ) -> list["FeedComment"]:
+        """解析一条评论下的子回复（``list_3``）。
+
+        子回复缺 id 时同样保留：判断「这条评论下是否已经有我的回复」只需要
+        uin 与正文；真要回复它时再按评论 id 规则挡下。
+
+        Args:
+            items: 评论项里的 ``list_3``。
+            parent_tid: 父评论的 tid，写进子回复的 ``parent_tid``。
+
+        Returns:
+            子回复列表；结构不对时返回空列表。
+        """
+        if not isinstance(items, list):
+            return []
+        replies: list[FeedComment] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            replies.append(
+                cls(
+                    uin=_as_int(item.get("uin")),
+                    tid=str(item.get("tid") or item.get("commentid") or "").strip(),
+                    nickname=str(
+                        item.get("name") or item.get("nickname") or ""
+                    ).strip(),
+                    content=strip_em_tags(str(item.get("content") or "")),
+                    create_time=_as_int(
+                        item.get("create_time") or item.get("createTime")
+                    ),
+                    parent_tid=str(item.get("parent_tid") or "").strip() or parent_tid,
+                )
+            )
+        return replies
 
     @staticmethod
     def parse_many(items: object) -> "list[FeedComment]":
