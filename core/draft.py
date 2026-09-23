@@ -16,6 +16,8 @@ from pathlib import Path
 
 from astrbot.api import logger
 
+from .ui import ICON_INFO, Section, command_line, kv, pair
+
 
 @dataclass(slots=True)
 class Draft:
@@ -93,27 +95,50 @@ class Draft:
             return f"问候草稿（{len(self.targets)} 人）"
         return "说说草稿"
 
-    def describe(self) -> str:
-        """给管理员看的完整描述。"""
-        lines = [f"【待确认 {self.title()}】"]
+    def _lines(self) -> list[str]:
+        """草稿的键值行（纯文本版与 Markdown 版共用）。"""
+        lines = [kv("类型", self.title())]
         if self.source:
-            lines.append(f"来源: {self.source}")
+            lines.append(kv("来源", self.source))
         if self.images:
-            lines.append(f"图片: {self.images} 张")
+            lines.append(kv("图片", f"{self.images} 张"))
         if self.kind == "comment" and self.target_tid:
-            lines.append(f"目标说说: {self.target_tid}")
+            lines.append(kv("目标说说", self.target_tid))
         if self.kind == "reply":
             lines.append(
-                f"被回复的评论: {self.target_name or self.target_comment_uin}"
-                f"（{self.target_text or '（无正文）'}）"
+                kv(
+                    "被回复的评论",
+                    f"{self.target_name or self.target_comment_uin}"
+                    f"（{self.target_text or '无正文'}）",
+                )
             )
             if self.target_tid:
-                lines.append(f"所在说说: {self.target_tid}")
+                lines.append(kv("所在说说", self.target_tid))
         if self.kind == "greet" and self.targets:
-            lines.append(f"发送对象: {'、'.join(self.targets)}")
-        lines.append(f"内容:\n{self.text}")
-        lines.append("回复 /空间确认 发布，/空间放弃 丢弃，/空间重写 让 AI 再写一版")
-        return "\n".join(lines)
+            lines.append(kv("发送对象", "、".join(self.targets)))
+        return lines
+
+    def describe_pair(self) -> tuple[str, str]:
+        """给管理员看的完整描述：二元组 (纯文本版, Markdown 版)。
+
+        草稿内容需要逐字确认，因此这里不套用 12 行上限；纯文本版直接发到 QQ，
+        Markdown 版用于回执图（标签成为标题、键值名称为真加粗）。
+        """
+        section = Section(icon=ICON_INFO, label="草稿待确认")
+        for line in self._lines():
+            section.add(line)
+        section.add(
+            command_line("空间确认", "空间放弃"),
+            command_line("空间重写"),
+            kv("说明", "确认后才会真正发出；重写会再生成一版"),
+        )
+        text, markup = pair([section])
+        body = f"内容：\n{self.text}"
+        return f"{text}\n{body}", f"{markup}\n\n{body}"
+
+    def describe(self) -> str:
+        """给管理员看的完整描述（纯文本版）。"""
+        return self.describe_pair()[0]
 
 
 class DraftBox:

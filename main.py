@@ -44,6 +44,20 @@ from .core.scheduler import (
     split_times,
 )
 from .core.store import PublishRecord, PublishStore
+from .core.ui import (
+    DIVIDER,
+    ICON_FAIL,
+    ICON_INFO,
+    ICON_OK,
+    ICON_WARN,
+    LIMIT_BLOCK_LINES,
+    LIMIT_RECEIPT,
+    Section,
+    kv,
+    pair,
+    plain_receipt,
+    quote_command,
+)
 from .core.user_prefs import FEATURE_LABELS, UserPrefStore
 from .core.web import WebSearchBridge
 
@@ -178,9 +192,19 @@ class QzonePublisherPlugin(Star):
                 message = await self._confirm_draft(draft)
             except Exception as e:
                 self.drafts.put(draft)
-                await self._notify(f"遗留草稿自动执行失败：{e}\n草稿已保留")
+                await self._notify(
+                    plain_receipt(
+                        "遗留草稿执行失败",
+                        [kv("原因", e), kv("说明", "草稿已保留")],
+                        icon=ICON_FAIL,
+                    )
+                )
                 return
-            await self._notify(f"⏰ 重启后处理了超时草稿\n{message}")
+            await self._notify(
+                plain_receipt(
+                    "重启后处理了超时草稿", [kv("结果", message)], icon=ICON_WARN
+                )
+            )
             return
 
         remaining = max(int(minutes - age_minutes), 1)
@@ -287,7 +311,16 @@ class QzonePublisherPlugin(Star):
                 self.cfg.active_msg_require_optin
             ):
                 await self._notify(
-                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, CHAT_KEY)}"
+                    plain_receipt(
+                        f"{slot_name}没有发送",
+                        [
+                            kv(
+                                "原因",
+                                self._no_consent_note(slot_name, CHAT_KEY),
+                            )
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
             return
 
@@ -431,7 +464,13 @@ class QzonePublisherPlugin(Star):
             text, source = await self.content.generate()
         except Exception as e:
             logger.error(f"自动发布内容生成失败: {e}")
-            await self._notify(f"定时发布失败：内容生成异常\n{e}")
+            await self._notify(
+                plain_receipt(
+                    "定时发布失败",
+                    [kv("原因", "内容生成异常"), kv("详情", e)],
+                    icon=ICON_FAIL,
+                )
+            )
             return
         await self._dispatch_post(text, source=source, prefix="定时发布")
 
@@ -441,16 +480,24 @@ class QzonePublisherPlugin(Star):
 
         if self.interact.targets:
             result = await self.interact.run_once()
-            lines.append(f"说说互动完成：{result.summary()}")
+            lines.append(
+                plain_receipt(
+                    "说说互动完成", result.summary().splitlines(), icon=ICON_OK
+                )
+            )
         else:
             logger.info("未配置 interact_uins，跳过本轮好友说说巡检")
 
         if bool(self.cfg.interact_reply_enabled):
             reply = await self.interact.run_replies_once()
-            lines.append(f"评论回复完成：{reply.summary()}")
+            lines.append(
+                plain_receipt(
+                    "评论回复完成", reply.summary().splitlines(), icon=ICON_OK
+                )
+            )
 
         if lines and bool(self.cfg.interact_notify):
-            await self._notify("\n".join(lines))
+            await self._notify(f"\n{DIVIDER}\n".join(lines))
 
         pending = self.drafts.pending
         if pending is not None and pending.kind in ("comment", "reply"):
@@ -536,7 +583,16 @@ class QzonePublisherPlugin(Star):
                 self.cfg.active_msg_require_optin
             ):
                 await self._notify(
-                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, feature)}"
+                    plain_receipt(
+                        f"{slot_name}没有发送",
+                        [
+                            kv(
+                                "原因",
+                                self._no_consent_note(slot_name, feature),
+                            )
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
             return
 
@@ -558,12 +614,21 @@ class QzonePublisherPlugin(Star):
         if result.sent == 0 and result.errors:
             # 别再用「已发送」这种说法掩盖失败：一条都没发出去时明确报警
             await self._notify(
-                f"⚠️ {slot_name}没有发出去：{result.summary()}" + self._usage_note()
+                plain_receipt(
+                    f"{slot_name}没有发出去",
+                    result.summary().splitlines(),
+                    icon=ICON_WARN,
+                )
+                + self._usage_note()
             )
             return
         await self._notify(
-            f"{slot_name}已发送：{result.summary()}\n内容：{result.text}"
-            + self._usage_note(),
+            plain_receipt(
+                f"{slot_name}已发送",
+                [*result.summary().splitlines(), kv("内容", result.text)],
+                icon=ICON_OK,
+            )
+            + self._usage_note()
         )
 
     def greet_holiday_status(self, upcoming: tuple[str, date, int] | None) -> str:
@@ -627,17 +692,31 @@ class QzonePublisherPlugin(Star):
         night = describe_cron(self.cfg.greet_night_cron)
         holiday = describe_cron(self.cfg.holiday_cron)
         chat_windows = describe_windows(self.greet.chat_windows)
-        return (
-            "本机器人可能会主动私聊发消息。\n"
-            f"可能的时间段：早安 {morning}、晚安 {night}、节日祝福 {holiday}、"
-            f"日常闲聊 {chat_windows}"
-            "（实际时间会随机延后，闲聊在窗口内随机，不会固定在同一秒）。\n"
-            "可能打扰到的功能：早安 / 晚安问候、传统节日祝福、"
-            "日常闲聊（白天与晚上可能收到一两句招呼），以及评论回复"
-            "（评论回复会在说说评论区提醒被回复的人，不是私聊）。\n"
-            "如需接收，回复 /私聊开；如不希望接收，回复 /私聊关。\n"
-            "不回应视为不接受，不会收到任何主动消息；随时可用 /私聊开 改回来。"
+        section = Section(icon=ICON_INFO, label="主动消息说明")
+        section.add(
+            kv(
+                "可能的时间段",
+                f"早安 {morning}、晚安 {night}、节日祝福 {holiday}、"
+                f"日常闲聊 {chat_windows}",
+            ),
+            kv("实际时间", "会随机延后；闲聊在窗口内随机，不会固定在同一秒"),
+            kv(
+                "可能打扰到的功能",
+                "早安 / 晚安问候、传统节日祝福、日常闲聊"
+                "（白天与晚上可能收到一两句招呼），以及评论回复"
+                "（评论回复会在说说评论区提醒被回复的人，不是私聊）",
+            ),
+            kv(
+                "如何设置",
+                f"{quote_command('私聊开')}接收，{quote_command('私聊关')}不接收",
+            ),
+            kv(
+                "说明",
+                "不回应视为不接受，不会收到任何主动消息；"
+                f"随时可用{quote_command('私聊开')}改回来",
+            ),
         )
+        return section.text()
 
     @staticmethod
     def _looks_like_command(text: str, wake_prefixes: list[str]) -> bool:
@@ -720,7 +799,16 @@ class QzonePublisherPlugin(Star):
                 self.cfg.active_msg_require_optin
             ):
                 await self._notify(
-                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, slot_key)}"
+                    plain_receipt(
+                        f"{slot_name}没有发送",
+                        [
+                            kv(
+                                "原因",
+                                self._no_consent_note(slot_name, slot_key),
+                            )
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
             return
 
@@ -729,7 +817,13 @@ class QzonePublisherPlugin(Star):
                 text = await self.greet.build_text(slot)
             except Exception as e:
                 logger.error(f"问候内容生成失败: {e}")
-                await self._notify(f"{slot_name}问候失败：内容生成异常\n{e}")
+                await self._notify(
+                    plain_receipt(
+                        f"{slot_name}失败",
+                        [kv("原因", "内容生成异常"), kv("详情", e)],
+                        icon=ICON_FAIL,
+                    )
+                )
                 return
             await self._draft_greet(
                 slot_key=slot_key,
@@ -759,7 +853,16 @@ class QzonePublisherPlugin(Star):
                 self.cfg.active_msg_require_optin
             ):
                 await self._notify(
-                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, HOLIDAY_KEY)}"
+                    plain_receipt(
+                        f"{slot_name}没有发送",
+                        [
+                            kv(
+                                "原因",
+                                self._no_consent_note(slot_name, HOLIDAY_KEY),
+                            )
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
             return
 
@@ -768,7 +871,13 @@ class QzonePublisherPlugin(Star):
                 preview = await self.greet.build_holiday_preview()
             except Exception as e:
                 logger.error(f"节日祝福内容生成失败: {e}")
-                await self._notify(f"{slot_name}失败：内容生成异常\n{e}")
+                await self._notify(
+                    plain_receipt(
+                        f"{slot_name}失败",
+                        [kv("原因", "内容生成异常"), kv("详情", e)],
+                        icon=ICON_FAIL,
+                    )
+                )
                 return
             if preview is None:
                 return
@@ -811,7 +920,10 @@ class QzonePublisherPlugin(Star):
         try:
             record = await self._publish(text, source=source)
         except Exception as e:
-            await self._notify(f"{prefix}失败：{e}" + self._usage_note())
+            await self._notify(
+                plain_receipt("发布失败", [kv("原因", e)], icon=ICON_FAIL)
+                + self._usage_note()
+            )
             return
         await self._notify(
             self._format_record(record, prefix=f"{prefix}成功")
@@ -839,7 +951,11 @@ class QzonePublisherPlugin(Star):
             )
             if not resp.ok:
                 raise RuntimeError(str(resp.message or resp.code))
-            return f"评论已发布（{draft.title()}）：{draft.text}"
+            return plain_receipt(
+                "评论已发布",
+                [kv("草稿", draft.title()), kv("内容", draft.text)],
+                icon=ICON_OK,
+            )
 
         if draft.kind == "reply":
             if not (draft.target_tid and draft.target_comment_tid):
@@ -856,32 +972,52 @@ class QzonePublisherPlugin(Star):
             # 回复真正发出后才记入去重；草稿被丢弃时下次巡检仍会重试
             self.interact.mark_replied(draft.target_tid, draft.target_comment_tid)
             who = draft.target_name or draft.target_comment_uin
-            return f"已回复 {who} 的评论：{draft.text}"
+            return plain_receipt(
+                "已回复评论",
+                [kv("对象", who), kv("内容", draft.text)],
+                icon=ICON_OK,
+            )
 
         if draft.kind == "greet":
             result = await self.greet.send_text(draft.text, draft.targets or None)
             if result.sent == 0:
                 raise RuntimeError(f"问候没有发出去：{result.summary()}")
-            return f"问候已发送：{result.summary()}\n内容：{draft.text}"
+            return plain_receipt(
+                "问候已发送",
+                [*result.summary().splitlines(), kv("内容", draft.text)],
+                icon=ICON_OK,
+            )
 
         record = await self._publish(draft.text, source=draft.source or "draft")
         return self._format_record(record, prefix="草稿已发布")
 
     @staticmethod
     def _format_record(record: PublishRecord, prefix: str = "发布成功") -> str:
-        """把发布记录格式化为可读文本。"""
-        lines = [prefix]
+        """把发布记录格式化为统一的区块回执。"""
+        failed = "失败" in prefix
+        lines: list[str] = []
         if record.tid:
-            lines.append(f"tid: {record.tid}")
+            lines.append(kv("tid", record.tid))
             if record.uin:
                 lines.append(
-                    f"链接: https://user.qzone.qq.com/{record.uin}/mood/{record.tid}"
+                    kv(
+                        "链接",
+                        f"https://user.qzone.qq.com/{record.uin}/mood/{record.tid}",
+                    )
                 )
+        if prefix and prefix not in ("发布成功", "发布失败"):
+            lines.append(kv("方式", prefix))
         if record.images:
-            lines.append(f"图片: {record.images} 张")
+            lines.append(kv("图片", f"{record.images} 张"))
         if record.text:
-            lines.append(f"内容: {record.text}")
-        return "\n".join(lines)
+            lines.append(kv("内容", record.text))
+        if record.error:
+            lines.append(kv("原因", record.error))
+        if failed and not lines:
+            lines.append(kv("状态", "没有可显示的发布信息"))
+        label = "发布失败" if failed else "发布成功"
+        icon = ICON_FAIL if failed else ICON_OK
+        return plain_receipt(label, lines, icon=icon)
 
     @staticmethod
     def _format_time(timestamp: int) -> str:
@@ -1007,15 +1143,17 @@ class QzonePublisherPlugin(Star):
         extra_umos: list[str] | None = None,
         *,
         render: bool = True,
+        markup: str = "",
     ) -> int:
         """向配置的会话发送通知。
 
         Args:
-            message: 通知内容。
+            message: 通知内容（纯文本版，能直接在 QQ 里显示）。
             extra_umos: 额外接收者。
             render: 是否尝试把通知渲染成回执图。默认尝试；
                 渲染器自身会在「未开启渲染」或「文本过短」时直接跳过，
                 渲染失败也会自动降级为纯文本。
+            markup: 回执图使用的 Markdown 版内容；留空时退回 ``message``。
 
         Returns:
             成功发送的会话数。
@@ -1029,7 +1167,10 @@ class QzonePublisherPlugin(Star):
             if item and item not in umos:
                 umos.append(item)
 
-        image = await self.render.render(message) if render else None
+        image = None
+        if render:
+            # 图片路径用 Markdown 版：标签成为标题、键值名称为真加粗
+            image = await self.render.render(str(markup or message))
         return await self._send_to(umos, message, image=image)
 
     async def _send_draft(self, draft: Draft) -> int:
@@ -1049,24 +1190,36 @@ class QzonePublisherPlugin(Star):
         if draft_umo and draft_umo not in umos:
             umos.append(draft_umo)
 
-        text = draft.describe() + self._usage_note()
-        image = await self.render.render(text)
+        text, markup = draft.describe_pair()
+        note_text, note_markup = self._usage_note_pair()
+        text += note_text
+        markup += note_markup
+        image = await self.render.render(markup)
         return await self._send_to(umos, text, image=image)
 
     # ------------------------------------------------------------------
     # Token 用量提示
     # ------------------------------------------------------------------
 
-    def _usage_note(self) -> str:
-        """附在草稿/通知后面的 token 用量提示（估算）。"""
+    def _usage_note_pair(self) -> tuple[str, str]:
+        """用量提示的 (纯文本版, Markdown 版)。"""
         item = self.ai.last_call
         if not item:
-            return ""
-        return (
-            f"\n\n📊 本次生成约用 {item.get('total', 0)} tokens"
-            f"（输入 {item.get('prompt', 0)} + 输出 {item.get('completion', 0)}，"
-            f"功能：{item.get('feature', '未知')}，估算值）"
+            return "", ""
+        total = item.get("total", 0)
+        detail = (
+            f"输入 {item.get('prompt', 0)} + 输出 {item.get('completion', 0)}，"
+            f"功能：{item.get('feature', '未知')}，估算值"
         )
+        section = Section(icon=ICON_INFO, label="用量估算")
+        section.add(f"{kv('本次生成约用', f'{total} tokens')}")
+        section.add(f"{kv('构成', detail)}")
+        text, markup = pair([section], max_lines=LIMIT_RECEIPT)
+        return f"\n\n{text}", f"\n\n{markup}"
+
+    def _usage_note(self) -> str:
+        """附在草稿/通知后面的 token 用量提示（估算，纯文本版）。"""
+        return self._usage_note_pair()[0]
 
     # ------------------------------------------------------------------
     # 草稿超时自动放行
@@ -1111,9 +1264,21 @@ class QzonePublisherPlugin(Star):
             message = await self._confirm_draft(draft)
         except Exception as e:
             self.drafts.put(draft)
-            await self._notify(f"草稿超时自动执行失败：{e}\n草稿已保留")
+            await self._notify(
+                plain_receipt(
+                    "超时草稿执行失败",
+                    [kv("原因", e), kv("说明", "草稿已保留")],
+                    icon=ICON_FAIL,
+                )
+            )
             return
-        await self._notify(f"⏰ 草稿超过 {minutes} 分钟未处理，已自动执行\n{message}")
+        await self._notify(
+            plain_receipt(
+                "草稿超时已自动执行",
+                [kv("等待", f"{minutes} 分钟无人处理"), kv("结果", message)],
+                icon=ICON_WARN,
+            )
+        )
 
     # ------------------------------------------------------------------
     # system prompt 注入
@@ -1148,14 +1313,31 @@ class QzonePublisherPlugin(Star):
         images = await self._extract_images(event)
 
         if not content and not images:
-            yield event.plain_result("用法：/空间发布 说说内容（可同时附带图片）")
+            yield event.plain_result(
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv("用法", f"{quote_command('空间发布 说说内容')}立即发布"),
+                        kv("说明", "可以同时附带图片，最多 9 张"),
+                    ],
+                    icon=ICON_WARN,
+                )
+            )
             return
 
-        yield event.plain_result("正在发布到 QQ空间...")
+        yield event.plain_result(
+            plain_receipt(
+                "正在发布",
+                [kv("目标", "QQ空间，请稍候")],
+                icon=ICON_INFO,
+            )
+        )
         try:
             record = await self._publish(content, images, source="manual")
         except Exception as e:
-            yield event.plain_result(f"发布失败：{e}")
+            yield event.plain_result(
+                plain_receipt("发布失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
 
         yield event.plain_result(self._format_record(record))
@@ -1168,11 +1350,19 @@ class QzonePublisherPlugin(Star):
         self.content.remember_umo(event.unified_msg_origin)
         self.ai.remember_umo(event.unified_msg_origin)
 
-        yield event.plain_result("正在按人设生成内容...")
+        yield event.plain_result(
+            plain_receipt(
+                "正在生成",
+                [kv("方式", "AI 按人设生成，请稍候")],
+                icon=ICON_INFO,
+            )
+        )
         try:
             text, source = await self.content.generate()
         except Exception as e:
-            yield event.plain_result(f"生成失败：{e}")
+            yield event.plain_result(
+                plain_receipt("生成失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
 
         # 与定时发布保持一致：开了草稿确认就先转草稿，不直接发出去
@@ -1189,8 +1379,14 @@ class QzonePublisherPlugin(Star):
         try:
             record = await self._publish(text, source=source)
         except Exception as e:
-            await self._notify(f"手动自动发失败：{e}" + self._usage_note())
-            yield event.plain_result(f"发布失败：{e}{self._usage_note()}")
+            await self._notify(
+                plain_receipt("发布失败", [kv("原因", e)], icon=ICON_FAIL)
+                + self._usage_note()
+            )
+            yield event.plain_result(
+                plain_receipt("发布失败", [kv("原因", e)], icon=ICON_FAIL)
+                + self._usage_note()
+            )
             return
 
         receipt = (
@@ -1206,32 +1402,46 @@ class QzonePublisherPlugin(Star):
         """查看登录态、AI 接入、日程与各定时任务状态"""
         self._remember_client(event)
 
-        lines = ["【QQ空间插件状态】"]
+        # 区块 1：登录与接入
+        login_lines: list[str] = []
+        login_icon = ICON_OK
         try:
             nickname = await self.session.get_nickname()
             uin = await self.session.get_uin()
-            lines.append(
-                f"登录态: 正常（{nickname} / {uin}，Cookie 来源: "
-                f"{self.session.source or '未知'}）"
+            login_lines.append(
+                kv(
+                    "登录态",
+                    f"正常（{nickname} / {uin}，Cookie 来源："
+                    f"{self.session.source or '未知'}）",
+                )
             )
         except Exception as e:
-            lines.append(f"登录态: 异常（{e}）")
+            login_icon = ICON_WARN
+            login_lines.append(kv("登录态", f"异常（{e}）"))
 
         admin_qqs, admin_source = self._admin_qqs()
-        lines.append(
-            f"管理员: {'、'.join(admin_qqs) if admin_qqs else '未识别到'}"
-            f"（来源: {admin_source}）"
+        login_lines.append(
+            kv(
+                "管理员",
+                f"{'、'.join(admin_qqs) if admin_qqs else '未识别到'}"
+                f"（来源：{admin_source}）",
+            )
         )
         if not admin_qqs:
-            lines.append(
-                "　⚠️ 没有管理员名单，草稿确认发不出去；"
-                "可在插件配置 admin_uins 填写，或用 /空间管理员 add <QQ号>"
+            login_lines.append(
+                kv(
+                    "提示",
+                    "没有管理员名单，草稿确认发不出去；可在插件配置 admin_uins 填写，"
+                    f"或用 {quote_command('空间管理员 add <QQ号>')}",
+                )
             )
-
         overrides = self.ai.overrides_text()
-        lines.append(
-            f"AI 接入: {self.ai.describe()}"
-            + (f"｜单独指定: {overrides}" if overrides else "")
+        login_lines.append(
+            kv(
+                "AI 接入",
+                f"{self.ai.describe()}"
+                + (f"｜单独指定：{overrides}" if overrides else ""),
+            )
         )
 
         cached = self.life.cached(datetime.now().date())
@@ -1239,74 +1449,106 @@ class QzonePublisherPlugin(Star):
             life_text = f"已就绪｜{cached.to_line()[:60]}"
         else:
             life_text = "今日尚未生成"
-        lines.append(
-            f"生活日程: {life_text}｜注入提示词: {'开' if self.cfg.life_inject_enabled else '关'}"
+        login_lines.append(
+            kv(
+                "生活日程",
+                f"{life_text}｜注入提示词："
+                f"{'开' if self.cfg.life_inject_enabled else '关'}",
+            )
         )
 
-        lines.append(f"联网素材: {self.web.status_text()}")
-        lines.append(f"回执图渲染: {self.render.status_text()}")
-
+        # 区块 2：生成与回执
+        gen_lines = [
+            kv("联网素材", self.web.status_text()),
+            kv("回执图渲染", self.render.status_text()),
+        ]
         basis = self.content.last_generation
         if basis:
-            lines.append(
-                f"上次生成依据: 人设={basis.get('persona') or '未取到'}"
-                f"｜日程={'已引用' if basis.get('life') else '未引用'}"
-                f"｜联网素材={'有' if basis.get('web') else '无'}"
-                f"｜聊天记录={'有' if basis.get('chat') else '无'}"
-                f"｜角度={basis.get('angle') or '未启用'}"
-                f"｜时段={basis.get('slot') or '未知'}"
+            gen_lines.append(
+                kv(
+                    "上次生成依据",
+                    f"人设={basis.get('persona') or '未取到'}"
+                    f"｜日程={'已引用' if basis.get('life') else '未引用'}"
+                    f"｜联网素材={'有' if basis.get('web') else '无'}"
+                    f"｜聊天记录={'有' if basis.get('chat') else '无'}"
+                    f"｜角度={basis.get('angle') or '未启用'}"
+                    f"｜时段={basis.get('slot') or '未知'}",
+                )
             )
             if basis.get("repeat_checked"):
-                lines.append(
-                    f"　避免重复: 参考最近 {basis.get('recent') or 0} 条"
-                    f"｜与最近内容相似度 {basis.get('repeat') or 0}%"
-                    f"（阈值 {int(self.cfg.publish_repeat_threshold or 0)}%）"
-                    + ("｜已自动重写一次" if basis.get("repeat_rewritten") else "")
+                gen_lines.append(
+                    kv(
+                        "避免重复",
+                        f"参考最近 {basis.get('recent') or 0} 条"
+                        f"｜与最近内容相似度 {basis.get('repeat') or 0}%"
+                        f"（阈值 {int(self.cfg.publish_repeat_threshold or 0)}%）"
+                        + ("｜已自动重写一次" if basis.get("repeat_rewritten") else ""),
+                    )
                 )
-            for warning in basis.get("warnings") or []:
-                lines.append(f"　⚠️ {warning}")
-
+            # 提醒合并成一行：区块行数有限，避免把「用量」等信息挤出区块
+            warnings = [str(item) for item in (basis.get("warnings") or [])]
+            if warnings:
+                gen_lines.append(kv("提醒", "；".join(warnings[:3])))
         usage_first_line = self.ai.usage.format_summary(1).splitlines()[0]
-        lines.append(f"Token 用量（估算）: {usage_first_line}")
+        gen_lines.append(kv("Token 用量（估算）", usage_first_line))
         if self.ai.last_call:
-            lines.append(f"　最近一次: {self.ai.last_call_text()}")
+            gen_lines.append(kv("最近一次", self.ai.last_call_text()))
 
-        lines.append(
-            f"定时发布: {'开启' if self.publish_task.running else '关闭'}"
-            f"（{self.publish_task.describe()}，抖动 {self.publish_task.jitter} 秒）"
-        )
-        lines.append(f"　内容来源: {self.cfg.content_source}")
-        lines.append(f"　下次执行: {self.publish_task.next_run_time}")
+        # 区块 3：定时任务
+        task_lines = [
+            kv(
+                "定时发布",
+                f"{'开启' if self.publish_task.running else '关闭'}"
+                f"（{self.publish_task.describe()}，"
+                f"抖动 {self.publish_task.jitter} 秒）",
+            ),
+            kv("内容来源", self.cfg.content_source),
+            kv("下次执行", self.publish_task.next_run_time),
+        ]
         if self.publish_task.error:
-            lines.append(f"　⚠️ {self.publish_task.error}")
-
-        lines.append(
-            f"说说互动: {self.interact.mode_text()}"
-            f"（{self.interact_task.cron or '未设置'}，"
-            f"关注 {len(self.interact.targets)} 个 QQ）"
+            task_lines.append(kv("提醒", self.publish_task.error))
+        task_lines.append(
+            kv(
+                "说说互动",
+                f"{self.interact.mode_text()}"
+                f"（{self.interact_task.cron or '未设置'}，"
+                f"关注 {len(self.interact.targets)} 个 QQ）",
+            )
         )
-        lines.append(f"　下次巡检: {self.interact_task.next_run_time}")
+        task_lines.append(kv("下次巡检", self.interact_task.next_run_time))
         if not self.interact.targets:
-            lines.append("　⚠️ 还没配置 interact_uins，巡检不会做任何事")
-        lines.append(f"　评论回复: {self.interact.reply_mode_text()}")
+            task_lines.append(kv("提醒", "还没配置 interact_uins，巡检不会做任何事"))
+        task_lines.append(kv("评论回复", self.interact.reply_mode_text()))
 
-        lines.append(
-            f"草稿确认: {'开启' if self.cfg.draft_enabled else '关闭'}"
-            f"｜评论也确认: {'开' if self.cfg.draft_for_comment else '关'}"
-        )
+        # 区块 4：草稿确认
+        draft_lines = [
+            kv(
+                "草稿确认",
+                f"{'开启' if self.cfg.draft_enabled else '关闭'}"
+                f"｜评论也确认：{'开' if self.cfg.draft_for_comment else '关'}",
+            )
+        ]
         pending = self.drafts.pending
         if pending is not None:
-            lines.append(
-                f"　待确认: {pending.title()}（{self._format_time(pending.created_time)}）"
+            draft_lines.append(
+                kv(
+                    "待确认",
+                    f"{pending.title()}（{self._format_time(pending.created_time)}）",
+                )
             )
 
+        # 区块 5：定时问候与节日祝福
+        greet_lines = [
+            kv(
+                "定时问候",
+                f"{'开启' if bool(self.cfg.greet_enabled) else '关闭'}"
+                f"｜收件人 "
+                f"{'已同意的用户' if bool(self.cfg.active_msg_require_optin) else 'greet_users'}"
+                f"｜内容 {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}",
+            )
+        ]
         morning = self.greet.slot_of("morning")
         night = self.greet.slot_of("night")
-        lines.append(
-            f"定时问候: {'开启' if bool(self.cfg.greet_enabled) else '关闭'}"
-            f"｜收件人 {'已同意的用户' if bool(self.cfg.active_msg_require_optin) else 'greet_users'}"
-            f"｜内容 {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
-        )
         for slot, task in (
             (morning, self.greet_morning_task),
             (night, self.greet_night_task),
@@ -1314,46 +1556,71 @@ class QzonePublisherPlugin(Star):
             if slot is None:
                 continue
             slot_targets = self._feature_targets(slot.key)
-            lines.append(
-                f"　{slot.name}: {task.cron or '未设置'}"
-                f"（下次 {task.next_run_time}）"
-                f"｜今日已发 {self.greet.sent_today(slot.key)} 人"
-                f"｜本次将发给 {len(slot_targets)} 人（已同意）"
+            greet_lines.append(
+                kv(
+                    f"{slot.name}问候",
+                    f"{task.cron or '未设置'}（下次 {task.next_run_time}）"
+                    f"｜今日已发 {self.greet.sent_today(slot.key)} 人"
+                    f"｜本次将发给 {len(slot_targets)} 人（已同意）",
+                )
             )
             if bool(self.cfg.greet_enabled) and not slot_targets:
-                lines.append(f"　⚠️ {self._no_consent_note(slot.name, slot.key)}")
+                greet_lines.append(
+                    kv("提醒", self._no_consent_note(slot.name, slot.key))
+                )
         sample_targets = self._feature_targets("morning") or self.greet.targets
         if sample_targets:
-            lines.append(f"　发送地址: {self.greet.umo_for(sample_targets[0])}")
+            greet_lines.append(kv("发送地址", self.greet.umo_for(sample_targets[0])))
 
+        # 区块 6：节日祝福与主动闲聊
         upcoming = days_until(datetime.now(self.cfg.timezone).date())
-        holiday_text = self.greet_holiday_status(upcoming)
         holiday_targets = self._feature_targets(HOLIDAY_KEY)
-        lines.append(
-            f"节日祝福: {'开启' if bool(self.cfg.holiday_enabled) else '关闭'}"
-            f"｜{holiday_text}"
-            f"｜本次将发给 {len(holiday_targets)} 人（已同意）"
-        )
+        holiday_lines = [
+            kv(
+                "节日祝福",
+                f"{'开启' if bool(self.cfg.holiday_enabled) else '关闭'}"
+                f"｜{self.greet_holiday_status(upcoming)}"
+                f"｜本次将发给 {len(holiday_targets)} 人（已同意）",
+            )
+        ]
         if bool(self.cfg.holiday_enabled) and not holiday_targets:
-            lines.append(f"　⚠️ {self._no_consent_note('节日祝福', HOLIDAY_KEY)}")
+            holiday_lines.append(
+                kv("提醒", self._no_consent_note("节日祝福", HOLIDAY_KEY))
+            )
+        holiday_lines.append(kv("主动闲聊", self.chat_open_status()))
 
-        lines.append(f"主动闲聊: {self.chat_open_status()}")
-
+        # 区块 5：主动消息与最近发布
         stats = self.prefs.stats()
-        lines.append(
-            f"主动消息同意: 已接受 {stats['accepted']} 人"
-            f"｜已拒绝 {stats['declined']} 人"
-            f"｜未回答 {stats['unanswered']} 人"
-            f"（需要同意: {'开' if bool(self.cfg.active_msg_require_optin) else '关'}）"
-        )
-
+        tail_lines = [
+            kv(
+                "主动消息同意",
+                f"已接受 {stats['accepted']} 人"
+                f"｜已拒绝 {stats['declined']} 人"
+                f"｜未回答 {stats['unanswered']} 人"
+                f"（需要同意："
+                f"{'开' if bool(self.cfg.active_msg_require_optin) else '关'}）",
+            )
+        ]
         last = self.store.last_success()
         if last:
-            lines.append(f"上次发布: {self._format_time(last.time)}（tid {last.tid}）")
+            tail_lines.append(
+                kv("上次发布", f"{self._format_time(last.time)}（tid {last.tid}）")
+            )
         else:
-            lines.append("上次发布: 暂无记录")
+            tail_lines.append(kv("上次发布", "暂无记录"))
 
-        yield event.plain_result("\n".join(lines))
+        sections = [
+            Section(icon=login_icon, label="登录与接入", lines=login_lines),
+            Section(icon=ICON_INFO, label="生成与回执", lines=gen_lines),
+            Section(icon=ICON_INFO, label="定时任务", lines=task_lines),
+            Section(icon=ICON_INFO, label="草稿确认", lines=draft_lines),
+            Section(icon=ICON_INFO, label="定时问候", lines=greet_lines),
+            Section(icon=ICON_INFO, label="节日祝福与闲聊", lines=holiday_lines),
+            Section(icon=ICON_INFO, label="主动消息与最近发布", lines=tail_lines),
+        ]
+        # 状态是多区块输出：区块之间用分隔线，每个区块不超过 8 行
+        text, _markup = pair(sections, divider=True, block_limit=LIMIT_BLOCK_LINES)
+        yield event.plain_result(text)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间重登", alias={"space relogin", "qz relogin"})
@@ -1363,10 +1630,19 @@ class QzonePublisherPlugin(Star):
         try:
             ctx = await self.session.refresh()
         except Exception as e:
-            yield event.plain_result(f"重新登录失败：{e}")
+            yield event.plain_result(
+                plain_receipt("重登失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
         yield event.plain_result(
-            f"重新登录成功：uin={ctx.uin}（Cookie 来源: {self.session.source}）"
+            plain_receipt(
+                "重登成功",
+                [
+                    kv("uin", ctx.uin),
+                    kv("Cookie 来源", self.session.source),
+                ],
+                icon=ICON_OK,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -1389,7 +1665,13 @@ class QzonePublisherPlugin(Star):
             self.cfg.set("publish_per_day", 0)
             self.cfg.set("publish_cron", "")
             self.publish_task.reconfigure(times=[], per_day=0, cron="")
-            yield event.plain_result("已清空发布时间点，定时自动发布已关闭")
+            yield event.plain_result(
+                plain_receipt(
+                    "发布时间已清空",
+                    [kv("状态", "定时自动发布已关闭")],
+                    icon=ICON_INFO,
+                )
+            )
             return
 
         # 可选前缀「每天 N」：只改每天发布条数
@@ -1401,7 +1683,11 @@ class QzonePublisherPlugin(Star):
                 per_day = min(max(int(number), 0), 10)
                 text = tail.strip()
         if not text:
-            yield event.plain_result("设置失败：没有可用的时间点")
+            yield event.plain_result(
+                plain_receipt(
+                    "设置失败", [kv("原因", "没有可用的时间点")], icon=ICON_FAIL
+                )
+            )
             return
 
         valid: list[str] = []
@@ -1423,8 +1709,14 @@ class QzonePublisherPlugin(Star):
 
         if not valid:
             yield event.plain_result(
-                f"设置失败：这些时间点无法识别（{'、'.join(invalid)}）；"
-                "请使用 HH:MM 或 5 段 Cron"
+                plain_receipt(
+                    "设置失败",
+                    [
+                        kv("原因", f"这些时间点无法识别（{'、'.join(invalid)}）"),
+                        kv("用法", "请使用 HH:MM 或 5 段 Cron"),
+                    ],
+                    icon=ICON_FAIL,
+                )
             )
             return
 
@@ -1446,36 +1738,52 @@ class QzonePublisherPlugin(Star):
             enabled=True,
         )
 
-        lines = [f"已设置自动发布时间：{self.publish_task.describe()}"]
+        section = Section(icon=ICON_OK, label="发布时间已设置")
+        section.add(kv("发布计划", self.publish_task.describe()))
         if self.publish_task.incomplete:
             # 条数多于时间点：配置不完整，明确提示而不是少发几条
-            lines.append(f"⚠️ {self.publish_task.error}；当前不会自动发布")
-            lines.append(
-                f"当前时间点列表有 {len(valid)} 个，每天都发 {days} 条："
-                "请补齐时间点，或用 /空间定时 每天 <条数> 把条数调小"
+            section.add(
+                kv("状态", "配置不完整，当前不会自动发布"),
+                kv("详情", self.publish_task.error),
+                kv(
+                    "用法",
+                    "补齐时间点，或用"
+                    f"{quote_command('空间定时 每天 2 08:30,12:30')}把条数调小",
+                ),
             )
         else:
-            lines.append(f"下次执行: {self.publish_task.next_run_time}")
+            section.add(kv("下次执行", self.publish_task.next_run_time))
         if invalid:
-            lines.append(f"已忽略无法识别的时间点：{'、'.join(invalid)}")
-        yield event.plain_result("\n".join(lines))
+            section.add(kv("已忽略", "、".join(invalid)))
+        yield event.plain_result(section.text())
 
     def _schedule_text(self) -> str:
         """自动发布时间的展示文本。"""
-        lines = [
-            f"自动发布: {'开启' if self.publish_task.running else '关闭'}"
-            f"｜{self.publish_task.describe()}",
-            f"抖动: {self.publish_task.jitter} 秒"
-            f"｜下次执行: {self.publish_task.next_run_time}",
-        ]
-        if self.publish_task.error:
-            lines.append(f"⚠️ {self.publish_task.error}")
-        lines.append(
-            "用法: /空间定时 08:30,12:30,21:00（多个时间点）"
-            "｜/空间定时 每天 2 08:30,12:30（只发前 2 个）"
-            "｜/空间定时 30 8 * * *（单个 Cron）｜/空间定时 off"
+        section = Section(icon=ICON_INFO, label="发布时间")
+        section.add(
+            kv(
+                "自动发布",
+                f"{'开启' if self.publish_task.running else '关闭'}"
+                f"｜{self.publish_task.describe()}",
+            ),
+            kv("抖动", f"{self.publish_task.jitter} 秒"),
+            kv("下次执行", self.publish_task.next_run_time),
         )
-        return "\n".join(lines)
+        if self.publish_task.error:
+            section.add(kv("提醒", self.publish_task.error))
+        section.add(
+            kv(
+                "用法",
+                f"{quote_command('空间定时 08:30,12:30,21:00')}多个时间点｜"
+                f"{quote_command('空间定时 每天 2 08:30,12:30')}只发前 2 个",
+            ),
+            kv(
+                "用法",
+                f"{quote_command('空间定时 30 8 * * *')}单个 Cron｜"
+                f"{quote_command('空间定时 off')}关闭",
+            ),
+        )
+        return section.text()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间开关", alias={"space toggle", "qz toggle"})
@@ -1493,22 +1801,47 @@ class QzonePublisherPlugin(Star):
             crons = self.publish_task.reconfigure(enabled=True)
             if not crons:
                 yield event.plain_result(
-                    "已开启定时发布，但没有可用的发布时间点：请用 /空间定时 设置"
+                    plain_receipt(
+                        "定时发布已开启",
+                        [
+                            kv("提醒", "没有可用的发布时间点"),
+                            kv("用法", f"用{quote_command('空间定时 08:30')}设置"),
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
                 return
             yield event.plain_result(
-                f"定时自动发布已开启：{self.publish_task.describe()}\n"
-                f"下次执行: {self.publish_task.next_run_time}"
+                plain_receipt(
+                    "定时发布已开启",
+                    [
+                        kv("发布计划", self.publish_task.describe()),
+                        kv("下次执行", self.publish_task.next_run_time),
+                    ],
+                    icon=ICON_OK,
+                )
             )
             return
 
         if flag in _OFF_FLAGS:
             self.cfg.set("auto_publish_enabled", False)
             self.publish_task.reconfigure(enabled=False)
-            yield event.plain_result("定时自动发布已关闭")
+            yield event.plain_result(plain_receipt("定时发布已关闭", icon=ICON_WARN))
             return
 
-        yield event.plain_result("参数无效，用法: /空间开关 on 或 /空间开关 off")
+        yield event.plain_result(
+            plain_receipt(
+                "参数无效",
+                [
+                    kv(
+                        "用法",
+                        f"{quote_command('空间开关 on')}或"
+                        f"{quote_command('空间开关 off')}",
+                    )
+                ],
+                icon=ICON_WARN,
+            )
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间互动", alias={"space interact", "qz interact"})
@@ -1518,13 +1851,23 @@ class QzonePublisherPlugin(Star):
         flag = str(state).strip().lower()
 
         if not flag:
-            yield event.plain_result(
-                f"说说互动当前为: {self.interact.mode_text()}\n"
-                f"巡检时间: {self.interact_task.cron or '未设置'}"
-                f"｜下次: {self.interact_task.next_run_time}\n"
-                f"关注对象: {', '.join(self.interact.targets) or '（未配置 interact_uins）'}\n"
-                "用法: /空间互动 on 或 /空间互动 off；立即跑一轮用 /空间读说说"
+            section = Section(icon=ICON_INFO, label="说说互动")
+            section.add(
+                kv("当前状态", self.interact.mode_text()),
+                kv("巡检时间", self.interact_task.cron or "未设置"),
+                kv("下次巡检", self.interact_task.next_run_time),
+                kv(
+                    "关注对象",
+                    "、".join(self.interact.targets) or "（未配置 interact_uins）",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('空间互动 on')}或"
+                    f"{quote_command('空间互动 off')}；立即跑一轮用"
+                    f"{quote_command('空间读说说')}",
+                ),
             )
+            yield event.plain_result(section.text())
             return
 
         if flag in _ON_FLAGS:
@@ -1532,21 +1875,47 @@ class QzonePublisherPlugin(Star):
             cron = self.interact_task.reconfigure(enabled=True)
             if cron is None:
                 yield event.plain_result(
-                    "已开启互动巡检，但没有可用的时间配置，请设置 interact_cron"
+                    plain_receipt(
+                        "说说互动已开启",
+                        [
+                            kv("提醒", "没有可用的时间配置"),
+                            kv("用法", "请先在面板里设置巡检时间"),
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
                 return
             yield event.plain_result(
-                f"说说互动巡检已开启：{cron}\n下次执行: {self.interact_task.next_run_time}"
+                plain_receipt(
+                    "说说互动已开启",
+                    [
+                        kv("巡检时间", cron),
+                        kv("下次巡检", self.interact_task.next_run_time),
+                    ],
+                    icon=ICON_OK,
+                )
             )
             return
 
         if flag in _OFF_FLAGS:
             self.cfg.set("interact_enabled", False)
             self.interact_task.reconfigure(enabled=False)
-            yield event.plain_result("说说互动巡检已关闭")
+            yield event.plain_result(plain_receipt("说说互动已关闭", icon=ICON_WARN))
             return
 
-        yield event.plain_result("参数无效，用法: /空间互动 on 或 /空间互动 off")
+        yield event.plain_result(
+            plain_receipt(
+                "参数无效",
+                [
+                    kv(
+                        "用法",
+                        f"{quote_command('空间互动 on')}或"
+                        f"{quote_command('空间互动 off')}",
+                    )
+                ],
+                icon=ICON_WARN,
+            )
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间回复", alias={"space reply", "qz reply"})
@@ -1556,39 +1925,82 @@ class QzonePublisherPlugin(Star):
         flag = str(action).strip().lower()
 
         if not flag:
-            yield event.plain_result(
-                f"回复评论当前为: {self.interact.reply_mode_text()}\n"
-                f"范围: {self.interact.window_days} 天内自己发的说说"
-                f"｜每轮最多 {self.interact.reply_limit} 条"
-                f"｜每条说说每轮最多回 1 条\n"
-                "用法: /空间回复 on 或 /空间回复 off；立即跑一轮用 /空间回复 now"
+            section = Section(icon=ICON_INFO, label="回复评论")
+            section.add(
+                kv("当前状态", self.interact.reply_mode_text()),
+                kv("范围", f"{self.interact.window_days} 天内自己发的说说"),
+                kv(
+                    "每轮上限",
+                    f"{self.interact.reply_limit} 条；每条说说每轮最多回 1 条",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('空间回复 on')}或"
+                    f"{quote_command('空间回复 off')}；立即跑一轮用"
+                    f"{quote_command('空间回复 now')}",
+                ),
             )
+            yield event.plain_result(section.text())
             return
 
         if flag in _ON_FLAGS:
             self.cfg.set("interact_reply_enabled", True)
             yield event.plain_result(
-                f"回复评论已开启: {self.interact.reply_mode_text()}\n"
-                f"随「说说互动」的时间表执行"
-                f"（{self.interact_task.cron or '未设置'}）"
+                plain_receipt(
+                    "回复评论已开启",
+                    [
+                        kv("当前状态", self.interact.reply_mode_text()),
+                        kv(
+                            "执行时间",
+                            "随「说说互动」的时间表"
+                            f"（{self.interact_task.cron or '未设置'}）",
+                        ),
+                    ],
+                    icon=ICON_OK,
+                )
             )
             return
 
         if flag in _OFF_FLAGS:
             self.cfg.set("interact_reply_enabled", False)
-            yield event.plain_result("回复评论已关闭")
+            yield event.plain_result(plain_receipt("回复评论已关闭", icon=ICON_WARN))
             return
 
         if flag in _NOW_FLAGS:
-            yield event.plain_result("正在检查自己说说下的新评论...")
+            yield event.plain_result(
+                plain_receipt(
+                    "正在巡检",
+                    [kv("范围", "自己说说下的评论，请稍候")],
+                    icon=ICON_INFO,
+                )
+            )
             result = await self.interact.run_replies_once(force=True)
-            yield event.plain_result(f"评论回复完成：{result.summary()}")
+            yield event.plain_result(
+                plain_receipt(
+                    "评论回复完成",
+                    result.summary().splitlines(),
+                    icon=ICON_INFO,
+                )
+            )
             pending = self.drafts.pending
             if pending is not None and pending.kind == "reply":
                 yield event.plain_result(pending.describe())
             return
 
-        yield event.plain_result("参数无效，用法: /空间回复 on 或 off 或 now")
+        yield event.plain_result(
+            plain_receipt(
+                "参数无效",
+                [
+                    kv(
+                        "用法",
+                        f"{quote_command('空间回复 on')}、"
+                        f"{quote_command('空间回复 off')}或"
+                        f"{quote_command('空间回复 now')}",
+                    )
+                ],
+                icon=ICON_WARN,
+            )
+        )
 
     # ------------------------------------------------------------------
     # 指令：联网搜索（接入 AstrBot 自带能力）/ 日程 / 读说说
@@ -1604,14 +2016,25 @@ class QzonePublisherPlugin(Star):
         if not text:
             _, reason = self.web.readiness()
             yield event.plain_result(
-                f"联网素材开关: {'开' if self.cfg.web_search_enabled else '关'}\n"
-                f"AstrBot 联网搜索: {reason}\n"
-                "用法: /空间搜索 关键词 —— 直接用 AstrBot 的联网搜索跑一条，"
-                "用来确认接入是否正常（不会发说说）"
+                plain_receipt(
+                    "联网素材",
+                    [
+                        kv("开关", "开" if self.cfg.web_search_enabled else "关"),
+                        kv("AstrBot 联网搜索", reason),
+                        kv(
+                            "用法",
+                            f"{quote_command('空间搜索 关键词')}"
+                            "跑一条搜索，用来确认接入是否正常（不会发说说）",
+                        ),
+                    ],
+                    icon=ICON_INFO,
+                )
             )
             return
 
-        yield event.plain_result(f"正在联网搜索：{text}")
+        yield event.plain_result(
+            plain_receipt("正在联网搜索", [kv("关键词", text)], icon=ICON_INFO)
+        )
         outcome = await self.web.search(
             text,
             count=int(self.cfg.web_search_count or 5),
@@ -1619,14 +2042,25 @@ class QzonePublisherPlugin(Star):
         )
         if not outcome:
             yield event.plain_result(
-                f"搜索失败：{outcome.error}\n"
-                "（提示：服务商与密钥都在 AstrBot 面板的「联网搜索」里配置，"
-                "插件只负责调用）"
+                plain_receipt(
+                    "搜索失败",
+                    [
+                        kv("原因", outcome.error),
+                        kv(
+                            "提示",
+                            "服务商与密钥都在 AstrBot 面板的「联网搜索」里配置，"
+                            "插件只负责调用",
+                        ),
+                    ],
+                    icon=ICON_FAIL,
+                )
             )
             return
-        yield event.plain_result(
-            f"搜到 {len(outcome.hits)} 条：\n{self.web.format_hits(outcome.hits)}"
-        )
+        section = Section(icon=ICON_OK, label="搜索完成")
+        section.add(kv("条数", f"{len(outcome.hits)} 条"))
+        for hit in self.web.format_hits(outcome.hits).splitlines():
+            section.add(f"  {hit}")
+        yield event.plain_result(section.text())
 
     @filter.command("空间日程", alias={"space life", "qz life"})
     async def cmd_life(self, event: AstrMessageEvent, action: GreedyStr = ""):
@@ -1640,26 +2074,40 @@ class QzonePublisherPlugin(Star):
         try:
             state = await self.life.get_state(force=force)
         except Exception as e:
-            yield event.plain_result(f"获取生活日程失败：{e}")
+            yield event.plain_result(
+                plain_receipt("读取日程失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
 
         if state is None:
             yield event.plain_result(
-                "没有拿到今日日程：请先检查 AstrBot 里是否配置了可用的 LLM 提供商"
+                plain_receipt(
+                    "没有拿到日程",
+                    [kv("说明", "请先检查 AstrBot 里是否配置了可用的 LLM 提供商")],
+                    icon=ICON_WARN,
+                )
             )
             return
 
         if state.status != "ok":
             yield event.plain_result(
-                "今日日程生成失败（通常是 AI 不可用），详情见 AstrBot 日志"
+                plain_receipt(
+                    "日程生成失败",
+                    [kv("原因", "通常是 AI 不可用"), kv("详情", "见 AstrBot 日志")],
+                    icon=ICON_WARN,
+                )
             )
             return
 
-        yield event.plain_result(
-            f"【{state.date} 生活状态】（当前时段: {time_desc()}）\n"
-            f"穿搭：{state.outfit}\n"
-            f"日程：{state.schedule}"
+        section = Section(
+            icon=ICON_INFO, label="今日生活状态", title_extra=f"（{state.date}）"
         )
+        section.add(
+            kv("当前时段", time_desc()),
+            kv("穿搭", state.outfit),
+            kv("日程", state.schedule),
+        )
+        yield event.plain_result(section.text())
 
     @filter.command("私聊开", alias={"space pm on", "qz pm on"})
     async def cmd_pm_on(self, event: AstrMessageEvent, action: GreedyStr = ""):
@@ -1702,7 +2150,7 @@ class QzonePublisherPlugin(Star):
                 if enable
                 else "已记录：不接受主动消息，功能全部关闭"
             )
-            return f"{note}\n{self._pm_text(qq)}"
+            return f"{plain_receipt(note, icon=ICON_OK)}\n{self._pm_text(qq)}"
 
         feature = self._feature_of(head)
         if feature is None:
@@ -1712,17 +2160,18 @@ class QzonePublisherPlugin(Star):
                 if state == "未回答"
                 else f"你的状态保持为{state}，未做任何改动"
             )
-            return (
-                f"未识别该功能名「{arg}」，{kept}。\n"
-                f"可用的功能名：早安、晚安、节日、闲聊。\n{self._pm_text(qq)}"
-            )
+            detail = kv("说明", f"未识别该功能名「{arg}」，{kept}")
+            hint = kv("可用的功能名", "早安、晚安、节日、闲聊")
+            head = plain_receipt("参数无法识别", [detail, hint], icon=ICON_WARN)
+            return f"{head}\n{self._pm_text(qq)}"
 
         self.prefs.set_feature(qq, feature, enable)
         if enable:
             # 明确要求开启某一项，等同于接受（否则开了也收不到）
             self.prefs.set_opted_in(qq, True)
         label = FEATURE_LABELS[feature]
-        return f"已{'开启' if enable else '关闭'}{label}\n{self._pm_text(qq)}"
+        head = f"已{'开启' if enable else '关闭'}{label}"
+        return f"{plain_receipt(head, icon=ICON_OK)}\n{self._pm_text(qq)}"
 
     @staticmethod
     def _pm_usage(state: str = "") -> str:
@@ -1731,11 +2180,20 @@ class QzonePublisherPlugin(Star):
             "已接受": "想全部停掉就用 /私聊关（只想停某一项就用 /私聊关 晚安）",
             "已拒绝": "想重新接收就用 /私聊开（只想开某一项就用 /私聊开 晚安）",
         }.get(state, "/私聊开 或 /私聊关")
-        return (
-            "用法: /私聊开 开启全部｜/私聊关 关闭全部｜"
-            "/私聊开 早安|晚安|节日|闲聊 只开某一项｜"
-            "/私聊关 早安|晚安|节日|闲聊 只关某一项\n"
-            f"随时可以改回来：{back}"
+        return "\n".join(
+            [
+                kv(
+                    "用法",
+                    f"{quote_command('私聊开')}开启全部｜"
+                    f"{quote_command('私聊关')}关闭全部",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('私聊开 早安')}只开某一项｜"
+                    f"{quote_command('私聊关 晚安')}只关某一项",
+                ),
+                kv("随时可以改回来", back),
+            ]
         )
 
     @staticmethod
@@ -1762,19 +2220,22 @@ class QzonePublisherPlugin(Star):
         """拼本人主动消息设置的展示文本。"""
         user = self.prefs.get(qq)
         state = UserPrefStore.state_text(user)
-        lines = [
-            f"当前状态（{qq}）: {state}",
-            f"功能开关: {UserPrefStore.features_text(user)}",
-            "时间段（由管理员设置，只读）: "
-            f"早安 {describe_cron(self.cfg.greet_morning_cron)}"
-            f"｜晚安 {describe_cron(self.cfg.greet_night_cron)}"
-            f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}"
-            f"｜日常闲聊 {describe_windows(self.greet.chat_windows)}",
-        ]
+        section = Section(icon=ICON_INFO, label="我的接收设置")
+        section.add(
+            kv("当前状态", f"{state}（{qq}）"),
+            kv("功能开关", UserPrefStore.features_text(user)),
+            kv(
+                "时间段（由管理员设置，只读）",
+                f"早安 {describe_cron(self.cfg.greet_morning_cron)}"
+                f"｜晚安 {describe_cron(self.cfg.greet_night_cron)}"
+                f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}"
+                f"｜日常闲聊 {describe_windows(self.greet.chat_windows)}",
+            ),
+        )
         if state == "未回答":
-            lines.append("说明: 未回答视为不接受，不会收到任何主动消息")
-        lines.append(self._pm_usage(state))
-        return "\n".join(lines)
+            section.add(kv("说明", "未回答视为不接受，不会收到任何主动消息"))
+        section.add(*self._pm_usage(state).splitlines())
+        return section.text()
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间读说说", alias={"space read", "qz read"})
@@ -1785,16 +2246,40 @@ class QzonePublisherPlugin(Star):
         lines: list[str] = []
 
         if self.interact.targets:
-            yield event.plain_result("正在巡检好友说说...")
+            yield event.plain_result(
+                plain_receipt(
+                    "正在巡检",
+                    [kv("范围", "好友说说，请稍候")],
+                    icon=ICON_INFO,
+                )
+            )
             result = await self.interact.run_once(force=force_flag)
-            lines.append(f"巡检完成：{result.summary()}")
+            lines.append(
+                plain_receipt("巡检完成", result.summary().splitlines(), icon=ICON_OK)
+            )
         else:
-            lines.append("还没配置关注对象：请在插件配置的 interact_uins 里填 QQ 号")
+            lines.append(
+                plain_receipt(
+                    "没有巡检对象",
+                    [kv("说明", "请在插件配置的 interact_uins 里填 QQ 号")],
+                    icon=ICON_WARN,
+                )
+            )
 
         if bool(self.cfg.interact_reply_enabled):
-            yield event.plain_result("正在检查自己说说下的新评论...")
+            yield event.plain_result(
+                plain_receipt(
+                    "正在巡检",
+                    [kv("范围", "自己说说下的评论，请稍候")],
+                    icon=ICON_INFO,
+                )
+            )
             reply = await self.interact.run_replies_once(force=force_flag)
-            lines.append(f"评论回复完成：{reply.summary()}")
+            lines.append(
+                plain_receipt(
+                    "评论回复完成", reply.summary().splitlines(), icon=ICON_OK
+                )
+            )
 
         yield event.plain_result("\n".join(lines))
 
@@ -1815,20 +2300,39 @@ class QzonePublisherPlugin(Star):
         qqs, source = self._admin_qqs()
 
         if not args:
-            yield event.plain_result(
-                f"管理员名单: {'、'.join(qqs) if qqs else '（空）'}\n"
-                f"来源: {source}\n"
-                "用法: /空间管理员 add 123456 或 /空间管理员 remove 123456\n"
-                "说明: 这里只影响草稿确认与通知发给谁；"
-                "指令权限由 AstrBot 配置里的 admins_id 决定（插件不绕过它）"
+            section = Section(icon=ICON_INFO, label="管理员名单")
+            section.add(
+                kv("当前名单", "、".join(qqs) or "（空）"),
+                kv("来源", source),
+                kv(
+                    "用法",
+                    f"{quote_command('空间管理员 add 123456')}加入｜"
+                    f"{quote_command('空间管理员 remove 123456')}移除",
+                ),
+                kv(
+                    "说明",
+                    "这里只影响草稿确认与通知发给谁；指令权限由 AstrBot 配置里的"
+                    " admins_id 决定（插件不绕过它）",
+                ),
             )
+            yield event.plain_result(section.text())
             return
 
         sub = args[0].lower()
         targets = [item for item in args[1:] if item.strip()]
         if sub not in {"add", "remove", "del", "delete", "加", "删"} or not targets:
             yield event.plain_result(
-                "用法: /空间管理员 add 123456 或 /空间管理员 remove 123456"
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv(
+                            "用法",
+                            f"{quote_command('空间管理员 add 123456')}或"
+                            f"{quote_command('空间管理员 remove 123456')}",
+                        )
+                    ],
+                    icon=ICON_WARN,
+                )
             )
             return
 
@@ -1839,7 +2343,13 @@ class QzonePublisherPlugin(Star):
         ]
         bad = [item for item in targets if not item.isdigit()]
         if bad:
-            yield event.plain_result(f"这些不是纯数字 QQ 号：{'、'.join(bad)}")
+            yield event.plain_result(
+                plain_receipt(
+                    "名单有误",
+                    [kv("不是 QQ 号", "、".join(bad))],
+                    icon=ICON_FAIL,
+                )
+            )
             return
 
         if sub in {"add", "加"}:
@@ -1859,7 +2369,17 @@ class QzonePublisherPlugin(Star):
 
         self.cfg.set("admin_uins", current)
         yield event.plain_result(
-            f"{message}\n当前名单: {'、'.join(current) or '（空，将回退用 AstrBot 的 admins_id）'}"
+            plain_receipt(
+                "管理员名单已更新",
+                [
+                    kv("结果", message),
+                    kv(
+                        "当前名单",
+                        "、".join(current) or "（空，将回退用 AstrBot 的 admins_id）",
+                    ),
+                ],
+                icon=ICON_OK,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -1878,11 +2398,17 @@ class QzonePublisherPlugin(Star):
             night = self.greet.slot_of("night")
             upcoming = days_until(datetime.now(self.cfg.timezone).date())
             require_optin = bool(self.cfg.active_msg_require_optin)
-            lines = [
-                f"问候开关: {'开' if bool(self.cfg.greet_enabled) else '关'}"
-                f"｜内容来源: {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
-                f"｜收件人: {'已同意的用户' if require_optin else 'greet_users'}"
-            ]
+            section = Section(icon=ICON_INFO, label="定时问候")
+            section.add(
+                kv(
+                    "问候开关",
+                    f"{'开' if bool(self.cfg.greet_enabled) else '关'}"
+                    f"｜内容来源 "
+                    f"{'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}"
+                    f"｜收件人 "
+                    f"{'已同意的用户' if require_optin else 'greet_users'}",
+                )
+            )
             for slot, task in (
                 (morning, self.greet_morning_task),
                 (night, self.greet_night_task),
@@ -1890,32 +2416,49 @@ class QzonePublisherPlugin(Star):
                 if slot is None:
                     continue
                 slot_targets = self._feature_targets(slot.key)
-                lines.append(
-                    f"{slot.name}: {task.cron or '未设置'}"
-                    f"（下次 {task.next_run_time}）"
-                    f"｜本次将发给 {len(slot_targets)} 人（已同意）"
+                section.add(
+                    kv(
+                        f"{slot.name}问候",
+                        f"{task.cron or '未设置'}（下次 {task.next_run_time}）"
+                        f"｜本次将发给 {len(slot_targets)} 人（已同意）",
+                    )
                 )
                 if bool(self.cfg.greet_enabled) and not slot_targets:
-                    lines.append(f"　⚠️ {self._no_consent_note(slot.name, slot.key)}")
+                    section.add(kv("提醒", self._no_consent_note(slot.name, slot.key)))
             holiday_targets = self._feature_targets(HOLIDAY_KEY)
-            lines.append(
-                f"节日祝福: {'开' if bool(self.cfg.holiday_enabled) else '关'}"
-                f"｜{self.greet_holiday_status(upcoming)}"
-                f"｜本次将发给 {len(holiday_targets)} 人（已同意）"
+            section.add(
+                kv(
+                    "节日祝福",
+                    f"{'开' if bool(self.cfg.holiday_enabled) else '关'}"
+                    f"｜{self.greet_holiday_status(upcoming)}"
+                    f"｜本次将发给 {len(holiday_targets)} 人（已同意）",
+                )
             )
             if bool(self.cfg.holiday_enabled) and not holiday_targets:
-                lines.append(f"　⚠️ {self._no_consent_note('节日祝福', HOLIDAY_KEY)}")
-            lines.append(
-                f"主动消息同意: {'需要' if require_optin else '不需要'}"
-                "（用户可用 /私聊开 或 /私聊关 自行设置）"
+                section.add(kv("提醒", self._no_consent_note("节日祝福", HOLIDAY_KEY)))
+            section.add(
+                kv(
+                    "主动消息同意",
+                    f"{'需要' if require_optin else '不需要'}"
+                    f"（用户可用{quote_command('私聊开')}或"
+                    f"{quote_command('私聊关')}自行设置）",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('空间问候 on')}或"
+                    f"{quote_command('空间问候 off')}开关定时问候",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('空间问候 morning 123456')}立刻发一条给指定 QQ"
+                    "（忽略当日去重，不受主动消息偏好限制）",
+                ),
+                kv(
+                    "用法",
+                    f"{quote_command('空间问候 holiday')}测试节日祝福",
+                ),
             )
-            lines.append(
-                "用法: /空间问候 on|off 开关定时问候；"
-                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试"
-                "（忽略当日去重，且不受主动消息偏好限制）；"
-                "/空间问候 holiday 测试节日祝福"
-            )
-            yield event.plain_result("\n".join(lines))
+            yield event.plain_result(section.text())
             return
 
         flag = parts[0].lower()
@@ -1927,60 +2470,124 @@ class QzonePublisherPlugin(Star):
                 night_cron = self.greet_night_task.reconfigure(enabled=True)
                 if not morning_cron and not night_cron:
                     yield event.plain_result(
-                        "已开启，但 greet_morning_cron / greet_night_cron 都是空的，"
-                        "请先设置时间"
+                        plain_receipt(
+                            "定时问候已开启",
+                            [
+                                kv("提醒", "早安与晚安的时间都为空"),
+                                kv(
+                                    "用法", "请先在面板里设置「早安时间」与「晚安时间」"
+                                ),
+                            ],
+                            icon=ICON_WARN,
+                        )
                     )
                     return
                 yield event.plain_result(
-                    f"定时问候已开启\n"
-                    f"早安: {morning_cron or '未设置'}（下次 {self.greet_morning_task.next_run_time}）"
-                    f"｜本次将发给 {len(self._feature_targets('morning'))} 人（已同意）\n"
-                    f"晚安: {night_cron or '未设置'}（下次 {self.greet_night_task.next_run_time}）"
-                    f"｜本次将发给 {len(self._feature_targets('night'))} 人（已同意）"
+                    plain_receipt(
+                        "定时问候已开启",
+                        [
+                            kv(
+                                "早安问候",
+                                f"{morning_cron or '未设置'}"
+                                f"（下次 {self.greet_morning_task.next_run_time}）"
+                                f"｜本次将发给 "
+                                f"{len(self._feature_targets('morning'))} 人（已同意）",
+                            ),
+                            kv(
+                                "晚安问候",
+                                f"{night_cron or '未设置'}"
+                                f"（下次 {self.greet_night_task.next_run_time}）"
+                                f"｜本次将发给 "
+                                f"{len(self._feature_targets('night'))} 人（已同意）",
+                            ),
+                        ],
+                        icon=ICON_OK,
+                    )
                 )
                 return
 
             self.greet_morning_task.reconfigure(enabled=False)
             self.greet_night_task.reconfigure(enabled=False)
-            yield event.plain_result("定时问候已关闭")
+            yield event.plain_result(plain_receipt("定时问候已关闭", icon=ICON_WARN))
             return
 
         is_holiday = flag in {"holiday", "节日", "节日祝福"}
         slot = self.greet.slot_of(flag)
         if slot is None and not is_holiday:
             yield event.plain_result(
-                "用法: /空间问候 on|off，或 /空间问候 morning 123456，"
-                "或 /空间问候 holiday"
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv(
+                            "用法",
+                            f"{quote_command('空间问候 on')}或"
+                            f"{quote_command('空间问候 off')}开关定时问候",
+                        ),
+                        kv(
+                            "用法",
+                            f"{quote_command('空间问候 morning 123456')}立刻发一条给指定 QQ｜"
+                            f"{quote_command('空间问候 holiday')}测试节日祝福",
+                        ),
+                    ],
+                    icon=ICON_WARN,
+                )
             )
             return
 
         targets = [item for item in parts[1:] if item.isdigit()]
         if not targets and not self.greet.targets:
             yield event.plain_result(
-                "没指定 QQ 号，且 greet_users 也是空的："
-                "请用 /空间问候 morning 123456 指定一个"
+                plain_receipt(
+                    "没有发送对象",
+                    [
+                        kv("原因", "没指定 QQ 号，且 greet_users 也是空的"),
+                        kv(
+                            "用法",
+                            f"{quote_command('空间问候 morning 123456')}指定一个",
+                        ),
+                    ],
+                    icon=ICON_WARN,
+                )
             )
             return
 
         if is_holiday:
             who = "、".join(targets) if targets else "配置里的对象"
             yield event.plain_result(
-                f"正在发送节日祝福给 {who}"
-                "（测试发送：忽略今天是否节日、忽略当日去重，不受主动消息偏好限制）..."
+                plain_receipt(
+                    "正在发送节日祝福",
+                    [
+                        kv("对象", who),
+                        kv(
+                            "说明",
+                            "测试发送：忽略今天是否节日、忽略当日去重，"
+                            "不受主动消息偏好限制",
+                        ),
+                    ],
+                    icon=ICON_INFO,
+                )
             )
             try:
                 result = await self.greet.send_holiday(
                     targets=targets or None, force=True, record=False, check_optin=False
                 )
             except Exception as e:
-                yield event.plain_result(f"发送失败：{e}")
+                yield event.plain_result(
+                    plain_receipt("发送失败", [kv("原因", e)], icon=ICON_FAIL)
+                )
                 return
             yield event.plain_result(self._greet_result_text("节日祝福", result))
             return
 
         yield event.plain_result(
-            f"正在发送{slot.name}问候给 {'、'.join(targets) if targets else '配置里的对象'}"
-            "（管理员手动发送，不受主动消息偏好限制）..."
+            plain_receipt(
+                f"正在发送{slot.name}问候",
+                [
+                    kv("对象", "、".join(targets) if targets else "配置里的对象"),
+                    kv("说明", "管理员手动发送，不受主动消息偏好限制"),
+                ],
+                icon=ICON_INFO,
+            )
         )
         try:
             # 手动发送不写「今日已问候」记录：否则会把当天的定时问候名额用掉，
@@ -1994,7 +2601,9 @@ class QzonePublisherPlugin(Star):
                 check_optin=False,
             )
         except Exception as e:
-            yield event.plain_result(f"发送失败：{e}")
+            yield event.plain_result(
+                plain_receipt("发送失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
 
         yield event.plain_result(self._greet_result_text(f"{slot.name}问候", result))
@@ -2011,23 +2620,44 @@ class QzonePublisherPlugin(Star):
             windows = self.greet.chat_windows
             today = datetime.now(self.cfg.timezone).date()
             targets = self._feature_targets(CHAT_KEY)
-            lines = [
-                f"主动闲聊: {'开启' if bool(self.cfg.chat_open_enabled) else '关闭'}",
-                f"时间窗口: {describe_windows(windows)}"
-                "（在每个窗口内随机取一个时刻发送）",
-                f"每天上限: {self.greet.chat_per_day} 条｜每次只发 1 人"
-                "｜同一个人每天最多 1 条",
-                f"收件人: {'已同意的用户' if require_optin else 'greet_users'}"
-                f"｜本次将发给 {len(targets)} 人（已同意）",
-                f"今日已发: {self.greet.sent_today(self.greet.chat_slot_key(today))} 人"
-                f"｜下一个窗口: {self.next_chat_window_text()}",
-                "说明: 主动闲聊是私聊内容且已获对方同意，不经过草稿确认",
-                "用法: /空间闲聊 on|off 开关；"
-                "/空间闲聊 now 立刻发一条测试（忽略时间窗口与当日去重）",
-            ]
+            section = Section(icon=ICON_INFO, label="主动闲聊")
+            section.add(
+                kv(
+                    "开关",
+                    "开启" if bool(self.cfg.chat_open_enabled) else "关闭",
+                ),
+                kv(
+                    "时间窗口",
+                    f"{describe_windows(windows)}（在每个窗口内随机取一个时刻发送）",
+                ),
+                kv(
+                    "每天上限",
+                    f"{self.greet.chat_per_day} 条｜每次只发 1 人"
+                    "｜同一个人每天最多 1 条",
+                ),
+                kv(
+                    "收件人",
+                    f"{'已同意的用户' if require_optin else 'greet_users'}"
+                    f"｜本次将发给 {len(targets)} 人（已同意）",
+                ),
+                kv(
+                    "今日已发",
+                    f"{self.greet.sent_today(self.greet.chat_slot_key(today))} 人"
+                    f"｜下一个窗口 {self.next_chat_window_text()}",
+                ),
+                kv("说明", "主动闲聊是私聊内容且已获对方同意，不经过草稿确认"),
+                kv(
+                    "用法",
+                    f"{quote_command('空间闲聊 on')}或"
+                    f"{quote_command('空间闲聊 off')}开关主动闲聊；"
+                    f"{quote_command('空间闲聊 now')}立刻发一条测试",
+                ),
+            )
             if bool(self.cfg.chat_open_enabled) and not windows:
-                lines.append("　⚠️ 没有可用的时间窗口，请在配置里按 HH:MM-HH:MM 填写")
-            yield event.plain_result("\n".join(lines))
+                section.add(
+                    kv("提醒", "没有可用的时间窗口，请在配置里按 HH:MM-HH:MM 填写")
+                )
+            yield event.plain_result(section.text())
             return
 
         flag = parts[0].lower()
@@ -2037,26 +2667,59 @@ class QzonePublisherPlugin(Star):
             crons = self._rebuild_chat_tasks()
             windows = self.greet.chat_windows
             if not enabled:
-                yield event.plain_result("主动闲聊已关闭")
+                yield event.plain_result(
+                    plain_receipt("主动闲聊已关闭", icon=ICON_WARN)
+                )
                 return
             if not windows:
                 yield event.plain_result(
-                    "已开启，但没有可用的时间窗口："
-                    "请在「主动闲聊的时间窗口」里按 HH:MM-HH:MM 填写"
+                    plain_receipt(
+                        "主动闲聊已开启",
+                        [
+                            kv("提醒", "没有可用的时间窗口"),
+                            kv(
+                                "用法",
+                                "请在「主动闲聊的时间窗口」里按 HH:MM-HH:MM 填写",
+                            ),
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
                 return
             yield event.plain_result(
-                f"主动闲聊已开启\n"
-                f"时间窗口: {describe_windows(windows)}｜每天最多 "
-                f"{self.greet.chat_per_day} 条\n"
-                f"下次执行: {self.next_chat_window_text()}"
-                f"（已排期 {len([item for item in crons if item])} 个窗口）"
+                plain_receipt(
+                    "主动闲聊已开启",
+                    [
+                        kv(
+                            "时间窗口",
+                            f"{describe_windows(windows)}｜每天最多 "
+                            f"{self.greet.chat_per_day} 条",
+                        ),
+                        kv(
+                            "下次执行",
+                            f"{self.next_chat_window_text()}（已排期 "
+                            f"{len([item for item in crons if item])} 个窗口）",
+                        ),
+                    ],
+                    icon=ICON_OK,
+                )
             )
             return
 
         if flag not in _NOW_FLAGS:
             yield event.plain_result(
-                "用法: /空间闲聊 on|off，或 /空间闲聊 now 立刻发一条测试"
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv(
+                            "用法",
+                            f"{quote_command('空间闲聊 on')}或"
+                            f"{quote_command('空间闲聊 off')}开关；"
+                            f"{quote_command('空间闲聊 now')}立刻发一条测试",
+                        )
+                    ],
+                    icon=ICON_WARN,
+                )
             )
             return
 
@@ -2067,19 +2730,32 @@ class QzonePublisherPlugin(Star):
                 if require_optin
                 else "没有可发送对象：请在配置里填写对象"
             )
-            yield event.plain_result(f"主动闲聊没有发送：{note}")
+            yield event.plain_result(
+                plain_receipt("主动闲聊没有发送", [kv("原因", note)], icon=ICON_WARN)
+            )
             return
 
         yield event.plain_result(
-            f"正在给 {len(targets)} 个对象里的一位发送一条测试搭话"
-            "（忽略时间窗口与当日去重，仍遵守主动消息同意设置）..."
+            plain_receipt(
+                "正在发送测试搭话",
+                [
+                    kv("对象", f"{len(targets)} 个已同意对象中的一位"),
+                    kv(
+                        "说明",
+                        "忽略时间窗口与当日去重，仍遵守主动消息同意设置",
+                    ),
+                ],
+                icon=ICON_INFO,
+            )
         )
         try:
             result = await self.greet.send_chat_open(
                 targets=targets, force=True, record=False
             )
         except Exception as e:
-            yield event.plain_result(f"发送失败：{e}")
+            yield event.plain_result(
+                plain_receipt("发送失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
         yield event.plain_result(self._greet_result_text("主动闲聊", result))
 
@@ -2094,14 +2770,18 @@ class QzonePublisherPlugin(Star):
         Returns:
             多行回执文本。
         """
-        lines = [f"{name}：{result.summary()}"]
+        lines = result.summary().splitlines()
         if result.targets_used:
             lines.append(
-                "发送地址: "
-                + "；".join(f"{qq} → {umo}" for qq, umo in result.targets_used.items())
+                kv(
+                    "发送地址",
+                    "；".join(
+                        f"{qq} → {umo}" for qq, umo in result.targets_used.items()
+                    ),
+                )
             )
-        lines.append(f"内容：{result.text}")
-        return "\n".join(lines)
+        lines.append(kv("内容", result.text))
+        return plain_receipt(name, lines, icon=ICON_OK)
 
     # ------------------------------------------------------------------
     # 指令：草稿确认
@@ -2115,16 +2795,33 @@ class QzonePublisherPlugin(Star):
         try:
             span = int(str(days).strip() or 1)
         except ValueError:
-            yield event.plain_result("用法: /空间用量 [天数]，例如 /空间用量 7")
+            yield event.plain_result(
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv(
+                            "用法",
+                            f"{quote_command('空间用量')}默认看今天，"
+                            f"{quote_command('空间用量 7')}看最近 7 天",
+                        )
+                    ],
+                    icon=ICON_WARN,
+                )
+            )
             return
         span = min(max(span, 1), 60)
 
-        yield event.plain_result(
-            "【AI 用量估算】\n"
-            + self.ai.usage.format_summary(span, indent="　")
-            + "\n\n说明：按文本长度粗估（中文约 0.7 token/字），"
-            "与实际计费存在 ±20% 左右误差，仅供心里有数。"
+        section = Section(icon=ICON_INFO, label="AI 用量估算")
+        for line in self.ai.usage.format_summary(span, indent="").splitlines():
+            section.add(f"  {line}" if line.strip() else line)
+        section.add(
+            kv(
+                "说明",
+                "按文本长度粗估（中文约 0.7 token/字），与实际计费存在 ±20% 左右误差，"
+                "仅供心里有数",
+            )
         )
+        yield event.plain_result(section.text())
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间确认", alias={"space ok", "qz ok"})
@@ -2134,15 +2831,29 @@ class QzonePublisherPlugin(Star):
         self._cancel_draft_timer()
         draft = self.drafts.pop()
         if draft is None:
-            yield event.plain_result("当前没有待确认的草稿")
+            yield event.plain_result(
+                plain_receipt(
+                    "没有待确认的草稿",
+                    [kv("说明", "当前草稿箱是空的")],
+                    icon=ICON_INFO,
+                )
+            )
             return
 
-        yield event.plain_result(f"正在发布{draft.title()}...")
+        yield event.plain_result(
+            plain_receipt("正在发布", [kv("草稿", draft.title())], icon=ICON_INFO)
+        )
         try:
             message = await self._confirm_draft(draft)
         except Exception as e:
             self.drafts.put(draft)
-            yield event.plain_result(f"发布失败：{e}\n草稿已保留，修正后可再 /空间确认")
+            yield event.plain_result(
+                plain_receipt(
+                    "发布失败",
+                    [kv("原因", e), kv("说明", "草稿已保留，修正后可再确认")],
+                    icon=ICON_FAIL,
+                )
+            )
             return
 
         yield event.plain_result(message)
@@ -2153,9 +2864,15 @@ class QzonePublisherPlugin(Star):
         """丢弃当前草稿"""
         self._cancel_draft_timer()
         if not self.drafts.clear():
-            yield event.plain_result("当前没有待确认的草稿")
+            yield event.plain_result(
+                plain_receipt(
+                    "没有待确认的草稿",
+                    [kv("说明", "当前草稿箱是空的")],
+                    icon=ICON_INFO,
+                )
+            )
             return
-        yield event.plain_result("草稿已丢弃")
+        yield event.plain_result(plain_receipt("草稿已丢弃", icon=ICON_WARN))
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间重写", alias={"space redo", "qz redo"})
@@ -2164,10 +2881,22 @@ class QzonePublisherPlugin(Star):
         self._remember_client(event)
         draft = self.drafts.pending
         if draft is None:
-            yield event.plain_result("当前没有待确认的草稿")
+            yield event.plain_result(
+                plain_receipt(
+                    "没有待确认的草稿",
+                    [kv("说明", "当前草稿箱是空的")],
+                    icon=ICON_INFO,
+                )
+            )
             return
 
-        yield event.plain_result("正在让 AI 重写草稿...")
+        yield event.plain_result(
+            plain_receipt(
+                "正在重写",
+                [kv("说明", "让 AI 再写一版草稿，请稍候")],
+                icon=ICON_INFO,
+            )
+        )
         try:
             if draft.kind == "comment":
                 text = await self.interact.rewrite_comment(draft)
@@ -2200,7 +2929,13 @@ class QzonePublisherPlugin(Star):
                     kind="post", text=text, source="rewrite", images=draft.images
                 )
         except Exception as e:
-            yield event.plain_result(f"重写失败：{e}\n原草稿仍保留")
+            yield event.plain_result(
+                plain_receipt(
+                    "重写失败",
+                    [kv("原因", e), kv("说明", "原草稿仍保留")],
+                    icon=ICON_FAIL,
+                )
+            )
             return
 
         self.drafts.put(new_draft)
@@ -2217,20 +2952,31 @@ class QzonePublisherPlugin(Star):
         records = self.store.recent(size)
 
         if not records:
-            yield event.plain_result("还没有发布记录")
+            yield event.plain_result(
+                plain_receipt(
+                    "暂无发布记录",
+                    [kv("说明", "还没有成功发布过说说")],
+                    icon=ICON_INFO,
+                )
+            )
             return
 
-        lines = [f"【最近 {len(records)} 条发布记录】"]
+        section = Section(
+            icon=ICON_INFO, label="发布记录", title_extra=f"（最近 {len(records)} 条）"
+        )
         for record in records:
             state = "成功" if record.ok else "失败"
             summary = (record.text or "").replace("\n", " ")[:40]
-            lines.append(
-                f"[{self._format_time(record.time)}] {state} "
-                f"来源={record.source} tid={record.tid or '-'} {summary}"
+            section.add(
+                kv(
+                    self._format_time(record.time),
+                    f"{state}｜来源 {record.source}｜tid "
+                    f"{record.tid or '-'}｜{summary}",
+                )
             )
             if not record.ok and record.error:
-                lines.append(f"    失败原因: {record.error}")
-        yield event.plain_result("\n".join(lines))
+                section.add(f"    {kv('失败原因', record.error)}")
+        yield event.plain_result(section.text())
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间删除", alias={"space delete", "qz delete"})
@@ -2239,16 +2985,33 @@ class QzonePublisherPlugin(Star):
         self._remember_client(event)
         target = str(tid).strip()
         if not target:
-            yield event.plain_result("用法：/空间删除 <tid>（可用 /空间历史 查看 tid）")
+            yield event.plain_result(
+                plain_receipt(
+                    "参数无效",
+                    [
+                        kv("用法", f"{quote_command('空间删除 <tid>')}删除指定说说"),
+                        kv("查 tid", f"可用{quote_command('空间历史')}查看"),
+                    ],
+                    icon=ICON_WARN,
+                )
+            )
             return
 
         try:
             resp = await self.api.delete(target)
         except Exception as e:
-            yield event.plain_result(f"删除失败：{e}")
+            yield event.plain_result(
+                plain_receipt("删除失败", [kv("原因", e)], icon=ICON_FAIL)
+            )
             return
 
         if resp.ok:
-            yield event.plain_result(f"已删除说说 {target}")
+            yield event.plain_result(
+                plain_receipt("删除成功", [kv("tid", target)], icon=ICON_OK)
+            )
         else:
-            yield event.plain_result(f"删除失败：{resp.message or resp.code}")
+            yield event.plain_result(
+                plain_receipt(
+                    "删除失败", [kv("原因", resp.message or resp.code)], icon=ICON_FAIL
+                )
+            )

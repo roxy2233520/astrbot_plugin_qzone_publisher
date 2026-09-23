@@ -33,6 +33,7 @@ from astrbot.api import logger
 
 from .config import PluginConfig
 from .holidays import as_date, festival_of, next_festival
+from .ui import kv
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
     from .llm import AIClient
@@ -225,15 +226,15 @@ class GreetResult:
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        """生成可读汇总。"""
-        parts = [f"成功 {self.sent} 人", f"跳过 {self.skipped} 人"]
+        """生成可读汇总（统一排版：首行为统计，其余为键值行）。"""
+        parts = [f"成功 {self.sent} 人，跳过 {self.skipped} 人"]
         if self.blocked:
-            parts.append(f"因未接受主动消息跳过 {self.blocked} 人")
+            parts.append(kv("因未接受主动消息跳过", f"{self.blocked} 人"))
         if not self.record:
-            parts.append("手动发送（不占用今日自动问候名额）")
-        text = "，".join(parts)
+            parts.append(kv("说明", "手动发送（不占用今日自动问候名额）"))
+        text = "\n".join(parts)
         if self.errors:
-            text += "\n" + "\n".join(f"⚠️ {item}" for item in self.errors[:5])
+            text += "\n" + "\n".join(kv("失败", item) for item in self.errors[:5])
         return text
 
 

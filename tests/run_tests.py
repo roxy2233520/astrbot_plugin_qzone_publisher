@@ -1023,13 +1023,13 @@ async def main() -> int:
     out = await collect(plugin.cmd_publish(image_event, "带图说说"))
     check(
         "附带图片时上传并发布",
-        any("图片: 1 张" in item for item in out),
+        any("图片：1 张" in item for item in out),
         str(out),
     )
 
     out = await collect(plugin.cmd_status(FakeEvent()))
     status_text = out[0]
-    check("状态指令显示登录态", "登录态: 正常" in status_text, status_text[:120])
+    check("状态指令显示登录态", "登录态：正常" in status_text, status_text[:120])
     check("状态指令显示内容来源", "内容来源" in status_text, status_text[:120])
 
     out = await collect(plugin.cmd_history(FakeEvent(), 3))
@@ -1960,7 +1960,7 @@ async def main() -> int:
     out = await collect(plugin.cmd_interact(FakeEvent(), ""))
     check(
         "互动指令展示模式",
-        any("说说互动当前为" in item for item in out),
+        any("说说互动" in item and "当前状态" in item for item in out),
         str(out)[:100],
     )
     out = await collect(plugin.cmd_interact(FakeEvent(), "off"))
@@ -2379,13 +2379,13 @@ async def main() -> int:
     out = await collect(plugin.cmd_search(FakeEvent(), ""))
     check(
         "不带参数时显示接入状态",
-        any("联网素材开关" in item and "AstrBot 联网搜索" in item for item in out),
+        any("开关：" in item and "AstrBot 联网搜索" in item for item in out),
         str(out)[:140],
     )
     out = await collect(plugin.cmd_search(FakeEvent(), "露营装备"))
     check(
         "搜索指令返回结果与链接",
-        any("搜到 2 条" in item and "news.example.com" in item for item in out),
+        any("条数：2 条" in item and "news.example.com" in item for item in out),
         str(out)[:160],
     )
     tavily_tool.error = RuntimeError("boom")
@@ -2455,14 +2455,18 @@ async def main() -> int:
         str(cfg_peek(admin_cfg, "admin_uins")),
     )
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "add abc"))
-    check("非数字 QQ 被拒绝", any("不是纯数字" in item for item in out), str(out)[:80])
+    check(
+        "非数字 QQ 被拒绝",
+        any("不是 QQ 号" in item and "abc" in item for item in out),
+        str(out)[:120],
+    )
     out = await collect(admin_plugin.cmd_admin(FakeEvent(), "乱写"))
     check("未知子命令给出用法", any("用法" in item for item in out), str(out)[:80])
 
     out = await collect(admin_plugin.cmd_status(FakeEvent()))
     check(
         "状态里显示管理员与来源",
-        any("管理员:" in item and "插件配置 admin_uins" in item for item in out),
+        any("管理员：" in item and "插件配置 admin_uins" in item for item in out),
         str(out)[:200],
     )
 
@@ -3083,8 +3087,9 @@ async def main() -> int:
     out = await collect(plugin.cmd_auto_publish(FakeEvent()))
     check(
         "手动自动发：直接发布并回报 tid",
-        any("手动自动发成功" in item for item in out)
-        and any("tid:" in item for item in out),
+        any("发布成功" in item for item in out)
+        and any("tid：" in item for item in out)
+        and any("手动自动发成功" in item for item in out),
         str(out)[:140],
     )
     check(
@@ -3354,11 +3359,13 @@ async def main() -> int:
     plugin.cfg.set("publish_cron", "0 8 * * 1")
     plugin.publish_task.reconfigure(times=[], per_day=1, cron="0 8 * * 1", enabled=True)
     schedule_text = plugin._schedule_text()
-    schedule_head = schedule_text.splitlines()[0]
+    schedule_line = next(
+        line for line in schedule_text.splitlines() if "自动发布" in line
+    )
     check(
         "状态里显示原 cron 而不是 08:30",
-        "0 8 * * 1" in schedule_head and "08:30" not in schedule_head,
-        schedule_head,
+        "0 8 * * 1" in schedule_line and "08:30" not in schedule_line,
+        schedule_line,
     )
     plugin.publish_task.stop()
 
@@ -3638,8 +3645,8 @@ async def main() -> int:
     out = await collect(plugin.cmd_reply(FakeEvent(), ""))
     check(
         "/空间回复 无参数显示状态",
-        any("回复评论当前为" in item for item in out)
-        and any("每轮最多" in item for item in out),
+        any("回复评论" in item and "当前状态" in item for item in out)
+        and any("每轮上限" in item for item in out),
         str(out)[:140],
     )
     out = await collect(plugin.cmd_reply(FakeEvent(), "off"))
@@ -3960,7 +3967,7 @@ async def main() -> int:
     )
     check(
         "汇总里写明未接受人数",
-        "因未接受主动消息跳过 1 人" in result.summary(),
+        "因未接受主动消息跳过：1 人" in result.summary(),
         result.summary(),
     )
     check(
@@ -3983,7 +3990,7 @@ async def main() -> int:
     out = await collect(plugin.cmd_status(FakeEvent()))
     check(
         "状态里显示主动消息同意情况",
-        any("主动消息同意:" in item and "已接受" in item for item in out),
+        any("主动消息同意：" in item and "已接受" in item for item in out),
         str(out)[:200],
     )
 
@@ -4193,7 +4200,7 @@ async def main() -> int:
     out = await collect(plugin.cmd_status(FakeEvent()))
     check(
         "状态里显示每天条数与时间点",
-        any("定时发布:" in item and "每天" in item for item in out),
+        any("定时发布：" in item and "每天" in item for item in out),
         str(out)[:200],
     )
     plugin.publish_task.stop()
@@ -4393,7 +4400,7 @@ async def main() -> int:
     out = await collect(plugin.cmd_status(FakeEvent()))
     check(
         "状态里显示节日祝福与下一个节日",
-        any("节日祝福:" in item and "下一个节日" in item for item in out),
+        any("节日祝福：" in item and "下一个节日" in item for item in out),
         str(out)[:220],
     )
 
@@ -4961,7 +4968,8 @@ async def main() -> int:
     check(
         "无参数时显示开关、窗口、上限、今日已发与下一个窗口",
         len(out) == 1
-        and "主动闲聊: 开启" in out[0]
+        and "主动闲聊" in out[0]
+        and "开关：开启" in out[0]
         and "12:00-13:30" in out[0]
         and "每天上限" in out[0]
         and "今日已发" in out[0]
@@ -5043,7 +5051,7 @@ async def main() -> int:
     check(
         "状态里新增主动闲聊一行",
         any(
-            "主动闲聊: " in item and "今日已发" in item and "下一个窗口" in item
+            "主动闲聊：" in item and "今日已发" in item and "下一个窗口" in item
             for item in out
         ),
         str([item for item in out if "主动闲聊" in item])[:200],
@@ -5487,7 +5495,7 @@ async def main() -> int:
     check(
         "状态里显示创作角度、时段与相似度",
         any("角度=" in item and "时段=" in item for item in out)
-        and any("避免重复: 参考最近" in item for item in out),
+        and any("避免重复：参考最近" in item for item in out),
         str([item for item in out if "角度=" in item or "避免重复" in item])[:240],
     )
 
@@ -5505,6 +5513,218 @@ async def main() -> int:
     plugin.cfg.set("publish_repeat_threshold", 60)
     plugin.ai.chat = original_content_chat
     plugin.store._records.clear()
+
+    # ==================================================================
+    print("\n[37] 统一排版（core/ui.py）")
+
+    _ui = _imp("core.ui")
+
+    check(
+        "状态符号只有四个",
+        _ui.ICONS == ("✅", "⚠️", "❌", "📌"),
+        str(_ui.ICONS),
+    )
+    check(
+        "分隔线为 8 个破折号",
+        _ui.DIVIDER == "────────" and len(_ui.DIVIDER) == 8,
+        f"{_ui.DIVIDER}({len(_ui.DIVIDER)})",
+    )
+    check(
+        "单条回执与状态区块的行数上限分别为 12 与 8",
+        _ui.LIMIT_RECEIPT == 12 and _ui.LIMIT_BLOCK_LINES == 8,
+        f"{_ui.LIMIT_RECEIPT}/{_ui.LIMIT_BLOCK_LINES}",
+    )
+
+    section = _ui.Section(
+        icon=_ui.ICON_OK, label="发布成功", lines=[_ui.kv("tid", "TID_1")]
+    )
+    check(
+        "区块标题为「符号 +【标签】」",
+        section.text().splitlines()[0] == "✅【发布成功】",
+        section.text().splitlines()[0],
+    )
+    check(
+        "键值行为「两个空格 + · + 名称：值」",
+        section.text().splitlines()[1] == "  · tid：TID_1",
+        repr(section.text().splitlines()[1]),
+    )
+    check(
+        "Markdown 版标题与键名都加粗",
+        section.markdown().splitlines()[0] == "**✅【发布成功】**"
+        and section.markdown().splitlines()[1] == "  · **tid**：TID_1",
+        str(section.markdown().splitlines()[:2]),
+    )
+    check(
+        "纯文本版不含任何 Markdown 标记",
+        not _ui.has_markdown(section.text()),
+        repr(section.text()),
+    )
+    check(
+        "Markdown 版确实含加粗标记",
+        _ui.has_markdown(section.markdown()) and "**" in section.markdown(),
+        repr(section.markdown()),
+    )
+
+    labelled = _ui.Section(icon=_ui.ICON_INFO, label="状态", title_extra="（2 项）")
+    check(
+        "区块标题可带补充说明",
+        labelled.text() == "📌【状态】（2 项）",
+        labelled.text(),
+    )
+
+    long_section = _ui.Section(icon=_ui.ICON_INFO, label="长内容")
+    for index in range(20):
+        long_section.add(_ui.kv(f"字段{index}", index))
+    limited = long_section.text(max_lines=8)
+    check(
+        "区块按行数上限截断并给出提示",
+        len(limited.splitlines()) == 8
+        and "已省略其余部分" in limited
+        and limited.splitlines()[-1].strip().startswith("·"),
+        f"{len(limited.splitlines())}/{limited.splitlines()[-1]}",
+    )
+    check(
+        "行数上限为 0 时不截断",
+        len(long_section.text(max_lines=0).splitlines()) == 21,
+        str(len(long_section.text(max_lines=0).splitlines())),
+    )
+
+    multi = [
+        _ui.Section(icon=_ui.ICON_OK, label="一", lines=[_ui.kv("a", 1)]),
+        _ui.Section(icon=_ui.ICON_WARN, label="二", lines=[_ui.kv("b", 2)]),
+    ]
+    plain_multi, markdown_multi = _ui.pair(multi, divider=True)
+    check(
+        "多区块输出在区块之间插入分隔线",
+        f"\n{_ui.DIVIDER}\n" in plain_multi,
+        plain_multi,
+    )
+    check(
+        "多区块的 Markdown 版同样分隔且加粗",
+        f"\n{_ui.DIVIDER}\n" in markdown_multi and "**✅【一】**" in markdown_multi,
+        markdown_multi,
+    )
+    check(
+        "pair 的两版内容一致（只有标记不同）",
+        _ui.plain(markdown_multi) == plain_multi,
+        f"{_ui.plain(markdown_multi)!r}/{plain_multi!r}",
+    )
+
+    check(
+        "指令名用直角引号包裹",
+        _ui.quote_command("空间发布") == "「/空间发布」"
+        and _ui.quote_command("/空间确定") == "「/空间确定」",
+        _ui.quote_command("空间发布"),
+    )
+    check(
+        "一行内最多给出两条指令",
+        _ui.command_line("空间确认", "空间放弃").count("「") == 2
+        and "另有" in _ui.command_line("空间确认", "空间放弃", "空间重写"),
+        _ui.command_line("空间确认", "空间放弃", "空间重写"),
+    )
+    check(
+        "plain() 能把 Markdown 标记降级为纯文本",
+        _ui.plain("**加粗** 与 `代码`") == "加粗 与 代码"
+        and _ui.plain("## 标题") == "标题",
+        f"{_ui.plain('**加粗** 与 `代码`')}/{_ui.plain('## 标题')}",
+    )
+    check(
+        "纯文本判定能识别列表与标题写法",
+        _ui.has_markdown("- 列表项")
+        and _ui.has_markdown("## 标题")
+        and not _ui.has_markdown("  · 名称：值"),
+        "列表/标题判定",
+    )
+    check(
+        "键值缺失时给出占位",
+        _ui.kv("空值", "") == "  · 空值：（空）",
+        _ui.kv("空值", ""),
+    )
+
+    # 实际回执：纯文本不带 Markdown，图片路径的 Markdown 版带加粗
+    record = PublishRecord(time=1700000000, text="排版测试的说说", tid="TID_UI")
+    record.uin = 123456
+    plain_receipt_text = plugin._format_record(record)
+    check(
+        "发布回执纯文本版可读且不含 Markdown 标记",
+        "✅【发布成功】" in plain_receipt_text
+        and "  · tid：TID_UI" in plain_receipt_text
+        and not _ui.has_markdown(plain_receipt_text),
+        plain_receipt_text,
+    )
+
+    draft_for_ui = Draft(
+        kind="reply",
+        text="排版测试的草稿正文",
+        source="interact",
+        target_name="小明",
+        target_text="原评论",
+        target_tid="TID_X",
+        target_comment_tid="CID_X",
+        target_comment_uin=10001,
+    )
+    draft_plain, draft_markdown = draft_for_ui.describe_pair()
+    check(
+        "草稿描述：纯文本版含关键信息且不含 Markdown 标记",
+        "📌【草稿待确认】" in draft_plain
+        and "被回复的评论" in draft_plain
+        and "空间确认" in draft_plain
+        and not _ui.has_markdown(draft_plain),
+        draft_plain[:200],
+    )
+    check(
+        "草稿描述：Markdown 版键名加粗而正文原样保留",
+        "**📌【草稿待确认】**" in draft_markdown
+        and "排版测试的草稿正文" in draft_markdown,
+        draft_markdown[:200],
+    )
+    check(
+        "草稿正文不参与排版加工",
+        draft_plain.endswith("排版测试的草稿正文"),
+        draft_plain.splitlines()[-1],
+    )
+
+    status_out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态输出分成多个带符号的区块",
+        "📌【" in status_out[0] and _ui.DIVIDER in status_out[0],
+        status_out[0][:160],
+    )
+    check(
+        "状态纯文本版不含 Markdown 标记",
+        not _ui.has_markdown(status_out[0]),
+        status_out[0][:160],
+    )
+    check(
+        "状态每个区块不超过 8 行",
+        all(
+            len(block.strip().splitlines()) <= 8
+            for block in status_out[0].split(_ui.DIVIDER)
+            if block.strip()
+        ),
+        str([len(b.strip().splitlines()) for b in status_out[0].split(_ui.DIVIDER)]),
+    )
+
+    usage_note = plugin._usage_note()
+    check(
+        "用量提示为区块且不含 Markdown 标记",
+        (not usage_note)
+        or (
+            "📌【用量估算】" in usage_note
+            and "本次生成约用" in usage_note
+            and not _ui.has_markdown(usage_note)
+        ),
+        repr(usage_note),
+    )
+
+    guidance = plugin._guidance_text()
+    check(
+        "首次引导也是区块排版且不超过 6 行",
+        guidance.splitlines()[0] == "📌【主动消息说明】"
+        and len(guidance.splitlines()) <= 6
+        and not _ui.has_markdown(guidance),
+        guidance[:120],
+    )
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

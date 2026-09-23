@@ -30,6 +30,7 @@ from .config import PluginConfig
 from .draft import Draft, DraftBox
 from .llm import AIClient
 from .qzone import FeedComment, FeedPost, QzoneAPI, QzoneParser
+from .ui import kv
 
 _SEEN_LIMIT = 1000
 
@@ -57,20 +58,18 @@ class InteractResult:
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        """生成可读汇总。"""
+        """生成可读汇总（统一排版：首行为统计，其余为键值行）。"""
         parts = [
-            f"检查 {self.checked} 条",
-            f"跳过 {self.skipped} 条",
-            f"点赞 {self.liked} 条",
-            f"评论 {self.commented} 条",
+            f"检查 {self.checked} 条，跳过 {self.skipped} 条，"
+            f"点赞 {self.liked} 条，评论 {self.commented} 条"
         ]
         if self.drafted:
-            parts.append(f"转草稿 {self.drafted} 条")
+            parts.append(kv("转草稿", f"{self.drafted} 条"))
         if self.stale:
-            parts.append(f"{self.stale} 人最近一条超出时间窗口")
-        text = "，".join(parts)
+            parts.append(kv("时间窗口", f"{self.stale} 人最近一条超出时间窗口"))
+        text = "\n".join(parts)
         if self.errors:
-            text += "\n" + "\n".join(f"⚠️ {item}" for item in self.errors[:5])
+            text += "\n" + "\n".join(kv("失败", item) for item in self.errors[:5])
         return text
 
 
@@ -93,17 +92,16 @@ class ReplyResult:
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
-        """生成可读汇总。"""
+        """生成可读汇总（统一排版：首行为统计，其余为键值行）。"""
         parts = [
-            f"检查评论 {self.checked} 条",
-            f"回复 {self.replied} 条",
-            f"跳过 {self.skipped} 条",
+            f"检查评论 {self.checked} 条，回复 {self.replied} 条，"
+            f"跳过 {self.skipped} 条"
         ]
         if self.drafted:
-            parts.append(f"转草稿 {self.drafted} 条")
-        text = "，".join(parts)
+            parts.append(kv("转草稿", f"{self.drafted} 条"))
+        text = "\n".join(parts)
         if self.errors:
-            text += "\n" + "\n".join(f"⚠️ {item}" for item in self.errors[:5])
+            text += "\n" + "\n".join(kv("失败", item) for item in self.errors[:5])
         return text
 
 

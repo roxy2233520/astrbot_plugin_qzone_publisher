@@ -29,6 +29,7 @@ from astrbot.core.star.context import Context
 
 from .config import PluginConfig
 from .llm import AIClient
+from .ui import ICON_WARN, kv, plain_receipt
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注，避免运行期循环导入
     from .life import LifeManager
@@ -308,7 +309,11 @@ class ContentGenerator:
     def warning_note(self) -> str:
         """把「避免重复」相关的提醒拼成一行，供回执与状态展示。"""
         warning = str(self.last_generation.get("repeat_warning") or "").strip()
-        return f"\n⚠️ {warning}" if warning else ""
+        if not warning:
+            return ""
+        return "\n" + plain_receipt(
+            "需要注意", [kv("避免重复", warning)], icon=ICON_WARN
+        )
 
     # ------------------------------------------------------------------
     # 生成

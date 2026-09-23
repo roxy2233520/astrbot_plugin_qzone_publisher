@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-607%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-635%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -30,7 +30,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | 避免重复 | 每天多条也不雷同：生成时参考最近发过的内容、每次换一个创作角度、按当前时段来写；新内容与最近的内容过于相似时**自动重写一次** |
 | 联网素材 | **接入 AstrBot 自带的联网搜索**：先联网查资料，再让 AI 结合资料写说说；搜索不可用时自动降级 |
 | Token 用量 | 估算每次生成大概用多少 token，累计到 `/空间状态` 与 `/空间用量`；草稿与发布通知里也会带上 |
-| 回执图 | 通知与草稿可附带一张渲染出来的回执图（用 AstrBot 自带文转图，不加字体、不加体积；渲染失败自动降级纯文本） |
+| 回执图 | 通知与草稿可附带一张渲染出来的回执图（用 AstrBot 自带文转图，不加字体、不加体积；渲染失败自动降级纯文本）；纯文本回执统一用【】标签与键值行排版，回执图里则是真加粗 |
 | AI 接入 | **只复用 AstrBot 已配置的 LLM 提供商**，插件不保存密钥、不自己发请求 |
 | 生活日程 | 自己用 AI 生成「今日穿搭 + 日程」（按天缓存、懒加载、创意池、防重复）；可选注入 system prompt |
 | 说说互动 | 定时读取关注 QQ 号**最近 N 天内最新的一条**说说（`interact_days`，**默认只读**）；最新一条超出窗口就整体跳过，不去评论几天前的老说说。可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
@@ -474,6 +474,23 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `/空间用量 [天数]` | 按功能（说说 / 日程 / 评论 / 问候 / 搜索词）分组的明细 |
 | 草稿确认消息 | 附一行「本次生成约用 N tokens」 |
 | 发布 / 问候通知 | 同样附带本次用量 |
+
+### 回执排版
+
+插件发出的所有回执（指令回复、发布通知、草稿描述、巡检汇总、问候与闲聊回执、
+错误提示、`/空间状态` 输出）都按同一套排版生成，一份内容两种渲染：
+
+- **纯文本版**（默认，直接发到 QQ）：用 `✅/⚠️/❌/📌` 四个状态符号加【】标签做区块标题
+  （例如 `✅【发布成功】`、`📌【草稿待确认】`），区块内统一用 `  · 名称：值` 的键值行，
+  多区块输出（如 `/空间状态`）用 `────────` 分隔线隔开；指令名写成「/空间发布」。
+  **不含任何 Markdown 标记**——QQ 不渲染 Markdown，写成 `**加粗**` 只会显示星号。
+- **Markdown 版**（回执图 t2i）：同一份内容把【】标签渲染成加粗标题、
+  键值名称渲染成**真加粗**，由 AstrBot 的渲染器排版。开启 `notify_render_image` 后，
+  通知与草稿走这一版；渲染失败会自动降级为纯文本版。
+
+长度约束：单条回执纯文本不超过 12 行；`/空间状态` 按区块拆分，每个区块不超过 8 行，
+超出部分会截断并提示（完整内容可由回执图承载）。AI 生成的说说正文、评论、回复与问候
+内容不参与这套排版，按原样发布。
 
 ---
 
