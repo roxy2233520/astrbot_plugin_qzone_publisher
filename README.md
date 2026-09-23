@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-324%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-352%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -34,6 +34,7 @@
 | AI 接入 | **只复用 AstrBot 已配置的 LLM 提供商**，插件不保存密钥、不自己发请求 |
 | 生活日程 | 自己用 AI 生成「今日穿搭 + 日程」（按天缓存、懒加载、创意池、防重复）；可选注入 system prompt |
 | 说说互动 | 定时读取关注 QQ 号**最近 N 天内最新的一条**说说（`interact_days`，**默认只读**）；最新一条超出窗口就整体跳过，不去评论几天前的老说说。可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
+| 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限，默认先转草稿确认 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
 | 定时问候 | 按时间给指定用户**私聊**发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
 | 运维 | 发布历史、失败通知、`/空间状态` 一屏看全、`/空间删除` 按 tid 删说说 |
@@ -216,6 +217,7 @@
 | :--- | :--- | :--- |
 | `draft_enabled` | `false` | 定时发说说先转草稿，人工确认后才发 |
 | `draft_for_comment` | `true` | 自动评论也先转草稿 |
+| `draft_for_reply` | `true` | 回复评论也先转草稿 |
 | `draft_for_greet` | `false` | 定时问候也先转草稿（你确认后才私聊发给问候对象） |
 | `draft_timeout_minutes` | `0` | 大于 0 时草稿超时无人处理会**自动放行**并通知你；0 = 必须人工处理 |
 | `draft_admin` / `draft_umo` | `true` / 空 | 草稿发给谁 |
@@ -310,10 +312,22 @@
 | `interact_skip_self` | `true` | 跳过自己发的 |
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
+| `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按下面几项的规则回复，建议保留「回复也先确认」 |
+| `llm_reply_provider_id` | 空 | 回复单独指定模型提供商（留空用全局） |
+| `interact_reply_prompt` | 见默认值 | 回复提示词 |
+| `interact_reply_max_chars` | `80` | 回复最大字数 |
+| `interact_reply_max_per_run` | `3` | 每轮最多回复几条；同一条说说每轮最多回一条 |
 | `llm_comment_provider_id` | 空 | 评论单独指定模型提供商（留空用全局） |
 | `interact_comment_prompt` | 见默认值 | 评论提示词 |
 | `interact_comment_max_chars` | `60` | 评论最大字数 |
 | `interact_notify` | `false` | 巡检结束后发汇总通知 |
+
+回复评论的边界说明：
+
+- 只处理 `interact_days` 天内**自己发布的**说说；说说列表没带评论明细时，会再请求一次说说详情补取，两次都拿不到就跳过这条说说。
+- 只回复文字评论：纯图片、纯表情（剥离表情标记后为空）以及自己发的评论都会被跳过。
+- 回复发在别人的空间里且公开可见，默认走草稿确认；`draft_for_reply` 关闭后才会直接发出。
+- 同一条评论只回复一次，记录在 `<数据目录>/replied_comments.json`；草稿被放弃时不会记为已回复，下次巡检仍会重试。
 
 ### 生活日程
 
@@ -333,6 +347,7 @@
 | `draft_admin` | `true` | 草稿私聊插件内管理员（回退 AstrBot 的 `admins_id`） |
 | `draft_umo` | 空 | 草稿额外发到的会话，格式 `平台ID:消息类型:会话ID` |
 | `draft_for_comment` | `true` | 自动评论也先转草稿 |
+| `draft_for_reply` | `true` | 回复评论也先转草稿（**默认开**：回复同样发在别人空间里，先过目更稳妥） |
 | `draft_for_greet` | `false` | 定时问候也先转草稿 |
 | `draft_timeout_minutes` | `0` | 大于 0 时草稿超时无人处理会**自动放行**并通知你；0 = 必须人工处理 |
 
@@ -360,7 +375,8 @@
 | `/空间定时 [时间]` | 管理员 | 查看或设置发布时间（`08:30` / `30 8 * * *` / `off`） |
 | `/空间开关 [on\|off]` | 管理员 | 定时发布开关 |
 | `/空间互动 [on\|off]` | 管理员 | 说说巡检开关（点赞/评论在配置里单独开） |
-| `/空间读说说 [force]` | 管理员 | 立刻巡检一轮 |
+| `/空间读说说 [force]` | 管理员 | 立刻巡检一轮（好友说说 + 自己说说下的评论） |
+| `/空间回复 [on\|off\|now]` | 管理员 | 查看或开关「回复自己说说下的评论」，`now` 立刻跑一轮 |
 | `/空间日程 [renew]` | 所有人 | 查看今日生活日程，`renew` 重新生成 |
 | `/空间搜索 [关键词]` | 管理员 | 用 AstrBot 自带联网搜索测一条（不发说说）；不带参数看接入状态 |
 | `/空间确认` / `/空间放弃` / `/空间重写` | 管理员 | 处理待确认草稿 |
@@ -368,8 +384,8 @@
 | `/空间删除 <tid>` | 管理员 | 删除指定说说 |
 
 英文别名：上面每条指令都有 `/space xxx` 与 `/qz xxx` 两种英文写法，可用的词是
-`post` / `auto` / `status` / `relogin` / `cron` / `toggle` / `interact` / `search` / `life` /
-`read` / `admin` / `greet` / `usage` / `ok` / `drop` / `redo` / `history` / `delete`
+`post` / `auto` / `status` / `relogin` / `cron` / `toggle` / `interact` / `reply` / `search` /
+`life` / `read` / `admin` / `greet` / `usage` / `ok` / `drop` / `redo` / `history` / `delete`
 （例如 `/space post`、`/qz post`）。另外 `/空间登录` 等价于 `/空间状态`。
 
 > 别名的匹配对象是**整条指令名**，所以 `/post` 这样只写动词的用法不会触发，
@@ -504,7 +520,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 324 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 352 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

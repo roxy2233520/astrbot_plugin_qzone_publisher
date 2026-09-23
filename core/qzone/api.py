@@ -14,7 +14,7 @@ from astrbot.api import logger
 
 from .client import QzoneHttpClient
 from .constants import QZONE_CODE_IMAGE_EXPIRED, QZONE_CODE_UNKNOWN
-from .model import ApiResponse
+from .model import USER_AGENT, ApiResponse
 from .parser import QzoneParser
 
 
@@ -42,6 +42,14 @@ class QzoneAPI(QzoneHttpClient):
     COMMENT_URL = (
         "https://user.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
         "/cgi-bin/emotion_cgi_re_feeds"
+    )
+    REPLY_URL = (
+        "https://h5.qzone.qq.com/proxy/domain/taotao.qzone.qq.com"
+        "/cgi-bin/emotion_cgi_re_feeds"
+    )
+    DETAIL_URL = (
+        "https://h5.qzone.qq.com/proxy/domain/taotao.qq.com"
+        "/cgi-bin/emotion_cgi_msgdetail_v6"
     )
 
     async def publish(
@@ -274,6 +282,98 @@ class QzoneAPI(QzoneHttpClient):
                 "ref": "feeds",
                 "content": content,
             },
+        )
+        return ApiResponse.from_raw(raw)
+
+    @staticmethod
+    def _h5_headers() -> dict[str, str]:
+        """h5.qzone.qq.com 域接口所需的请求头。
+
+        Returns:
+            请求头字典；不带 Host，交由 aiohttp 按实际地址填写。
+        """
+        return {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "Referer": "https://user.qzone.qq.com/",
+            "Origin": "https://user.qzone.qq.com",
+        }
+
+    async def reply(
+        self,
+        uin: int | str,
+        tid: str,
+        comment_tid: str,
+        comment_uin: int | str,
+        content: str,
+    ) -> ApiResponse:
+        """回复自己说说下的一条评论。
+
+        Args:
+            uin: 说说作者（自己）的 QQ 号。
+            tid: 说说 ID。
+            comment_tid: 被回复评论的 ID。
+            comment_uin: 被回复评论的作者 QQ 号。
+            content: 回复正文。
+
+        Returns:
+            统一响应对象。
+        """
+        ctx = await self.session.get_ctx()
+        raw = await self.request(
+            "POST",
+            self.REPLY_URL,
+            params={"g_tk": ctx.gtk},
+            data={
+                "topicId": f"{uin}_{tid}__1",
+                "uin": ctx.uin,
+                "hostUin": uin,
+                "feedsType": 100,
+                "inCharset": "utf-8",
+                "outCharset": "utf-8",
+                "plat": "qzone",
+                "source": "ic",
+                "platformid": 52,
+                "format": "fs",
+                "ref": "feeds",
+                "content": content,
+                "commentId": comment_tid,
+                "commentUin": comment_uin,
+                "richval": "",
+                "richtype": "",
+                "private": "0",
+                "paramstr": 2,
+                "qzreferrer": f"{self.BASE_URL}/{ctx.uin}/main",
+            },
+            headers=self._h5_headers(),
+        )
+        return ApiResponse.from_raw(raw)
+
+    async def get_detail(self, tid: str) -> ApiResponse:
+        """取一条说说的详情，用于拿列表接口没带全的评论明细。
+
+        Args:
+            tid: 说说 ID。
+
+        Returns:
+            统一响应对象，成功时 data 内含 commentlist。
+        """
+        ctx = await self.session.get_ctx()
+        raw = await self.request(
+            "GET",
+            self.DETAIL_URL,
+            params={
+                "g_tk": ctx.gtk,
+                "uin": ctx.uin,
+                "tid": tid,
+                "format": "json",
+                "num": 100,
+                "callback": "_preloadCallback",
+                "code_version": 1,
+                "need_comment": 1,
+                "need_private_comment": 1,
+            },
+            headers=self._h5_headers(),
         )
         return ApiResponse.from_raw(raw)
 

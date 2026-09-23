@@ -42,6 +42,7 @@ from .core.web import WebSearchBridge
 _ON_FLAGS = {"on", "开", "开启", "true", "1", "yes"}
 _OFF_FLAGS = {"off", "关", "关闭", "false", "0", "no", "none", "disable"}
 _RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"}
+_NOW_FLAGS = {"now", "run", "立刻", "立即", "现在"}
 _PUBLISH_TASK = "qzone_auto_publish"
 _INTERACT_TASK = "qzone_interact"
 _GREET_MORNING_TASK = "qzone_greet_morning"
@@ -299,17 +300,24 @@ class QzonePublisherPlugin(Star):
         await self._dispatch_post(text, source=source, prefix="定时发布")
 
     async def _auto_interact(self) -> None:
-        """定时互动任务：按开关读/赞/评好友说说。"""
-        if not self.interact.targets:
-            logger.info("未配置 interact_uins，跳过本轮互动巡检")
-            return
+        """定时互动任务：读 / 赞 / 评好友说说，并回复自己说说下的评论。"""
+        lines: list[str] = []
 
-        result = await self.interact.run_once()
-        if bool(self.cfg.interact_notify):
-            await self._notify(f"说说互动完成：{result.summary()}")
+        if self.interact.targets:
+            result = await self.interact.run_once()
+            lines.append(f"说说互动完成：{result.summary()}")
+        else:
+            logger.info("未配置 interact_uins，跳过本轮好友说说巡检")
+
+        if bool(self.cfg.interact_reply_enabled):
+            reply = await self.interact.run_replies_once()
+            lines.append(f"评论回复完成：{reply.summary()}")
+
+        if lines and bool(self.cfg.interact_notify):
+            await self._notify("\n".join(lines))
 
         pending = self.drafts.pending
-        if pending is not None and pending.kind == "comment":
+        if pending is not None and pending.kind in ("comment", "reply"):
             await self._send_draft(pending)
             await self._arm_draft_timer(pending)
 
@@ -400,7 +408,7 @@ class QzonePublisherPlugin(Star):
         )
 
     async def _confirm_draft(self, draft: Draft) -> str:
-        """执行草稿：说说走发布接口，评论走评论接口，问候走私聊。
+        """执行草稿：说说走发布接口，评论与回复走评论接口，问候走私聊。
 
         Args:
             draft: 待执行的草稿。
@@ -420,6 +428,23 @@ class QzonePublisherPlugin(Star):
             if not resp.ok:
                 raise RuntimeError(str(resp.message or resp.code))
             return f"评论已发布（{draft.title()}）：{draft.text}"
+
+        if draft.kind == "reply":
+            if not (draft.target_tid and draft.target_comment_tid):
+                raise RuntimeError("草稿缺少目标说说或评论 ID，无法回复")
+            resp = await self.api.reply(
+                draft.target_uin,
+                draft.target_tid,
+                draft.target_comment_tid,
+                draft.target_comment_uin,
+                draft.text,
+            )
+            if not resp.ok:
+                raise RuntimeError(str(resp.message or resp.code))
+            # 回复真正发出后才记入去重；草稿被丢弃时下次巡检仍会重试
+            self.interact.mark_replied(draft.target_tid, draft.target_comment_tid)
+            who = draft.target_name or draft.target_comment_uin
+            return f"已回复 {who} 的评论：{draft.text}"
 
         if draft.kind == "greet":
             result = await self.greet.send_text(draft.text, draft.targets or None)
@@ -841,6 +866,7 @@ class QzonePublisherPlugin(Star):
         lines.append(f"　下次巡检: {self.interact_task.next_run_time}")
         if not self.interact.targets:
             lines.append("　⚠️ 还没配置 interact_uins，巡检不会做任何事")
+        lines.append(f"　评论回复: {self.interact.reply_mode_text()}")
 
         lines.append(
             f"草稿确认: {'开启' if self.cfg.draft_enabled else '关闭'}"
@@ -1022,6 +1048,48 @@ class QzonePublisherPlugin(Star):
 
         yield event.plain_result("参数无效，用法: /空间互动 on 或 /空间互动 off")
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间回复", alias={"space reply", "qz reply"})
+    async def cmd_reply(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """查看、开关或立即执行「回复自己说说下的评论」"""
+        self._remember_client(event)
+        flag = str(action).strip().lower()
+
+        if not flag:
+            yield event.plain_result(
+                f"回复评论当前为: {self.interact.reply_mode_text()}\n"
+                f"范围: {self.interact.window_days} 天内自己发的说说"
+                f"｜每轮最多 {self.interact.reply_limit} 条"
+                f"｜每条说说每轮最多回 1 条\n"
+                "用法: /空间回复 on 或 /空间回复 off；立即跑一轮用 /空间回复 now"
+            )
+            return
+
+        if flag in _ON_FLAGS:
+            self.cfg.set("interact_reply_enabled", True)
+            yield event.plain_result(
+                f"回复评论已开启: {self.interact.reply_mode_text()}\n"
+                f"随「说说互动」的时间表执行"
+                f"（{self.interact_task.cron or '未设置'}）"
+            )
+            return
+
+        if flag in _OFF_FLAGS:
+            self.cfg.set("interact_reply_enabled", False)
+            yield event.plain_result("回复评论已关闭")
+            return
+
+        if flag in _NOW_FLAGS:
+            yield event.plain_result("正在检查自己说说下的新评论...")
+            result = await self.interact.run_replies_once(force=True)
+            yield event.plain_result(f"评论回复完成：{result.summary()}")
+            pending = self.drafts.pending
+            if pending is not None and pending.kind == "reply":
+                yield event.plain_result(pending.describe())
+            return
+
+        yield event.plain_result("参数无效，用法: /空间回复 on 或 off 或 now")
+
     # ------------------------------------------------------------------
     # 指令：联网搜索（接入 AstrBot 自带能力）/ 日程 / 读说说
     # ------------------------------------------------------------------
@@ -1096,20 +1164,27 @@ class QzonePublisherPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间读说说", alias={"space read", "qz read"})
     async def cmd_read(self, event: AstrMessageEvent, force: GreedyStr = ""):
-        """立即巡检一轮好友说说（默认只读；force 忽略去重）"""
+        """立即巡检一轮好友说说与自己说说下的评论（force 忽略去重）"""
         self._remember_client(event)
-        if not self.interact.targets:
-            yield event.plain_result(
-                "还没配置关注对象：请在插件配置的 interact_uins 里填 QQ 号"
-            )
-            return
+        force_flag = bool(str(force).strip())
+        lines: list[str] = []
 
-        yield event.plain_result("正在巡检好友说说...")
-        result = await self.interact.run_once(force=bool(str(force).strip()))
-        yield event.plain_result(f"巡检完成：{result.summary()}")
+        if self.interact.targets:
+            yield event.plain_result("正在巡检好友说说...")
+            result = await self.interact.run_once(force=force_flag)
+            lines.append(f"巡检完成：{result.summary()}")
+        else:
+            lines.append("还没配置关注对象：请在插件配置的 interact_uins 里填 QQ 号")
+
+        if bool(self.cfg.interact_reply_enabled):
+            yield event.plain_result("正在检查自己说说下的新评论...")
+            reply = await self.interact.run_replies_once(force=force_flag)
+            lines.append(f"评论回复完成：{reply.summary()}")
+
+        yield event.plain_result("\n".join(lines))
 
         pending = self.drafts.pending
-        if pending is not None and pending.kind == "comment":
+        if pending is not None and pending.kind in ("comment", "reply"):
             yield event.plain_result(pending.describe())
 
     # ------------------------------------------------------------------
@@ -1338,6 +1413,20 @@ class QzonePublisherPlugin(Star):
                     target_tid=draft.target_tid,
                     target_name=draft.target_name,
                     target_text=draft.target_text,
+                )
+            elif draft.kind == "reply":
+                text = await self.interact.rewrite_reply(draft)
+                new_draft = Draft(
+                    kind="reply",
+                    text=text,
+                    source="interact",
+                    target_uin=draft.target_uin,
+                    target_tid=draft.target_tid,
+                    target_name=draft.target_name,
+                    target_text=draft.target_text,
+                    target_comment_tid=draft.target_comment_tid,
+                    target_comment_uin=draft.target_comment_uin,
+                    target_post_text=draft.target_post_text,
                 )
             else:
                 text = await self.content.rewrite(previous=draft.text)

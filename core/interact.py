@@ -1,4 +1,4 @@
-"""自动读 / 赞 / 评好友说说。
+"""自动读 / 赞 / 评好友说说，并回复自己说说下的评论。
 
 默认策略是**只读**：按配置里关注的 QQ 号定时拉取最近说说，记录已处理过的 tid；
 点赞与评论必须显式开启（``interact_like`` / ``interact_comment``）。
@@ -8,8 +8,13 @@
 如果这位好友最新一条都超出了窗口，就整体跳过（不点赞、不评论），
 免得去评论几天前的老说说。
 
-去重依据是 ``uin_tid``，存在 ``<插件数据目录>/interacted_tids.json``，
-所以同一条说说不会被点赞或评论第二次。
+**回复自己说说下的评论**（``interact_reply_enabled``，默认关闭）：
+只处理自己 ``interact_days`` 天内发布的说说，别人的评论才回复；
+同一条评论只回复一次，每轮最多 ``interact_reply_max_per_run`` 条，
+且同一条说说每轮最多回一条；开启 ``draft_for_reply`` 时先转草稿确认。
+
+去重依据分别是 ``uin_tid``（好友互动）与 ``说说tid_评论tid``（回复），
+存在 ``<插件数据目录>/interacted_tids.json`` 与 ``replied_comments.json``。
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from astrbot.api import logger
 from .config import PluginConfig
 from .draft import Draft, DraftBox
 from .llm import AIClient
-from .qzone import FeedPost, QzoneAPI, QzoneParser
+from .qzone import FeedComment, FeedPost, QzoneAPI, QzoneParser
 
 _SEEN_LIMIT = 1000
 
@@ -69,6 +74,39 @@ class InteractResult:
         return text
 
 
+@dataclass(slots=True)
+class ReplyResult:
+    """一次「回复自己说说下评论」巡检的汇总。
+
+    Attributes:
+        checked: 检查过的评论条数。
+        replied: 已回复条数。
+        drafted: 转入草稿箱的条数。
+        skipped: 跳过条数（自己的评论 / 空内容 / 已回复过 / 已占用草稿）。
+        errors: 出错信息。
+    """
+
+    checked: int = 0
+    replied: int = 0
+    drafted: int = 0
+    skipped: int = 0
+    errors: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        """生成可读汇总。"""
+        parts = [
+            f"检查评论 {self.checked} 条",
+            f"回复 {self.replied} 条",
+            f"跳过 {self.skipped} 条",
+        ]
+        if self.drafted:
+            parts.append(f"转草稿 {self.drafted} 条")
+        text = "，".join(parts)
+        if self.errors:
+            text += "\n" + "\n".join(f"⚠️ {item}" for item in self.errors[:5])
+        return text
+
+
 class InteractService:
     """好友说说互动服务。"""
 
@@ -94,6 +132,9 @@ class InteractService:
         self.file = Path(config.data_dir) / "interacted_tids.json"
         self._seen: list[str] = []
         self.load()
+        self.reply_file = Path(config.data_dir) / "replied_comments.json"
+        self._replied: list[str] = []
+        self.load_replied()
 
     # ------------------------------------------------------------------
     # 去重记录
@@ -154,6 +195,8 @@ class InteractService:
             parts.append("点赞")
         if bool(self.cfg.interact_comment):
             parts.append("评论(先确认)" if bool(self.cfg.draft_for_comment) else "评论")
+        if bool(self.cfg.interact_reply_enabled):
+            parts.append("回复(先确认)" if bool(self.cfg.draft_for_reply) else "回复")
         return " + ".join(parts)
 
     @property
@@ -349,3 +392,289 @@ class InteractService:
             text=draft.target_text,
         )
         return await self._generate_comment(post)
+
+    # ------------------------------------------------------------------
+    # 回复自己说说下的评论
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _reply_key(post_tid: str, comment_tid: str) -> str:
+        """回复去重键：说说 tid + 评论 tid。"""
+        return f"{post_tid}_{comment_tid}"
+
+    def load_replied(self) -> None:
+        """加载已回复评论记录。"""
+        self._replied = []
+        if not self.reply_file.exists():
+            return
+        try:
+            raw = json.loads(self.reply_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"回复去重记录读取失败，已忽略: {e}")
+            return
+        if isinstance(raw, list):
+            self._replied = [str(item) for item in raw]
+
+    def save_replied(self) -> None:
+        """原子写入已回复评论记录。"""
+        try:
+            self.reply_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.reply_file.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self._replied[-_SEEN_LIMIT:], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(self.reply_file)
+        except Exception as e:
+            logger.error(f"回复去重记录写入失败: {e}")
+
+    def replied(self, post_tid: str, comment_tid: str) -> bool:
+        """该条评论是否已经回复过。"""
+        return self._reply_key(post_tid, comment_tid) in self._replied
+
+    def mark_replied(self, post_tid: str, comment_tid: str) -> None:
+        """把评论标记为已回复并落盘（回复真正发出后调用）。"""
+        key = self._reply_key(post_tid, comment_tid)
+        if key not in self._replied:
+            self._replied.append(key)
+        self.save_replied()
+
+    @property
+    def replied_count(self) -> int:
+        """累计已回复的评论条数。"""
+        return len(self._replied)
+
+    @property
+    def reply_limit(self) -> int:
+        """每轮最多回复几条（至少 1）。"""
+        return max(int(self.cfg.interact_reply_max_per_run or 0), 1)
+
+    def reply_mode_text(self) -> str:
+        """给状态与指令用的回复模式描述。"""
+        if not bool(self.cfg.interact_reply_enabled):
+            return "关闭"
+        tail = "先确认" if bool(self.cfg.draft_for_reply) else "直接回复"
+        return f"开启（每轮最多 {self.reply_limit} 条，{tail}，已回复 {self.replied_count} 条）"
+
+    async def run_replies_once(self, *, force: bool = False) -> ReplyResult:
+        """巡检一轮：回复自己说说下别人留下的新评论。
+
+        只处理 ``interact_days`` 天内自己发布的说说；每轮最多回复
+        ``interact_reply_max_per_run`` 条，且同一条说说每轮最多回一条；
+        自己的评论、空内容评论与已回复过的评论都会被跳过。
+
+        Args:
+            force: 为 True 时忽略「已有待确认回复草稿」的占用检查。
+
+        Returns:
+            本次巡检汇总。
+        """
+        result = ReplyResult()
+        try:
+            self_uin = await self.api.session.get_uin()
+        except Exception as e:
+            result.errors.append(f"无法确认自己的 QQ 号: {e}")
+            return result
+        if not self_uin:
+            result.errors.append("无法确认自己的 QQ 号，本轮不回复评论")
+            return result
+
+        days = self.window_days
+        cutoff = int(time.time()) - days * 86400
+        limit = self.reply_limit
+        count = max(int(self.cfg.interact_count or 0), 1)
+
+        try:
+            resp = await self.api.get_feeds(self_uin, pos=0, num=count)
+        except Exception as e:
+            result.errors.append(f"读取自己的说说失败: {e}")
+            return result
+        if not resp.ok:
+            result.errors.append(f"读取自己的说说失败: {resp.message or resp.code}")
+            return result
+
+        posts = QzoneParser.parse_feeds(resp.data)
+        fresh = [
+            post
+            for post in posts
+            if post.created_time <= 0 or post.created_time >= cutoff
+        ]
+        if not posts:
+            logger.info("自己的说说列表为空，本轮不回复评论")
+        elif not fresh:
+            logger.info(f"自己的说说都在 {days} 天窗口之外，本轮不回复评论")
+
+        pending = self.drafts.pending
+        occupied = (
+            pending.target_comment_tid if pending and pending.kind == "reply" else ""
+        )
+
+        for post in sorted(fresh, key=lambda item: item.created_time, reverse=True):
+            if result.replied + result.drafted >= limit:
+                break
+
+            comments = await self._comments_of(post, result)
+            for comment in comments:
+                if result.replied + result.drafted >= limit:
+                    break
+
+                result.checked += 1
+                if comment.uin == self_uin:
+                    result.skipped += 1
+                    continue
+                if not comment.content.strip():
+                    result.skipped += 1
+                    continue
+                if self.replied(post.tid, comment.tid):
+                    result.skipped += 1
+                    continue
+                if not force and comment.tid == occupied:
+                    result.skipped += 1
+                    continue
+
+                try:
+                    await self._reply_to_comment(post, comment, result)
+                except Exception as e:
+                    result.errors.append(f"{post.tid}/{comment.tid}: {e}")
+                # 同一条说说每轮最多回一条
+                break
+
+        self.save_replied()
+        logger.info(f"评论回复巡检完成：{result.summary()}")
+        return result
+
+    async def _comments_of(
+        self, post: FeedPost, result: ReplyResult
+    ) -> list[FeedComment]:
+        """取一条说说的评论明细，列表没带全时回退到详情接口。
+
+        Args:
+            post: 目标说说。
+            result: 本轮汇总，用于记录取详情的错误。
+
+        Returns:
+            评论明细列表；取不到时返回空列表。
+        """
+        if post.comments:
+            return post.comments
+        if post.comment_count <= 0:
+            return []
+
+        try:
+            resp = await self.api.get_detail(post.tid)
+        except Exception as e:
+            result.errors.append(f"{post.tid}: 取评论详情异常 {e}")
+            return []
+        if not resp.ok:
+            result.errors.append(
+                f"{post.tid}: 取评论详情失败 {resp.message or resp.code}"
+            )
+            return []
+        return QzoneParser.parse_comments(resp.data)
+
+    async def _reply_to_comment(
+        self, post: FeedPost, comment: FeedComment, result: ReplyResult
+    ) -> None:
+        """生成一条回复，并按配置直接发出或转入草稿。
+
+        Args:
+            post: 评论所在的说说。
+            comment: 被回复的评论。
+            result: 本轮汇总，用于累计结果与错误。
+        """
+        content = await self._generate_reply(post, comment)
+
+        if bool(self.cfg.draft_for_reply):
+            self.drafts.put(
+                Draft(
+                    kind="reply",
+                    text=content,
+                    source="interact",
+                    target_uin=post.uin,
+                    target_tid=post.tid,
+                    target_name=comment.display_name(),
+                    target_text=comment.content,
+                    target_comment_tid=comment.tid,
+                    target_comment_uin=comment.uin,
+                    target_post_text=post.text,
+                )
+            )
+            result.drafted += 1
+            logger.info(f"已生成回复草稿：{post.tid}/{comment.tid}")
+            return
+
+        resp = await self.api.reply(
+            post.uin, post.tid, comment.tid, comment.uin, content
+        )
+        if not resp.ok:
+            result.errors.append(
+                f"回复评论 {comment.tid} 失败: {resp.message or resp.code}"
+            )
+            return
+
+        result.replied += 1
+        self.mark_replied(post.tid, comment.tid)
+        logger.info(f"已回复 {comment.display_name()} 在 {post.tid} 下的评论")
+
+    async def _generate_reply(self, post: FeedPost, comment: FeedComment) -> str:
+        """用 AI 生成一条评论回复。
+
+        Args:
+            post: 评论所在的说说。
+            comment: 被回复的评论。
+
+        Returns:
+            回复正文。
+
+        Raises:
+            RuntimeError: AI 返回内容为空时抛出。
+        """
+        task = str(self.cfg.interact_reply_prompt or "").strip() or (
+            "针对对方的评论写一句得体的回复，直接回应对方提到的内容，"
+            "不要解释、不做自我描述、不分选项。"
+        )
+        limit = max(int(self.cfg.interact_reply_max_chars or 0), 1)
+
+        text = await self.ai.chat(
+            system_prompt=(
+                f"{task}\n\n# 输出要求\n"
+                f"只输出回复正文本身，不要引号、不要解释，不超过 {limit} 字。"
+            ),
+            prompt=(
+                f"我的说说：{post.text or '（无正文）'}\n"
+                f"对方（{comment.display_name()}）的评论：{comment.content}"
+            ),
+            provider_id=str(self.cfg.llm_reply_provider_id or ""),
+            feature="回复",
+        )
+
+        cleaned = text.strip().strip("\"'“”")
+        cleaned = "".join(cleaned.split())
+        if not cleaned:
+            raise RuntimeError("AI 生成的回复内容为空")
+        return cleaned[:limit]
+
+    async def rewrite_reply(self, draft: Draft) -> str:
+        """按草稿记录的目标重新生成一版回复。
+
+        Args:
+            draft: 回复草稿，需带 target_tid / target_comment_tid / target_text。
+
+        Returns:
+            新生成的回复正文。
+
+        Raises:
+            RuntimeError: AI 返回内容为空时抛出。
+        """
+        post = FeedPost(
+            uin=draft.target_uin,
+            tid=draft.target_tid,
+            text=draft.target_post_text,
+        )
+        comment = FeedComment(
+            uin=draft.target_comment_uin,
+            tid=draft.target_comment_tid,
+            nickname=draft.target_name,
+            content=draft.target_text,
+        )
+        return await self._generate_reply(post, comment)

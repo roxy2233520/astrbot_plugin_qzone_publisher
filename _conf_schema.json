@@ -388,9 +388,22 @@
         "type": "bool",
         "default": false
       },
+      "interact_reply_enabled": {
+        "description": "回复自己说说下的评论",
+        "hint": "自己发的说说下面有人评论时，用 AI 生成一句回复。默认关闭；开启后建议保留「回复也先确认」",
+        "type": "bool",
+        "default": false
+      },
       "llm_comment_provider_id": {
         "description": "生成评论用的提供商（可选）",
         "hint": "想给评论单独指定模型就选这里；留空则沿用上面的提供商",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "llm_reply_provider_id": {
+        "description": "回复评论使用的提供商（可选）",
+        "hint": "留空则使用 AstrBot 当前默认提供商",
         "type": "string",
         "_special": "select_provider",
         "default": ""
@@ -403,6 +416,14 @@
         "editor_theme": "vs-dark",
         "default": "生成一句简短、直接、贴题的评论，不要解释、不做自我描述、不分选项。"
       },
+      "interact_reply_prompt": {
+        "description": "回复评论的提示词",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "editor_theme": "vs-dark",
+        "default": "针对对方的评论写一句得体的回复，直接回应对方提到的内容，不要解释、不做自我描述、不分选项。"
+      },
       "interact_comment_max_chars": {
         "description": "评论最大字数",
         "type": "int",
@@ -412,6 +433,28 @@
           "step": 5
         },
         "default": 60
+      },
+      "interact_reply_max_chars": {
+        "description": "回复字数上限",
+        "hint": "生成后的回复会清洗引号与多余空白，并截断到该字数",
+        "type": "int",
+        "slider": {
+          "min": 10,
+          "max": 200,
+          "step": 5
+        },
+        "default": 80
+      },
+      "interact_reply_max_per_run": {
+        "description": "每轮最多回复几条",
+        "hint": "一次巡检最多回复多少条评论；同一条说说每轮最多回复一条",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "default": 3
       },
       "interact_notify": {
         "description": "互动结束后发送汇总通知",
@@ -531,7 +574,7 @@
   },
   "sec_draft": {
     "description": "草稿确认",
-    "hint": "发布 / 评论 / 问候先发给你确认，确认后才真正执行",
+    "hint": "发布 / 评论 / 回复 / 问候先发给你确认，确认后才真正执行",
     "type": "object",
     "items": {
       "draft_enabled": {
@@ -555,6 +598,12 @@
       "draft_for_comment": {
         "description": "自动评论也走草稿确认",
         "hint": "开启后 interact_comment 生成的评论会先进草稿箱，不会直接发出去",
+        "type": "bool",
+        "default": true
+      },
+      "draft_for_reply": {
+        "description": "回复评论也先走草稿确认",
+        "hint": "回复同样发在别人的空间里，默认先发给你确认，/空间确认 后才真正发出",
         "type": "bool",
         "default": true
       },

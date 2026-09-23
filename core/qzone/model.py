@@ -139,6 +139,84 @@ class ApiResponse:
         return self.ok
 
 
+def _as_int(value: Any) -> int:
+    """尽最大努力把接口字段转成整数，失败返回 0。"""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+@dataclass(slots=True)
+class FeedComment:
+    """一条评论（来自 msglist / msgdetail 的 commentlist）。
+
+    Attributes:
+        uin: 评论者 QQ 号。
+        tid: 评论 ID，回复时作为 commentId 使用。
+        nickname: 评论者昵称。
+        content: 评论正文（已剥离表情标记）。
+        create_time: 评论时间戳。
+        parent_tid: 被回复的评论 ID（子评论时存在）。
+    """
+
+    uin: int
+    tid: str
+    nickname: str = ""
+    content: str = ""
+    create_time: int = 0
+    parent_tid: str = ""
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "FeedComment":
+        """由接口返回的单条评论构造，字段缺失时留空而不报错。
+
+        Args:
+            raw: commentlist 里的一项。
+
+        Returns:
+            构造好的 FeedComment。
+        """
+        return cls(
+            uin=_as_int(raw.get("uin")),
+            tid=str(raw.get("tid") or raw.get("commentid") or "").strip(),
+            nickname=str(raw.get("name") or raw.get("nickname") or "").strip(),
+            content=strip_em_tags(str(raw.get("content") or "")),
+            create_time=_as_int(raw.get("create_time") or raw.get("createTime")),
+            parent_tid=str(raw.get("parent_tid") or "").strip(),
+        )
+
+    @staticmethod
+    def parse_many(items: object) -> "list[FeedComment]":
+        """解析一组评论，跳过结构不对或缺少评论 ID 的项。
+
+        Args:
+            items: 接口返回的 commentlist。
+
+        Returns:
+            FeedComment 列表。
+        """
+        if not isinstance(items, list):
+            return []
+        comments: list[FeedComment] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                comment = FeedComment.from_raw(item)
+            except Exception:  # pragma: no cover - 字段异常时跳过该条
+                continue
+            if comment.tid:
+                comments.append(comment)
+        return comments
+
+    def display_name(self) -> str:
+        """展示用名称：昵称缺失时退回 QQ 号。"""
+        if self.nickname:
+            return self.nickname
+        return str(self.uin) if self.uin else "（未知）"
+
+
 @dataclass(slots=True)
 class FeedPost:
     """一条说说（来自 emotion_cgi_msglist_v6 的 msglist）。
@@ -150,7 +228,8 @@ class FeedPost:
         text: 正文（已剥离表情标记）。
         images: 图片地址列表。
         created_time: 发布时间戳。
-        comment_count: 评论数。
+        comment_count: 评论数（接口的 cmtnum，缺失时用评论明细条数）。
+        comments: 评论明细；列表接口通常只带一部分，详情接口更完整。
         source_name: 来源设备/应用名。
     """
 
@@ -161,6 +240,7 @@ class FeedPost:
     images: list[str] = field(default_factory=list)
     created_time: int = 0
     comment_count: int = 0
+    comments: list[FeedComment] = field(default_factory=list)
     source_name: str = ""
 
     @classmethod
@@ -190,7 +270,7 @@ class FeedPost:
                     images.append(str(cover))
 
         commentlist = raw.get("commentlist")
-        comments = commentlist if isinstance(commentlist, list) else []
+        comments = FeedComment.parse_many(commentlist)
 
         try:
             uin = int(raw.get("uin") or 0)
@@ -204,6 +284,7 @@ class FeedPost:
             text=strip_em_tags(str(raw.get("content") or "")),
             images=images,
             created_time=int(raw.get("created_time") or 0),
-            comment_count=len(comments),
+            comment_count=max(_as_int(raw.get("cmtnum")), len(comments)),
+            comments=comments,
             source_name=str(raw.get("source_name") or "").strip(),
         )

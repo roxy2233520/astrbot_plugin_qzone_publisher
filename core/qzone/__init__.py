@@ -3,6 +3,7 @@
 from .api import QzoneAPI as QzoneAPI
 from .client import QzoneHttpClient as QzoneHttpClient
 from .model import ApiResponse as ApiResponse
+from .model import FeedComment as FeedComment
 from .model import FeedPost as FeedPost
 from .model import QzoneContext as QzoneContext
 from .model import strip_em_tags as strip_em_tags
@@ -11,6 +12,7 @@ from .session import QzoneSession as QzoneSession
 
 __all__ = [
     "ApiResponse",
+    "FeedComment",
     "FeedPost",
     "QzoneAPI",
     "QzoneContext",

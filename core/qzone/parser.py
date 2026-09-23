@@ -17,7 +17,7 @@ from .constants import (
     QZONE_MSG_JSON_PARSE_ERROR,
     QZONE_MSG_NON_OBJECT_RESPONSE,
 )
-from .model import FeedPost
+from .model import FeedComment, FeedPost
 
 # 形如 _preloadCallback({...}); 的 JSONP 包裹
 _JSONP_PATTERN = re.compile(r"^[^(){]{0,64}\(\s*(\{.*\})\s*\)\s*;?\s*$", re.DOTALL)
@@ -134,3 +134,15 @@ class QzoneParser:
             if post.tid:
                 posts.append(post)
         return posts
+
+    @staticmethod
+    def parse_comments(payload: dict[str, Any]) -> list[FeedComment]:
+        """解析说说详情响应里的 commentlist。
+
+        Args:
+            payload: 业务层响应字典（成功时含 commentlist）。
+
+        Returns:
+            FeedComment 列表；没有可解析内容时返回空列表。
+        """
+        return FeedComment.parse_many(payload.get("commentlist"))

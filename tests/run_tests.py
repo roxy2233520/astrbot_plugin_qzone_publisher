@@ -1154,9 +1154,13 @@ async def main() -> int:
     feeds_calls: list[dict] = []
     likes: list[dict] = []
     comments: list[dict] = []
+    replies: list[dict] = []
+    details: list[dict] = []
+    detail_comments: list[dict] = []
 
     # 假空间返回的说说列表：测试里可以整体替换，用来构造各种时间窗口场景
     now_ts = int(time.time())
+    SELF_UIN = 123456
 
     def friend_post(
         tid: str, ago_hours: float, uin: int = 999999, name: str = "小明"
@@ -1171,6 +1175,42 @@ async def main() -> int:
             "pic": [{"url2": "http://img/1.jpg"}],
             "commentlist": [{"tid": 1}],
         }
+
+    def comment_item(
+        tid: str,
+        content: str,
+        uin: int = 999999,
+        name: str = "小明",
+        **extra,
+    ) -> dict:
+        """造一条评论明细（字段名沿用接口的真实写法，便于验证容错）。"""
+        item = {
+            "uin": uin,
+            "name": name,
+            "tid": tid,
+            "content": content,
+            "createTime": now_ts - 600,
+        }
+        item.update(extra)
+        return item
+
+    def my_post(
+        tid: str,
+        ago_hours: float,
+        commentlist: list[dict] | None = None,
+        **extra,
+    ) -> dict:
+        """造一条自己发布的说说，可附带评论明细。"""
+        post = {
+            "uin": SELF_UIN,
+            "tid": tid,
+            "name": "我自己",
+            "content": "我今天发的说说",
+            "created_time": int(now_ts - ago_hours * 3600),
+            "commentlist": commentlist or [],
+        }
+        post.update(extra)
+        return post
 
     feeds_payload: list[dict] = [
         friend_post("T1", 1),
@@ -1237,6 +1277,15 @@ async def main() -> int:
     async def handle_publish_fail(request):
         return web.json_response({"code": -10000, "message": "发太快了"})
 
+    async def handle_reply(request):
+        form = await request.post()
+        replies.append({"form": dict(form), "query": dict(request.query)})
+        return web.json_response({"code": 0})
+
+    async def handle_detail(request):
+        details.append(dict(request.query))
+        return web.json_response({"code": 0, "commentlist": detail_comments})
+
     async def handle_publish_ok(request):
         form = await request.post()
         received["publish"] = {
@@ -1255,6 +1304,8 @@ async def main() -> int:
     app2.router.add_post("/comment", handle_comment)
     app2.router.add_post("/publish", handle_publish_ok)
     app2.router.add_post("/publish_fail", handle_publish_fail)
+    app2.router.add_post("/reply", handle_reply)
+    app2.router.add_get("/detail", handle_detail)
     runner2 = web.AppRunner(app2)
     await runner2.setup()
     site2 = web.TCPSite(runner2, "127.0.0.1", 8792)
@@ -3162,6 +3213,326 @@ async def main() -> int:
         again.publish_cron == "0 7 * * *",
         str(again.publish_cron),
     )
+
+    print("\n[30] 回复自己说说下的评论")
+
+    plugin.api.LIST_URL = f"{AI_BASE}/feeds"
+    plugin.api.REPLY_URL = f"{AI_BASE}/reply"
+    plugin.api.DETAIL_URL = f"{AI_BASE}/detail"
+
+    async def reply_chat(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        return "收到了，我这边也一样。"
+
+    plugin.ai.chat = reply_chat
+    cfg.set("interact_reply_enabled", True)
+    cfg.set("interact_reply_max_per_run", 3)
+    cfg.set("interact_reply_max_chars", 80)
+    cfg.set("draft_for_reply", False)
+    cfg.set("draft_enabled", False)
+    cfg.set("interact_days", 3)
+    plugin.drafts.clear()
+    plugin.interact._replied = []
+
+    parsed_post = FeedPost.from_raw(
+        {
+            "uin": SELF_UIN,
+            "tid": "P1",
+            "content": "正文",
+            "cmtnum": 3,
+            "commentlist": [
+                {
+                    "uin": 999999,
+                    "name": "小明",
+                    "tid": "C1",
+                    "content": "不错[em]e100[/em]",
+                    "createTime": 1700000000,
+                },
+                {"uin": 888888, "tid": "C2", "content": "   "},
+                {"uin": 777777, "tid": "", "content": "缺评论 ID"},
+                "不是字典",
+            ],
+        }
+    )
+    check(
+        "评论明细解析（剥离表情、容忍字段缺失与脏数据）",
+        len(parsed_post.comments) == 2
+        and parsed_post.comments[0].nickname == "小明"
+        and parsed_post.comments[0].content == "不错"
+        and parsed_post.comments[0].create_time == 1700000000
+        and parsed_post.comment_count == 3,
+        str([(item.tid, item.content) for item in parsed_post.comments]),
+    )
+    check(
+        "详情响应的评论解析同源",
+        [
+            item.tid
+            for item in QzoneParser.parse_comments(
+                {"commentlist": [{"uin": 1, "tid": "X", "content": "hi"}]}
+            )
+        ]
+        == ["X"],
+        "parse_comments",
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post(
+            "S1",
+            1,
+            [
+                comment_item("C_SELF", "我自己顶一下", uin=SELF_UIN, name="我自己"),
+                comment_item("C_EMPTY", "   "),
+            ],
+        )
+    ]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "自己的评论与空内容评论都跳过",
+        res.checked == 2 and res.replied == 0 and res.skipped == 2 and not replies,
+        res.summary(),
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post("S_OLD", 24 * 5, [comment_item("C_OLD", "老说说上的评论")])
+    ]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "自己 5 天前的说说超出窗口，不回复",
+        res.checked == 0 and res.replied == 0 and not replies,
+        res.summary(),
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [my_post("S2", 1, [comment_item("C2", "你今天去哪了")])]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "直接模式：回复一条评论",
+        res.checked == 1 and res.replied == 1 and len(replies) == 1,
+        res.summary(),
+    )
+    reply_form = replies[-1]["form"] if replies else {}
+    check(
+        "回复表单参数正确",
+        reply_form.get("topicId") == f"{SELF_UIN}_S2__1"
+        and reply_form.get("commentId") == "C2"
+        and reply_form.get("commentUin") == "999999"
+        and reply_form.get("hostUin") == str(SELF_UIN)
+        and reply_form.get("content") == "收到了，我这边也一样。"
+        and reply_form.get("feedsType") == "100"
+        and reply_form.get("qzreferrer", "").endswith(f"/{SELF_UIN}/main")
+        and replies[-1]["query"].get("g_tk"),
+        str(reply_form)[:180],
+    )
+
+    res = await plugin.interact.run_replies_once()
+    check(
+        "同一条评论第二轮不再回复",
+        res.replied == 0 and res.skipped == 1 and len(replies) == 1,
+        res.summary(),
+    )
+    check(
+        "回复去重记录落盘",
+        plugin.interact.replied("S2", "C2")
+        and plugin.interact.replied_count == 1
+        and (plugin.cfg.data_dir / "replied_comments.json").exists(),
+        str(plugin.interact.replied_count),
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post("S3", 1, [comment_item("C3a", "第一条"), comment_item("C3b", "第二条")])
+    ]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "同一条说说每轮最多回一条",
+        res.replied == 1
+        and len(replies) == 1
+        and replies[-1]["form"].get("commentId") == "C3a",
+        res.summary(),
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    cfg.set("interact_reply_max_per_run", 1)
+    feeds_payload[:] = [
+        my_post("S4", 1, [comment_item("C4", "说说四的评论")]),
+        my_post("S5", 2, [comment_item("C5", "说说五的评论")]),
+    ]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "每轮上限生效（最多 1 条）",
+        res.replied == 1 and len(replies) == 1,
+        res.summary(),
+    )
+    cfg.set("interact_reply_max_per_run", 3)
+    plugin.interact._replied = []
+    replies.clear()
+    plugin.drafts.clear()
+    cfg.set("draft_for_reply", True)
+    feeds_payload[:] = [
+        my_post(
+            "S6", 1, [comment_item("C6", "草稿模式的评论", uin=888888, name="小红")]
+        )
+    ]
+    res = await plugin.interact.run_replies_once()
+    pending_reply = plugin.drafts.pending
+    check(
+        "草稿模式：不直接发出，转成 reply 草稿",
+        res.drafted == 1
+        and res.replied == 0
+        and not replies
+        and pending_reply is not None
+        and pending_reply.kind == "reply",
+        res.summary(),
+    )
+    check(
+        "回复草稿带目标说说 / 评论 / 评论人",
+        pending_reply is not None
+        and pending_reply.target_tid == "S6"
+        and pending_reply.target_comment_tid == "C6"
+        and pending_reply.target_comment_uin == 888888
+        and pending_reply.target_name == "小红"
+        and "草稿模式的评论" in pending_reply.target_text,
+        str(pending_reply)[:140],
+    )
+    check(
+        "回复草稿标题与描述写清回复谁",
+        pending_reply is not None
+        and "回复草稿" in pending_reply.title()
+        and "小红" in pending_reply.title()
+        and "被回复的评论" in pending_reply.describe(),
+        pending_reply.title() if pending_reply else "None",
+    )
+
+    res = await plugin.interact.run_replies_once()
+    check(
+        "已有待确认回复草稿时不再重复生成",
+        res.drafted == 0 and res.skipped == 1 and not replies,
+        res.summary(),
+    )
+
+    replies.clear()
+    out = await collect(plugin.cmd_confirm(FakeEvent()))
+    check(
+        "确认回复草稿后真的调用回复接口",
+        len(replies) == 1 and replies[-1]["form"].get("commentId") == "C6",
+        str(out)[:140],
+    )
+    check(
+        "确认后才记入去重，草稿清空",
+        plugin.interact.replied("S6", "C6") and plugin.drafts.pending is None,
+        str(plugin.interact.replied_count),
+    )
+
+    plugin.interact._replied = []
+    replies.clear()
+    details.clear()
+    cfg.set("draft_for_reply", False)
+    detail_comments[:] = [
+        comment_item("C7", "详情接口里的评论", uin=777777, name="小刚")
+    ]
+    feeds_payload[:] = [my_post("S7", 1, [], cmtnum=1)]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "列表没带评论明细时回退到详情接口",
+        len(details) == 1 and details[-1].get("tid") == "S7" and res.replied == 1,
+        f"{details} / {res.summary()}",
+    )
+    detail_comments.clear()
+
+    async def empty_reply_chat(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        return "   "
+
+    plugin.ai.chat = empty_reply_chat
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [my_post("S8", 1, [comment_item("C8", "空回复场景")])]
+    res = await plugin.interact.run_replies_once()
+    check(
+        "AI 返回空内容时记为错误且不发送",
+        res.replied == 0 and bool(res.errors) and not replies,
+        res.summary(),
+    )
+    plugin.ai.chat = reply_chat
+
+    out = await collect(plugin.cmd_reply(FakeEvent(), ""))
+    check(
+        "/空间回复 无参数显示状态",
+        any("回复评论当前为" in item for item in out)
+        and any("每轮最多" in item for item in out),
+        str(out)[:140],
+    )
+    out = await collect(plugin.cmd_reply(FakeEvent(), "off"))
+    check(
+        "/空间回复 off 关闭开关",
+        any("已关闭" in item for item in out)
+        and not bool(plugin.cfg.interact_reply_enabled),
+        str(out)[:100],
+    )
+    out = await collect(plugin.cmd_reply(FakeEvent(), "on"))
+    check(
+        "/空间回复 on 打开开关",
+        any("已开启" in item for item in out)
+        and bool(plugin.cfg.interact_reply_enabled),
+        str(out)[:100],
+    )
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [my_post("S9", 1, [comment_item("C9", "指令触发一轮")])]
+    out = await collect(plugin.cmd_reply(FakeEvent(), "now"))
+    check(
+        "/空间回复 now 立刻跑一轮",
+        any("评论回复完成" in item for item in out) and len(replies) == 1,
+        str(out)[:140],
+    )
+    out = await collect(plugin.cmd_reply(FakeEvent(), "乱写"))
+    check(
+        "/空间回复 参数无效时给用法",
+        any("参数无效" in item for item in out),
+        str(out)[:80],
+    )
+
+    check(
+        "回复模式描述随开关变化",
+        plugin.interact.reply_mode_text().startswith("开启")
+        and "已回复" in plugin.interact.reply_mode_text(),
+        plugin.interact.reply_mode_text(),
+    )
+    check(
+        "互动模式描述带出回复项",
+        "回复" in plugin.interact.mode_text(),
+        plugin.interact.mode_text(),
+    )
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态输出包含评论回复一行",
+        any("评论回复" in item for item in out),
+        str(out)[:120],
+    )
+
+    cfg.set("interact_reply_enabled", False)
+    check(
+        "关闭后回复模式描述为关闭",
+        plugin.interact.reply_mode_text() == "关闭",
+        plugin.interact.reply_mode_text(),
+    )
+    check(
+        "关闭时互动模式描述不再带回复项",
+        "回复" not in plugin.interact.mode_text(),
+        plugin.interact.mode_text(),
+    )
+
+    plugin.drafts.clear()
+    plugin.interact._replied = []
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()
