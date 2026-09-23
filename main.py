@@ -1570,9 +1570,10 @@ class QzonePublisherPlugin(Star):
         await self._notify(receipt)
         yield event.plain_result(receipt)
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间状态", alias={"space status", "qz status", "空间登录"})
     async def cmd_status(self, event: AstrMessageEvent):
-        """查看登录态、AI 接入、日程与各定时任务状态"""
+        """查看登录态、AI 接入、日程与各定时任务状态（仅管理员）"""
         self._remember_client(event)
 
         # 区块 1：登录与接入
@@ -3146,9 +3147,10 @@ class QzonePublisherPlugin(Star):
     # 指令：历史与删除
     # ------------------------------------------------------------------
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间历史", alias={"space history", "qz history"})
     async def cmd_history(self, event: AstrMessageEvent, count: int = 5):
-        """查看最近的发布记录"""
+        """查看最近的发布记录（仅管理员）"""
         size = min(max(int(count or 5), 1), 20)
         records = self.store.recent(size)
 

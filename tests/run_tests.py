@@ -6330,6 +6330,79 @@ async def main() -> int:
     )
     greet_cfg.set("greet_morning_pool", ["池子甲", "池子乙"])
 
+    # ==================================================================
+    print("\n[40] 指令权限口径（防回归）")
+
+    # 允许非管理员使用的指令白名单：只有日程查询与主动消息开关
+    ALLOW_ANYONE = {"空间日程", "私聊开", "私聊关"}
+    # 其余指令必须全部限管理员（新增指令时这份名单与白名单一起核对）
+    EXPECT_ADMIN = {
+        "空间发布",
+        "空间自动发",
+        "空间状态",
+        "空间重登",
+        "空间定时",
+        "空间开关",
+        "空间互动",
+        "空间回复",
+        "空间搜索",
+        "空间读说说",
+        "空间管理员",
+        "空间问候",
+        "空间闲聊",
+        "空间用量",
+        "空间确认",
+        "空间放弃",
+        "空间重写",
+        "空间历史",
+        "空间删除",
+    }
+
+    main_source = (REPO_ROOT / "main.py").read_text(encoding="utf-8")
+    source_lines = main_source.splitlines()
+    admin_commands: list[str] = []
+    open_commands: list[str] = []
+    for index, line in enumerate(source_lines):
+        stripped = line.strip()
+        if not stripped.startswith('@filter.command("'):
+            continue
+        name = stripped.split('@filter.command("', 1)[1].split('"', 1)[0]
+        # 向上收集紧挨着的装饰器块，看里面有没有管理员限制
+        decorators: list[str] = []
+        cursor = index - 1
+        while cursor >= 0 and source_lines[cursor].strip().startswith("@"):
+            decorators.append(source_lines[cursor].strip())
+            cursor -= 1
+        if any("PermissionType.ADMIN" in item for item in decorators):
+            admin_commands.append(name)
+        else:
+            open_commands.append(name)
+
+    check(
+        "指令总数与权限标注总数一致（22 条）",
+        len(admin_commands) + len(open_commands) == 22,
+        f"{len(admin_commands)}+{len(open_commands)}",
+    )
+    unexpected_open = sorted(set(open_commands) - ALLOW_ANYONE)
+    missing_admin = sorted(ALLOW_ANYONE - set(open_commands))
+    check(
+        "未加管理员限制的指令恰好是日程与主动消息开关这三条",
+        set(open_commands) == ALLOW_ANYONE and len(open_commands) == 3,
+        f"未加限制的指令: {unexpected_open or '无'}｜"
+        f"被误加了限制的允许清单指令: {missing_admin or '无'}",
+    )
+    check(
+        "其余 19 条都限管理员（含 /空间状态 与 /空间历史）",
+        sorted(admin_commands) == sorted(EXPECT_ADMIN),
+        f"缺少限制: {sorted(EXPECT_ADMIN - set(admin_commands))}｜"
+        f"多出限制: {sorted(set(admin_commands) - EXPECT_ADMIN)}",
+    )
+    check(
+        "会暴露内部信息的两条指令已限管理员",
+        "空间状态" in admin_commands and "空间历史" in admin_commands,
+        f"管理员指令: {sorted(admin_commands)}",
+    )
+
     plugin.publish_task.stop()
     plugin.interact_task.stop()
     await plugin.api.close()
