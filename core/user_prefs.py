@@ -188,6 +188,23 @@ class UserPrefStore:
             "total": len(self._users),
         }
 
+    def allowed_users(self, feature: str) -> list[str]:
+        """取「已接受、且没有单独关掉该功能」的用户 QQ 列表。
+
+        节日祝福的收件人就是这份列表（不依赖 greet_users）。
+
+        Args:
+            feature: 功能名（morning / night / holiday）。
+
+        Returns:
+            按 QQ 号升序排列的用户列表。
+        """
+        return [
+            user.qq
+            for user in sorted(self._users.values(), key=lambda item: item.qq)
+            if user.opted_in is True and user.feature_enabled(str(feature))
+        ]
+
     # ------------------------------------------------------------------
     # 修改
     # ------------------------------------------------------------------

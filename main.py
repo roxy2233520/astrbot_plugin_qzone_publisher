@@ -29,7 +29,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .core.config import PluginConfig
 from .core.content import ContentGenerator
 from .core.draft import Draft, DraftBox
-from .core.greet import GreetingService
+from .core.greet import HOLIDAY_KEY, GreetingService
 from .core.holidays import days_until, table_range_text
 from .core.interact import InteractService
 from .core.life import LifeManager, time_desc
@@ -49,10 +49,6 @@ from .core.web import WebSearchBridge
 
 _ON_FLAGS = {"on", "开", "开启", "true", "1", "yes"}
 _OFF_FLAGS = {"off", "关", "关闭", "false", "0", "no", "none", "disable"}
-_ACCEPT_FLAGS = {"accept", "yes", "ok", "接受", "同意", "可以", "好"}
-_DENY_FLAGS = {"deny", "refuse", "reject", "no", "拒绝", "不同意", "不接受"}
-_ALL_ON_FLAGS = {"全部开启", "全部打开", "全开", "all on"}
-_ALL_OFF_FLAGS = {"全部关闭", "全部关掉", "全关", "all off"}
 _RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"}
 _NOW_FLAGS = {"now", "run", "立刻", "立即", "现在"}
 _PUBLISH_TASK = "qzone_auto_publish"
@@ -387,11 +383,27 @@ class QzonePublisherPlugin(Star):
         Returns:
             (允许发送的 QQ 列表, 因未接受而跳过的人数)。
         """
+        if feature == HOLIDAY_KEY:
+            # 节日祝福的收件人本来就只有「已同意且没关掉节日」的人
+            return self._holiday_targets(), 0
+
         targets = list(self.greet.targets)
         if not bool(self.cfg.active_msg_require_optin):
             return targets, 0
         allowed = [qq for qq in targets if self.prefs.allowed(qq, feature)]
         return allowed, len(targets) - len(allowed)
+
+    def _holiday_targets(self) -> list[str]:
+        """节日祝福的收件人：已同意接收、且没有单独关掉「节日」的用户。
+
+        ``active_msg_require_optin`` 关闭时退回按 ``greet_users`` 发送（与旧版一致）。
+
+        Returns:
+            收件人 QQ 列表。
+        """
+        if not bool(self.cfg.active_msg_require_optin):
+            return list(self.greet.targets)
+        return self.prefs.allowed_users(HOLIDAY_KEY)
 
     async def _draft_greet(
         self, *, slot_key: str, slot_name: str, feature: str, text: str
@@ -471,11 +483,11 @@ class QzonePublisherPlugin(Star):
         return (
             "本机器人可能会主动私聊发消息。\n"
             f"可能的时间段：早安 {morning}、晚安 {night}、节日祝福 {holiday}"
-            "（实际时间会随机延后，不会固定在同一秒）\n"
-            "可能打扰到的功能：早安、晚安、传统节日祝福，"
-            "以及说说发布与互动结果的通知。\n"
-            "如需接收，回复 /空间偏好 接受；如不希望接收，回复 /空间偏好 拒绝。\n"
-            "随时可用 /空间偏好 查看与修改。"
+            "（实际时间会随机延后，不会固定在同一秒）。\n"
+            "可能打扰到的功能：早安 / 晚安问候、传统节日祝福，以及评论回复"
+            "（评论回复会在说说评论区提醒被回复的人，不是私聊）。\n"
+            "如需接收，回复 /私聊开；如不希望接收，回复 /私聊关。\n"
+            "不回应视为不接受，不会收到任何主动消息；随时可用 /私聊开 改回来。"
         )
 
     @staticmethod
@@ -575,11 +587,19 @@ class QzonePublisherPlugin(Star):
         await self._report_greet(slot_name, result)
 
     async def _run_holiday(self) -> None:
-        """执行一次节日祝福：当天不是内置节日就不发送。"""
+        """执行一次节日祝福：收件人是已同意接收节日祝福的用户，当天不是节日就不发送。"""
         slot_name = "节日祝福"
+        targets = self._holiday_targets()
 
-        if not self.greet.targets:
-            logger.info("未配置 greet_users，跳过本次节日祝福")
+        if not targets:
+            logger.info("没有已同意接收节日祝福的用户，跳过本次节日祝福")
+            if bool(self.cfg.notify_enabled) and bool(
+                self.cfg.active_msg_require_optin
+            ):
+                await self._notify(
+                    f"{slot_name}没有发送：目前没有已同意接收节日祝福的用户"
+                    "（对方可用 /私聊开 开通）"
+                )
             return
 
         if bool(self.cfg.draft_for_greet):
@@ -593,12 +613,15 @@ class QzonePublisherPlugin(Star):
                 return
             slot_key, text = preview
             await self._draft_greet(
-                slot_key=slot_key, slot_name=slot_name, feature="holiday", text=text
+                slot_key=slot_key,
+                slot_name=slot_name,
+                feature=HOLIDAY_KEY,
+                text=text,
             )
             return
 
         try:
-            result = await self.greet.send_holiday()
+            result = await self.greet.send_holiday(targets=targets)
         except Exception as e:
             logger.error(f"节日祝福发送失败: {e}")
             return
@@ -1129,10 +1152,17 @@ class QzonePublisherPlugin(Star):
 
         upcoming = days_until(datetime.now(self.cfg.timezone).date())
         holiday_text = self.greet_holiday_status(upcoming)
+        holiday_targets = self._holiday_targets()
         lines.append(
             f"节日祝福: {'开启' if bool(self.cfg.holiday_enabled) else '关闭'}"
             f"｜{holiday_text}"
+            f"｜本次将发给 {len(holiday_targets)} 人（已同意）"
         )
+        if bool(self.cfg.holiday_enabled) and not holiday_targets:
+            lines.append(
+                "　⚠️ 目前没有已同意接收节日祝福的用户，节日祝福不会发出"
+                "（对方可用 /私聊开 开通）"
+            )
 
         stats = self.prefs.stats()
         lines.append(
@@ -1242,7 +1272,15 @@ class QzonePublisherPlugin(Star):
         )
 
         lines = [f"已设置自动发布时间：{self.publish_task.describe()}"]
-        lines.append(f"下次执行: {self.publish_task.next_run_time}")
+        if self.publish_task.incomplete:
+            # 条数多于时间点：配置不完整，明确提示而不是少发几条
+            lines.append(f"⚠️ {self.publish_task.error}；当前不会自动发布")
+            lines.append(
+                f"当前时间点列表有 {len(valid)} 个，每天都发 {days} 条："
+                "请补齐时间点，或用 /空间定时 每天 <条数> 把条数调小"
+            )
+        else:
+            lines.append(f"下次执行: {self.publish_task.next_run_time}")
         if invalid:
             lines.append(f"已忽略无法识别的时间点：{'、'.join(invalid)}")
         yield event.plain_result("\n".join(lines))
@@ -1448,61 +1486,80 @@ class QzonePublisherPlugin(Star):
             f"日程：{state.schedule}"
         )
 
-    @filter.command("空间偏好", alias={"space prefs", "qz prefs"})
-    async def cmd_prefs(self, event: AstrMessageEvent, action: GreedyStr = ""):
-        """查看或修改本人在主动消息上的偏好（所有用户可用）"""
+    @filter.command("私聊开", alias={"space pm on", "qz pm on"})
+    async def cmd_pm_on(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """开启主动私聊消息：不带参数开启全部，带参数只开该项（所有用户可用）"""
         self._remember_client(event)
+        yield event.plain_result(self._apply_pm(event, str(action), enable=True))
+
+    @filter.command("私聊关", alias={"space pm off", "qz pm off"})
+    async def cmd_pm_off(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """关闭主动私聊消息：不带参数关闭全部，带参数只关该项（所有用户可用）"""
+        self._remember_client(event)
+        yield event.plain_result(self._apply_pm(event, str(action), enable=False))
+
+    def _apply_pm(self, event: AstrMessageEvent, spec: str, *, enable: bool) -> str:
+        """处理「私聊开 / 私聊关」并给出回执。
+
+        参数无法识别时只提示，不改动任何状态——尤其不会因此变成「已接受」。
+
+        Args:
+            event: 消息事件。
+            spec: 参数（功能名，可为空）。
+            enable: True 表示开启，False 表示关闭。
+
+        Returns:
+            回执文本。
+        """
         qq = str(event.get_sender_id() or "").strip()
         if not qq.isdigit():
-            yield event.plain_result("无法识别你的 QQ 号，暂时不能查看或修改偏好")
-            return
+            return "无法识别你的 QQ 号，暂时不能修改设置"
 
-        parts = str(action).split()
-        if not parts:
-            yield event.plain_result(self._prefs_text(qq))
-            return
+        arg = spec.strip()
+        head = arg.split()[0].lower() if arg.split() else ""
 
-        head = parts[0].lower()
-        if head in _ACCEPT_FLAGS:
-            self.prefs.set_opted_in(qq, True)
-            yield event.plain_result(f"已记录：接受主动消息\n{self._prefs_text(qq)}")
-            return
-        if head in _DENY_FLAGS:
-            self.prefs.set_opted_in(qq, False)
-            yield event.plain_result(f"已记录：不接受主动消息\n{self._prefs_text(qq)}")
-            return
-        if head in _ALL_ON_FLAGS or head in _ALL_OFF_FLAGS:
-            value = head in _ALL_ON_FLAGS
-            self.prefs.set_all_features(qq, value)
-            yield event.plain_result(
-                f"已{'开启' if value else '关闭'}全部主动消息功能\n{self._prefs_text(qq)}"
+        if not arg:
+            # 不带参数：开启 = 接受并全部开启；关闭 = 拒绝并全部关闭
+            self.prefs.set_opted_in(qq, enable)
+            self.prefs.set_all_features(qq, enable)
+            note = (
+                "已记录：接受主动消息，功能全部开启"
+                if enable
+                else "已记录：不接受主动消息，功能全部关闭"
             )
-            return
+            return f"{note}\n{self._pm_text(qq)}"
 
         feature = self._feature_of(head)
-        if feature is not None:
-            if len(parts) < 2 or parts[1].lower() not in (_ON_FLAGS | _OFF_FLAGS):
-                yield event.plain_result(
-                    f"用法: /空间偏好 {FEATURE_LABELS[feature]} on 或 off"
-                )
-                return
-            value = parts[1].lower() in _ON_FLAGS
-            self.prefs.set_feature(qq, feature, value)
-            yield event.plain_result(
-                f"已{'开启' if value else '关闭'}{FEATURE_LABELS[feature]}\n"
-                f"{self._prefs_text(qq)}"
+        if feature is None:
+            state = UserPrefStore.state_text(self.prefs.get(qq))
+            kept = (
+                "你的状态保持为未回答（视为不接受）"
+                if state == "未回答"
+                else f"你的状态保持为{state}，未做任何改动"
             )
-            return
+            return (
+                f"未识别该功能名「{arg}」，{kept}。\n"
+                f"可用的功能名：早安、晚安、节日。\n{self._pm_text(qq)}"
+            )
 
-        yield event.plain_result(self._prefs_usage())
+        self.prefs.set_feature(qq, feature, enable)
+        if enable:
+            # 明确要求开启某一项，等同于接受（否则开了也收不到）
+            self.prefs.set_opted_in(qq, True)
+        label = FEATURE_LABELS[feature]
+        return f"已{'开启' if enable else '关闭'}{label}\n{self._pm_text(qq)}"
 
     @staticmethod
-    def _prefs_usage() -> str:
-        """偏好指令的用法说明。"""
+    def _pm_usage(state: str = "") -> str:
+        """两个指令的用法行，并说明随时可以改回来。"""
+        back = {
+            "已接受": "想全部停掉就用 /私聊关（只想停某一项就用 /私聊关 晚安）",
+            "已拒绝": "想重新接收就用 /私聊开（只想开某一项就用 /私聊开 晚安）",
+        }.get(state, "/私聊开 或 /私聊关")
         return (
-            "用法: /空间偏好 接受｜/空间偏好 拒绝｜"
-            "/空间偏好 早安 on|off｜/空间偏好 晚安 on|off｜"
-            "/空间偏好 节日 on|off｜/空间偏好 全部开启｜/空间偏好 全部关闭"
+            "用法: /私聊开 开启全部｜/私聊关 关闭全部｜"
+            "/私聊开 早安|晚安|节日 只开某一项｜/私聊关 早安|晚安|节日 只关某一项\n"
+            f"随时可以改回来：{back}"
         )
 
     @staticmethod
@@ -1521,12 +1578,12 @@ class QzonePublisherPlugin(Star):
         }
         return table.get(str(token).strip().lower())
 
-    def _prefs_text(self, qq: str) -> str:
-        """拼本人偏好的展示文本。"""
+    def _pm_text(self, qq: str) -> str:
+        """拼本人主动消息设置的展示文本。"""
         user = self.prefs.get(qq)
         state = UserPrefStore.state_text(user)
         lines = [
-            f"主动消息偏好（{qq}）: {state}",
+            f"当前状态（{qq}）: {state}",
             f"功能开关: {UserPrefStore.features_text(user)}",
             "时间段（由管理员设置，只读）: "
             f"早安 {describe_cron(self.cfg.greet_morning_cron)}"
@@ -1534,8 +1591,8 @@ class QzonePublisherPlugin(Star):
             f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}",
         ]
         if state == "未回答":
-            lines.append("说明: 尚未回答时不会收到任何主动消息")
-        lines.append(self._prefs_usage())
+            lines.append("说明: 未回答视为不接受，不会收到任何主动消息")
+        lines.append(self._pm_usage(state))
         return "\n".join(lines)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1648,9 +1705,10 @@ class QzonePublisherPlugin(Star):
                 f"｜{night.name if night else '晚安'}: {self.greet_night_task.cron or '未设置'}"
                 f"（下次 {self.greet_night_task.next_run_time}）\n"
                 f"节日祝福: {'开' if bool(self.cfg.holiday_enabled) else '关'}"
-                f"｜{self.greet_holiday_status(upcoming)}\n"
+                f"｜{self.greet_holiday_status(upcoming)}"
+                f"｜将发给 {len(self._holiday_targets())} 人（已同意）\n"
                 f"主动消息同意: {'需要' if bool(self.cfg.active_msg_require_optin) else '不需要'}"
-                f"（用户可用 /空间偏好 自行设置）\n"
+                f"（用户可用 /私聊开 或 /私聊关 自行设置）\n"
                 "用法: /空间问候 on|off 开关定时问候；"
                 "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试（忽略当日去重）；"
                 "/空间问候 holiday 测试节日祝福"

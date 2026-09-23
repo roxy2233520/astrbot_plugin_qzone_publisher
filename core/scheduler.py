@@ -372,6 +372,7 @@ class CronTaskGroup:
         self.jitter = max(int(jitter or 0), 0)
         self.enabled = bool(enabled)
         self.error = ""
+        self.incomplete = False
         self._tasks: list[CronTask] = []
         self._raws: list[str] = []
         self._crons: list[str] = []
@@ -424,12 +425,17 @@ class CronTaskGroup:
         """解析生效的时间点。
 
         Returns:
-            (生效的原始写法列表, 规范化后的 Cron 列表)；
-            ``per_day`` 为 0 时都为空；列表为空或全部非法时回退 ``fallback_cron``。
+            (生效的原始写法列表, 规范化后的 Cron 列表)。规则：
+
+            - ``per_day`` 为 0 表示不自动发布，两者都为空；
+            - 时间点列表为空或全部无法识别时，回退 ``fallback_cron`` 作为唯一时间点；
+            - **可用时间点个数少于 ``per_day`` 时视为配置不完整**：不发布、不建任务，
+              并把原因写进 ``error``（由状态与指令回执提示用户补齐或调小条数）。
         """
         raws: list[str] = []
         crons: list[str] = []
         invalid: list[str] = []
+        incomplete = False
 
         if self.per_day > 0:
             for item in self.times[: self.per_day]:
@@ -443,14 +449,36 @@ class CronTaskGroup:
                     continue
                 raws.append(text)
 
+        used_fallback = False
         if not crons and self.per_day > 0 and self.fallback_cron:
             try:
                 crons = [normalize_cron(self.fallback_cron)]
                 raws = [self.fallback_cron]
+                used_fallback = True
             except ValueError:
                 invalid.append(self.fallback_cron)
 
-        self.error = f"忽略无法识别的时间点：{'、'.join(invalid)}" if invalid else ""
+        messages: list[str] = []
+        if invalid:
+            messages.append(f"忽略无法识别的时间点：{'、'.join(invalid)}")
+
+        if crons and len(crons) < self.per_day:
+            # 条数多于时间点：配置不完整，宁可不发也不要少发/多发得不明不白
+            incomplete = True
+            if used_fallback:
+                messages.append(
+                    f"publish_per_day 为 {self.per_day}，但可用时间点只有 {len(crons)} 个"
+                    "（来自自动发布时间），请补齐 publish_times 或把条数调小"
+                )
+            else:
+                messages.append(
+                    f"publish_per_day 为 {self.per_day}，但 publish_times 只有 "
+                    f"{len(crons)} 个可用时间点，请补齐或调小条数"
+                )
+            raws, crons = [], []
+
+        self.incomplete = incomplete
+        self.error = "；".join(messages)
         return raws, crons
 
     def _refresh(self) -> None:
@@ -505,6 +533,8 @@ class CronTaskGroup:
         """人话描述当前设置。"""
         if self.per_day <= 0:
             return "每天 0 条（不自动发布）"
+        if self.incomplete:
+            return f"每天 {self.per_day} 条（配置不完整，未发布）"
         if not self._crons:
             return "未设置可用的发布时间点"
         return f"每天 {len(self._crons)} 条：{'、'.join(self._raws)}"
@@ -526,7 +556,12 @@ class CronTaskGroup:
             logger.info(f"[{self.name}] 未启用")
             return []
         if not self._crons:
-            logger.info(f"[{self.name}] 没有可用的发布时间点，保持关闭")
+            if self.incomplete:
+                logger.warning(
+                    f"[{self.name}] 配置不完整，已暂停自动发布：{self.error}"
+                )
+            else:
+                logger.info(f"[{self.name}] 没有可用的发布时间点，保持关闭")
             return []
 
         for index, cron in enumerate(self._crons, start=1):
