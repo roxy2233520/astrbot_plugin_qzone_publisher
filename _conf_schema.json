@@ -47,7 +47,7 @@
   },
   "sec_private": {
     "description": "私聊问候",
-    "hint": "定时给指定用户私聊发早安 / 晚安与传统节日祝福",
+    "hint": "定时给指定用户私聊发早安 / 晚安、传统节日祝福与日常闲聊",
     "type": "object",
     "items": {
       "active_msg_require_optin": {
@@ -65,6 +65,12 @@
       "holiday_enabled": {
         "description": "启用节日祝福",
         "hint": "节日当天给「已同意接收节日祝福」的用户发一条私聊祝福（除夕、春节、元宵、情人节、七夕、中秋、国庆）；收件人不依赖 greet_users；默认关闭",
+        "type": "bool",
+        "default": false
+      },
+      "chat_open_enabled": {
+        "description": "启用主动闲聊",
+        "hint": "在下面的时间窗口内随机挑一个时刻，给一位已同意的用户发一两句轻松的搭话；每天最多几次由「每天最多主动开口几次」决定；默认关闭",
         "type": "bool",
         "default": false
       },
@@ -91,6 +97,15 @@
         "hint": "支持 HH:MM 或 5 段 Cron；当天不是内置节日则不发送",
         "type": "string",
         "default": "0 9 * * *"
+      },
+      "chat_open_windows": {
+        "description": "主动闲聊的时间窗口",
+        "hint": "每项一个窗口，格式 HH:MM-HH:MM，例如 12:00-13:30、19:00-22:00；在每个窗口内随机取一个时刻发送，每天不固定；跨零点的窗口（如 23:00-01:00）同样支持；无法识别的项会被忽略并写日志",
+        "type": "list",
+        "default": [
+          "12:00-13:30",
+          "19:00-22:00"
+        ]
       },
       "greet_jitter": {
         "description": "问候时间的随机抖动（秒）",
@@ -123,6 +138,13 @@
       },
       "llm_holiday_provider_id": {
         "description": "节日祝福使用的提供商（可选）",
+        "hint": "留空则使用 AstrBot 当前默认提供商",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "llm_chat_open_provider_id": {
+        "description": "主动闲聊使用的提供商（可选）",
         "hint": "留空则使用 AstrBot 当前默认提供商",
         "type": "string",
         "_special": "select_provider",
@@ -181,6 +203,37 @@
           "又是一年{festival}，记得吃好一点。",
           "{festival}快乐，我这边一切都好。"
         ]
+      },
+      "chat_open_prompt": {
+        "description": "主动闲聊的提示词",
+        "hint": "生成搭话内容用的提示词；默认值已写明语气约束，可按需调整",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "editor_theme": "vs-dark",
+        "default": "用你自己的说话风格，主动给一个熟悉的人发一两句轻松的搭话。\n语气要求：轻松自然，不冒犯对方，不打探对方的隐私与私事，不给对方压力；不要用“在吗”“干嘛呢”这类没有内容的空招呼；只写一到两句话；可以自然提一句你今天在做什么；给对方留出不理会的余地，不要追问对方为什么不回复；不要解释、不要加引号、不要分点或罗列。"
+      },
+      "chat_open_per_day": {
+        "description": "每天最多主动开口几次",
+        "hint": "从可用时间窗口里随机挑这么多个窗口，各发一条；窗口个数不足时按窗口数发送；每次只发给一个人，同一个人每天最多收到一条",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 3,
+          "step": 1
+        },
+        "default": 1
+      },
+      "chat_open_max_chars": {
+        "description": "搭话字数上限",
+        "hint": "生成后的搭话会清洗引号与多余空白，并截断到该字数",
+        "type": "int",
+        "slider": {
+          "min": 10,
+          "max": 100,
+          "step": 5
+        },
+        "default": 40
       }
     }
   },

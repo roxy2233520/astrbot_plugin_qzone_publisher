@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import types
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import ClassVar
 
@@ -4570,6 +4570,491 @@ async def main() -> int:
         str(out)[:260],
     )
     plugin.prefs._users = saved_users
+
+    # ==================================================================
+    print("\n[34] 主动闲聊（定时主动开口）")
+
+    _greet_mod = _imp("core.greet")
+    parse_windows = _greet_mod.parse_windows
+    CHAT_KEY = _greet_mod.CHAT_KEY
+    tz = plugin.cfg.timezone
+
+    # ---- 窗口解析：合法 / 非法 / 跨零点 ----
+    windows, invalid = parse_windows(["12:00-13:30", "19:00-22:00"])
+    check(
+        "合法窗口解析为两个且没有非法项",
+        len(windows) == 2 and invalid == [],
+        f"{windows}/{invalid}",
+    )
+    check(
+        "窗口起点与跨度正确",
+        windows[0].start_minute == 720
+        and windows[0].span_minutes == 90
+        and windows[1].start_minute == 1140
+        and windows[1].span_minutes == 180,
+        f"{windows[0]}/{windows[1]}",
+    )
+    check(
+        "窗口起点生成正确的 Cron",
+        windows[0].start_cron == "0 12 * * *" and windows[1].start_cron == "0 19 * * *",
+        f"{windows[0].start_cron}/{windows[1].start_cron}",
+    )
+    check(
+        "抖动上限等于窗口长度（秒）",
+        windows[0].duration_seconds == 5400 and windows[1].duration_seconds == 10800,
+        f"{windows[0].duration_seconds}/{windows[1].duration_seconds}",
+    )
+    _, invalid_items = parse_windows(
+        ["中午", "12:00", "25:00-26:00", "12:00-12:00", "19:70-20:00"]
+    )
+    check(
+        "无法识别的窗口全部列出（含不合法时刻与空窗口）",
+        invalid_items == ["中午", "12:00", "25:00-26:00", "12:00-12:00", "19:70-20:00"],
+        str(invalid_items),
+    )
+    check(
+        "字符串写法（逗号分隔）也支持",
+        len(parse_windows("12:00-13:30, 19:00-22:00")[0]) == 2,
+        str(parse_windows("12:00-13:30, 19:00-22:00")),
+    )
+    cross, _ = parse_windows(["23:00-01:00"])
+    check(
+        "跨零点窗口的跨度为 120 分钟",
+        len(cross) == 1 and cross[0].span_minutes == 120,
+        str(cross),
+    )
+    check(
+        "跨零点窗口包含 23:30 与次日 00:30",
+        cross[0].contains(datetime(2026, 9, 24, 23, 30)) is True
+        and cross[0].contains(datetime(2026, 9, 25, 0, 30)) is True,
+        "跨零点判定",
+    )
+    check(
+        "跨零点窗口不包含 01:30",
+        cross[0].contains(datetime(2026, 9, 25, 1, 30)) is False,
+        "跨零点判定",
+    )
+    check(
+        "窗口内 / 窗口外的判定",
+        windows[0].contains(datetime(2026, 9, 24, 13, 0)) is True
+        and windows[0].contains(datetime(2026, 9, 24, 15, 0)) is False,
+        "窗口边界判定",
+    )
+    check(
+        "宽限秒数允许刚过窗口的补偿触发",
+        windows[0].contains(datetime(2026, 9, 24, 13, 35), grace_seconds=600) is True
+        and windows[0].contains(datetime(2026, 9, 24, 13, 35)) is False,
+        "补偿触发判定",
+    )
+    check(
+        "默认承诺的语气约束写进了内置提示词",
+        "不冒犯" in _greet_mod.DEFAULT_CHAT_OPEN_PROMPT
+        and "在吗" in _greet_mod.DEFAULT_CHAT_OPEN_PROMPT
+        and "一两句" in _greet_mod.DEFAULT_CHAT_OPEN_PROMPT,
+        _greet_mod.DEFAULT_CHAT_OPEN_PROMPT[:80],
+    )
+    check(
+        "内置兜底文案为 3 条且没有空招呼",
+        len(_greet_mod.CHAT_FALLBACK_POOL) == 3
+        and all("在吗" not in item for item in _greet_mod.CHAT_FALLBACK_POOL),
+        str(_greet_mod.CHAT_FALLBACK_POOL),
+    )
+
+    # ---- 调度：每个窗口一个任务，随机时刻落在窗口内 ----
+    plugin.cfg.set("chat_open_windows", ["12:00-13:30", "19:00-22:00"])
+    plugin.cfg.set("chat_open_per_day", 2)
+    plugin.cfg.set("chat_open_enabled", True)
+    crons = plugin._rebuild_chat_tasks()
+    check(
+        "每个时间窗口各建一个任务",
+        len(plugin.chat_open_tasks) == 2,
+        str([task.name for task in plugin.chat_open_tasks]),
+    )
+    check(
+        "任务 cron 为窗口起点",
+        [task.cron for task in plugin.chat_open_tasks] == ["0 12 * * *", "0 19 * * *"],
+        str(crons),
+    )
+    check(
+        "每个任务的抖动上限等于各自窗口长度",
+        [task.jitter for task in plugin.chat_open_tasks] == [5400, 10800],
+        str([task.jitter for task in plugin.chat_open_tasks]),
+    )
+    injected = [
+        datetime(2026, 9, 24, 12, 0, tzinfo=tz),
+        datetime(2026, 9, 24, 19, 0, tzinfo=tz),
+    ]
+    landed = []
+    for index, window in enumerate(windows):
+        for offset in (0, window.duration_seconds // 3, window.duration_seconds - 1):
+            landed.append(window.contains(injected[index] + timedelta(seconds=offset)))
+    check(
+        "窗口起点加抖动范围内的时刻都落在窗口内（注入时间）",
+        all(landed),
+        str(landed),
+    )
+    check(
+        "窗口结束后再抖动就超出窗口（会按已错过跳过）",
+        windows[0].contains(
+            datetime(2026, 9, 24, 12, 0, tzinfo=tz)
+            + timedelta(seconds=windows[0].duration_seconds + 3600)
+        )
+        is False,
+        "越界判定",
+    )
+    plugin.cfg.set("chat_open_enabled", False)
+    check(
+        "关闭开关后不再排期（没有任务）",
+        plugin._rebuild_chat_tasks() == [] and plugin.chat_open_tasks == [],
+        str(plugin.chat_open_tasks),
+    )
+    plugin.cfg.set("chat_open_enabled", True)
+    plugin._rebuild_chat_tasks()
+
+    check(
+        "每天上限 1 时只随机挑一个窗口",
+        len(plugin.greet.select_windows(windows, 1, date(2026, 9, 24))) == 1,
+        str(plugin.greet.select_windows(windows, 1, date(2026, 9, 24))),
+    )
+    picked_day = plugin.greet.select_windows(windows, 1, date(2026, 9, 24))
+    check(
+        "同一天的挑选结果固定（重启也不会变）",
+        plugin.greet.select_windows(windows, 1, date(2026, 9, 24)) == picked_day,
+        str(picked_day),
+    )
+    check(
+        "窗口个数不足时按窗口数来",
+        plugin.greet.select_windows(windows, 5, date(2026, 9, 24)) == [0, 1],
+        str(plugin.greet.select_windows(windows, 5, date(2026, 9, 24))),
+    )
+    check(
+        "没有窗口时挑选结果为空",
+        plugin.greet.select_windows([], 2, date(2026, 9, 24)) == [],
+        "空窗口",
+    )
+
+    # ---- 发送：窗口内 / 窗口已过 / 人数上限 / 每人每天一条 ----
+    plugin.cfg.set("greet_users", ["10030", "10031", "10032", "10033"])
+    plugin.cfg.set("active_msg_require_optin", True)
+    _greet_mod.random.seed(20260924)
+
+    def chat_recipients() -> list[str]:
+        """只取发给 1003x 测试对象的私聊，排除给管理员的通知。"""
+        return [item[0] for item in StarTools.sent if "FriendMessage:1003" in item[0]]
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._chat_open_tick(1, now=datetime(2026, 9, 24, 15, 0, tzinfo=tz))
+    check(
+        "窗口已过时跳过、不发送",
+        chat_recipients() == [],
+        str(chat_recipients()),
+    )
+
+    await plugin._chat_open_tick(0, now=datetime(2026, 9, 24, 12, 45, tzinfo=tz))
+    first_wave = chat_recipients()
+    check(
+        "窗口内只发一条（一次只发一个人）",
+        len(first_wave) == 1,
+        str(first_wave),
+    )
+    check(
+        "收件人来自已同意的用户",
+        first_wave
+        and first_wave[0].split(":")[-1] in plugin._feature_targets(CHAT_KEY),
+        f"{first_wave}/{plugin._feature_targets(CHAT_KEY)}",
+    )
+    check(
+        "落盘去重的 key 形如 chat:<日期>:<QQ>",
+        any(
+            str(item).startswith("chat:") and str(item).count(":") == 2
+            for item in plugin.greet._sent.get(plugin.greet._today(), [])
+        ),
+        str(plugin.greet._sent),
+    )
+
+    await plugin._chat_open_tick(1, now=datetime(2026, 9, 24, 19, 30, tzinfo=tz))
+    second_wave = chat_recipients()
+    check(
+        "第二条发给另一个人（同一个人每天最多一条）",
+        len(second_wave) == 2 and second_wave[1] != second_wave[0],
+        str(second_wave),
+    )
+
+    await plugin._chat_open_tick(1, now=datetime(2026, 9, 24, 20, 0, tzinfo=tz))
+    check(
+        "达到每天上限后不再发送",
+        len(chat_recipients()) == 2,
+        str(chat_recipients()),
+    )
+    blocked = await plugin.greet.send_chat_open(targets=["10030", "10031"])
+    check(
+        "每天上限到达时直接返回说明",
+        blocked.sent == 0 and any("每天上限" in item for item in blocked.errors),
+        blocked.summary(),
+    )
+
+    plugin.cfg.set("chat_open_per_day", 1)
+    plugin.cfg.set("chat_open_windows", ["12:00-13:30", "19:00-22:00"])
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    tick_day = date(2026, 9, 24)
+    only = plugin.greet.select_windows(windows, 1, tick_day)[0]
+    skipped_index = 1 - only
+    await plugin._chat_open_tick(
+        skipped_index, now=datetime(2026, 9, 24, [12, 19][skipped_index], 30, tzinfo=tz)
+    )
+    check(
+        "当天没被选中的窗口不发送",
+        chat_recipients() == [],
+        f"{only}/{chat_recipients()}",
+    )
+    await plugin._chat_open_tick(
+        only, now=datetime(2026, 9, 24, [12, 19][only], 30, tzinfo=tz)
+    )
+    check(
+        "被选中的窗口发出一条",
+        len(chat_recipients()) == 1,
+        str(chat_recipients()),
+    )
+
+    # ---- 同意门控 ----
+    plugin.cfg.set("chat_open_per_day", 3)
+    check(
+        "未同意的用户不在闲聊收件人里",
+        "10032" not in plugin._feature_targets(CHAT_KEY)
+        and "10033" not in plugin._feature_targets(CHAT_KEY),
+        str(plugin._feature_targets(CHAT_KEY)),
+    )
+    plugin.prefs.set_feature("10030", "chat", False)
+    check(
+        "单独关掉闲聊的用户收不到",
+        "10030" not in plugin._feature_targets(CHAT_KEY),
+        str(plugin._feature_targets(CHAT_KEY)),
+    )
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    await plugin._chat_open_tick(0, now=datetime(2026, 9, 24, 12, 30, tzinfo=tz))
+    check(
+        "关掉闲聊的人不会被发到",
+        all(not item.endswith("FriendMessage:10030") for item in chat_recipients()),
+        str(chat_recipients()),
+    )
+    plugin.prefs.set_feature("10030", "chat", True)
+
+    plugin.cfg.set("active_msg_require_optin", False)
+    check(
+        "关闭同意机制后退回按对象列表发送",
+        plugin._feature_targets(CHAT_KEY) == ["10030", "10031", "10032", "10033"],
+        str(plugin._feature_targets(CHAT_KEY)),
+    )
+    plugin.cfg.set("active_msg_require_optin", True)
+
+    # ---- 内容：AI 生成、字数上限、失败回退 ----
+    plugin.cfg.set("chat_open_max_chars", 40)
+    original_chat = plugin.ai.chat
+    captured: dict = {}
+
+    async def capturing_chat(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        captured["system"] = str(system_prompt)
+        captured["feature"] = feature
+        captured["provider"] = provider_id
+        return "今天风有点大，我这边刚忙完手头的事。"
+
+    plugin.ai.chat = capturing_chat
+    ai_text = await plugin.greet.build_chat_text()
+    check(
+        "AI 生成搭话时带上提示词与字数要求",
+        captured.get("feature") == "主动闲聊"
+        and "只输出要说的话" in captured.get("system", "")
+        and "40 字" in captured.get("system", ""),
+        str(captured)[:200],
+    )
+    check(
+        "AI 生成的内容被采用",
+        ai_text == "今天风有点大，我这边刚忙完手头的事。",
+        ai_text,
+    )
+
+    async def failing_chat(**kwargs):
+        raise RuntimeError("AI 挂了")
+
+    plugin.ai.chat = failing_chat
+    fallback_text = await plugin.greet.build_chat_text()
+    check(
+        "AI 失败时回退内置文案池",
+        fallback_text in _greet_mod.CHAT_FALLBACK_POOL,
+        fallback_text,
+    )
+
+    async def empty_chat(**kwargs):
+        return "   "
+
+    plugin.ai.chat = empty_chat
+    check(
+        "AI 返回空也回退内置文案",
+        (await plugin.greet.build_chat_text()) in _greet_mod.CHAT_FALLBACK_POOL,
+        "空返回",
+    )
+
+    async def long_chat(**kwargs):
+        return '"' + "很长的搭话内容" * 20 + '"'
+
+    plugin.ai.chat = long_chat
+    long_text = await plugin.greet.build_chat_text()
+    check(
+        "内容受字数上限约束并清洗引号",
+        len(long_text) <= 40 and not long_text.startswith('"'),
+        f"{len(long_text)}/{long_text}",
+    )
+    plugin.ai.chat = original_chat
+    check(
+        "兜底文案同样受字数上限约束",
+        len(plugin.greet._clean_chat(_greet_mod.CHAT_FALLBACK_POOL[0], 10)) == 10,
+        str(len(plugin.greet._clean_chat(_greet_mod.CHAT_FALLBACK_POOL[0], 10))),
+    )
+
+    # ---- 指令 /空间闲聊 ----
+    plugin.cfg.set("chat_open_enabled", True)
+    plugin.cfg.set("chat_open_per_day", 1)
+    plugin._rebuild_chat_tasks()
+    out = await collect(plugin.cmd_chat(FakeEvent(), ""))
+    check(
+        "无参数时显示开关、窗口、上限、今日已发与下一个窗口",
+        len(out) == 1
+        and "主动闲聊: 开启" in out[0]
+        and "12:00-13:30" in out[0]
+        and "每天上限" in out[0]
+        and "今日已发" in out[0]
+        and "下一个窗口" in out[0],
+        str(out)[:240],
+    )
+    check(
+        "无参数回执里写明不走草稿确认",
+        "不经过草稿确认" in out[0],
+        str(out)[:240],
+    )
+
+    out = await collect(plugin.cmd_chat(FakeEvent(), "off"))
+    check(
+        "off 关闭主动闲聊并停掉任务",
+        plugin.cfg.chat_open_enabled is False
+        and plugin.chat_open_tasks == []
+        and "已关闭" in out[0],
+        str(out)[:160],
+    )
+
+    out = await collect(plugin.cmd_chat(FakeEvent(), "on"))
+    check(
+        "on 打开主动闲聊并给出窗口与下次执行",
+        plugin.cfg.chat_open_enabled is True
+        and len(plugin.chat_open_tasks) == 2
+        and "主动闲聊已开启" in out[0]
+        and "12:00-13:30" in out[0]
+        and "下次执行" in out[0],
+        str(out)[:200],
+    )
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    out = await collect(plugin.cmd_chat(FakeEvent(), "now"))
+    now_recipients = chat_recipients()
+    check(
+        "now 立刻发出一条测试",
+        len(now_recipients) == 1 and any("成功 1 人" in item for item in out),
+        f"{now_recipients}/{str(out)[:160]}",
+    )
+    check(
+        "now 的回执里给出实际发送地址",
+        any("发送地址" in item and "FriendMessage" in item for item in out),
+        str(out)[:200],
+    )
+    check(
+        "now 不占用当日名额（不写去重记录）",
+        plugin.greet._sent.get(plugin.greet._today(), []) == [],
+        str(plugin.greet._sent),
+    )
+    StarTools.sent.clear()
+    out = await collect(plugin.cmd_chat(FakeEvent(), "now"))
+    check(
+        "now 忽略当日去重、可以连续发送",
+        len(chat_recipients()) == 1,
+        str(chat_recipients()),
+    )
+
+    out = await collect(plugin.cmd_chat(FakeEvent(), "乱写"))
+    check(
+        "无法识别的参数只提示用法",
+        "用法" in out[0] and plugin.cfg.chat_open_enabled is True,
+        str(out)[:160],
+    )
+
+    saved_chat_users = plugin.prefs._users
+    plugin.prefs._users = {}
+    out = await collect(plugin.cmd_chat(FakeEvent(), "now"))
+    check(
+        "无人同意时 now 明确说明原因",
+        any("没有发送" in item and "/私聊开" in item for item in out),
+        str(out)[:200],
+    )
+    plugin.prefs._users = saved_chat_users
+
+    # ---- 状态与用户侧开关 ----
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里新增主动闲聊一行",
+        any(
+            "主动闲聊: " in item and "今日已发" in item and "下一个窗口" in item
+            for item in out
+        ),
+        str([item for item in out if "主动闲聊" in item])[:200],
+    )
+
+    guidance = plugin._guidance_text()
+    check(
+        "首次引导里加入日常闲聊与时间窗口",
+        "日常闲聊" in guidance
+        and "12:00-13:30" in guidance
+        and "白天与晚上可能收到一两句招呼" in guidance,
+        guidance,
+    )
+    check("引导文案仍不超过 6 行", len(guidance.splitlines()) <= 6, str(guidance))
+
+    await collect(plugin.cmd_pm_on(FakeEvent(sender_id="10040"), ""))
+    out = await collect(plugin.cmd_pm_off(FakeEvent(sender_id="10040"), "闲聊"))
+    check(
+        "/私聊关 闲聊 只关闲聊、早安仍开",
+        plugin.prefs.allowed("10040", "chat") is False
+        and plugin.prefs.allowed("10040", "morning") is True,
+        str(plugin.prefs.get("10040")),
+    )
+    check(
+        "回执里把「日常闲聊」列进功能开关",
+        "日常闲聊" in out[0] and "关" in out[0],
+        str(out)[:200],
+    )
+    await collect(plugin.cmd_pm_on(FakeEvent(sender_id="10041"), "chat"))
+    check(
+        "英文 chat 也能开启",
+        plugin.prefs.allowed("10041", "chat") is True,
+        str(plugin.prefs.get("10041")),
+    )
+    await collect(plugin.cmd_pm_off(FakeEvent(sender_id="10041"), "日常闲聊"))
+    check(
+        "中文「日常闲聊」也能识别",
+        plugin.prefs.get("10041").feature_enabled("chat") is False,
+        str(plugin.prefs.get("10041")),
+    )
+    out = await collect(plugin.cmd_pm_on(FakeEvent(sender_id="10041"), "乱写"))
+    check(
+        "功能名提示里包含闲聊",
+        "早安、晚安、节日、闲聊" in out[0],
+        str(out)[:200],
+    )
+
+    plugin._stop_chat_tasks()
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

@@ -29,7 +29,7 @@ from astrbot.core.star.filter.command import GreedyStr
 from .core.config import PluginConfig
 from .core.content import ContentGenerator
 from .core.draft import Draft, DraftBox
-from .core.greet import HOLIDAY_KEY, GreetingService
+from .core.greet import CHAT_KEY, HOLIDAY_KEY, GreetingService, describe_windows
 from .core.holidays import days_until, table_range_text
 from .core.interact import InteractService
 from .core.life import LifeManager, time_desc
@@ -56,6 +56,9 @@ _INTERACT_TASK = "qzone_interact"
 _GREET_MORNING_TASK = "qzone_greet_morning"
 _GREET_NIGHT_TASK = "qzone_greet_night"
 _HOLIDAY_TASK = "qzone_greet_holiday"
+_CHAT_TASK = "qzone_chat_open"
+# 主动闲聊允许「窗口已过一点点」的补偿触发（AstrBot 重启或卡顿后仍算在窗口内）
+_CHAT_WINDOW_GRACE_SECONDS = 600
 
 
 class QzonePublisherPlugin(Star):
@@ -139,6 +142,9 @@ class QzonePublisherPlugin(Star):
             jitter_key="holiday_jitter",
             enabled_key="holiday_enabled",
         )
+        # 主动闲聊：每个时间窗口一个任务，窗口起点 + 窗口长度内的随机抖动
+        # （与其它定时任务一样，构造时不启动，等 initialize() 里统一 start）
+        self.chat_open_tasks: list[CronTask] = []
         self._client: Any = None
         self._draft_timer: asyncio.Task | None = None
 
@@ -149,6 +155,7 @@ class QzonePublisherPlugin(Star):
         self.greet_morning_task.start()
         self.greet_night_task.start()
         self.holiday_task.start()
+        self._rebuild_chat_tasks()
         await self._resume_pending_draft()
 
     async def _resume_pending_draft(self) -> None:
@@ -188,7 +195,110 @@ class QzonePublisherPlugin(Star):
         self.greet_morning_task.stop()
         self.greet_night_task.stop()
         self.holiday_task.stop()
+        self._stop_chat_tasks()
         await self.api.close()
+
+    # ------------------------------------------------------------------
+    # 主动闲聊：任务重建与执行
+    # ------------------------------------------------------------------
+
+    def _stop_chat_tasks(self) -> None:
+        """停止并清空主动闲聊任务。"""
+        for task in self.chat_open_tasks:
+            task.stop()
+        self.chat_open_tasks = []
+
+    def _rebuild_chat_tasks(self) -> list[str | None]:
+        """按当前配置重建主动闲聊任务：每个时间窗口一个任务。
+
+        窗口内随机取时刻的做法：任务固定在窗口起点触发，随机抖动上限设为窗口长度
+        （AstrBot 的调度器会在 0~抖动秒之间随机延后），因此实际发送时刻落在窗口内且每天不固定。
+
+        Returns:
+            各任务生效的 Cron 表达式列表。
+        """
+        self._stop_chat_tasks()
+        windows = self.greet.chat_windows
+        if not windows or not bool(self.cfg.chat_open_enabled):
+            return []
+        for index, window in enumerate(windows):
+            task = CronTask(
+                name=f"{_CHAT_TASK}[{index + 1}]",
+                timezone=self.cfg.timezone,
+                job=self._make_chat_job(index),
+                cron=window.start_cron,
+                jitter=window.duration_seconds,
+                enabled=bool(self.cfg.chat_open_enabled),
+            )
+            task.start()
+            self.chat_open_tasks.append(task)
+        return [task.cron for task in self.chat_open_tasks]
+
+    def _make_chat_job(self, index: int):
+        """为第 index 个窗口生成任务回调。"""
+
+        async def job() -> None:
+            await self._chat_open_tick(index)
+
+        return job
+
+    async def _chat_open_tick(self, index: int, now: datetime | None = None) -> None:
+        """某个时间窗口到点：确认仍在窗口内，并且是当天随机选中的窗口。
+
+        Args:
+            index: 窗口下标（对应配置里窗口列表的顺序）。
+            now: 注入的时刻，缺省取当前时间（自测用）。
+        """
+        windows = self.greet.chat_windows
+        if index >= len(windows):
+            logger.info(f"[chat] 窗口配置已变化，忽略第 {index + 1} 个窗口的触发")
+            return
+        window = windows[index]
+        moment = now or datetime.now(self.cfg.timezone)
+        if not window.contains(moment, grace_seconds=_CHAT_WINDOW_GRACE_SECONDS):
+            logger.info(
+                f"[chat] {window.text} 已错过（当前 {moment.strftime('%H:%M')}），本次跳过"
+            )
+            return
+        chosen = self.greet.select_windows(
+            windows, self.greet.chat_per_day, moment.date()
+        )
+        if index not in chosen:
+            picked = "、".join(windows[item].text for item in chosen) or "无"
+            logger.info(
+                f"[chat] 今天随机选中的窗口是 {picked}，{window.text} 本次不发送"
+            )
+            return
+        await self._run_chat_open(window)
+
+    async def _run_chat_open(self, window) -> None:
+        """在到点的窗口里发一条主动闲聊（一次只发一个人）。
+
+        Args:
+            window: 到点的窗口（仅用于日志与提示）。
+        """
+        slot_name = "主动闲聊"
+        targets = self._feature_targets(CHAT_KEY)
+        if not targets:
+            logger.info(f"{slot_name}：没有可发送对象（{window.text}），跳过本次")
+            if bool(self.cfg.notify_enabled) and bool(
+                self.cfg.active_msg_require_optin
+            ):
+                await self._notify(
+                    f"{slot_name}没有发送：{self._no_consent_note(slot_name, CHAT_KEY)}"
+                )
+            return
+
+        # 主动闲聊是私聊内容、收件人已明确同意，所以不走草稿确认：
+        # 多一次人工确认往往会错过「闲聊」的时机（与问候的 draft_for_greet 无关）。
+        try:
+            result = await self.greet.send_chat_open(targets=targets)
+        except Exception as e:
+            logger.error(f"{slot_name}发送失败: {e}")
+            return
+
+        if result.sent or result.errors:
+            await self._report_greet(slot_name, result)
 
     # ------------------------------------------------------------------
     # 平台客户端
@@ -476,16 +586,52 @@ class QzonePublisherPlugin(Star):
         )
         return "｜".join(parts)
 
+    def next_chat_window_text(self) -> str:
+        """下一个主动闲聊窗口的时刻文本。
+
+        Returns:
+            形如 ``09-24 12:07``（窗口起点 + 随机抖动后的实际调度时刻）；
+            没有已排期的窗口时给出原因说明。
+        """
+        stamps = [
+            item
+            for item in (task.next_run_datetime for task in self.chat_open_tasks)
+            if item is not None
+        ]
+        if stamps:
+            return min(stamps).strftime("%m-%d %H:%M")
+        if not self.greet.chat_windows:
+            return "未配置时间窗口"
+        if not bool(self.cfg.chat_open_enabled):
+            return "已关闭"
+        return "未调度"
+
+    def chat_open_status(self) -> str:
+        """主动闲聊的状态说明：开关 / 窗口 / 每天上限 / 今日已发 / 下一个窗口。"""
+        windows = self.greet.chat_windows
+        today = datetime.now(self.cfg.timezone).date()
+        sent = self.greet.sent_today(self.greet.chat_slot_key(today))
+        return (
+            f"{'开启' if bool(self.cfg.chat_open_enabled) else '关闭'}"
+            f"｜窗口 {describe_windows(windows)}"
+            f"｜每天最多 {self.greet.chat_per_day} 条（每次只发 1 人，同一人每天最多 1 条）"
+            f"｜今日已发 {sent} 人"
+            f"｜下一个窗口 {self.next_chat_window_text()}"
+        )
+
     def _guidance_text(self) -> str:
         """首次私聊引导的文案（不超过 6 行）。"""
         morning = describe_cron(self.cfg.greet_morning_cron)
         night = describe_cron(self.cfg.greet_night_cron)
         holiday = describe_cron(self.cfg.holiday_cron)
+        chat_windows = describe_windows(self.greet.chat_windows)
         return (
             "本机器人可能会主动私聊发消息。\n"
-            f"可能的时间段：早安 {morning}、晚安 {night}、节日祝福 {holiday}"
-            "（实际时间会随机延后，不会固定在同一秒）。\n"
-            "可能打扰到的功能：早安 / 晚安问候、传统节日祝福，以及评论回复"
+            f"可能的时间段：早安 {morning}、晚安 {night}、节日祝福 {holiday}、"
+            f"日常闲聊 {chat_windows}"
+            "（实际时间会随机延后，闲聊在窗口内随机，不会固定在同一秒）。\n"
+            "可能打扰到的功能：早安 / 晚安问候、传统节日祝福、"
+            "日常闲聊（白天与晚上可能收到一两句招呼），以及评论回复"
             "（评论回复会在说说评论区提醒被回复的人，不是私聊）。\n"
             "如需接收，回复 /私聊开；如不希望接收，回复 /私聊关。\n"
             "不回应视为不接受，不会收到任何主动消息；随时可用 /私聊开 改回来。"
@@ -1177,6 +1323,8 @@ class QzonePublisherPlugin(Star):
         if bool(self.cfg.holiday_enabled) and not holiday_targets:
             lines.append(f"　⚠️ {self._no_consent_note('节日祝福', HOLIDAY_KEY)}")
 
+        lines.append(f"主动闲聊: {self.chat_open_status()}")
+
         stats = self.prefs.stats()
         lines.append(
             f"主动消息同意: 已接受 {stats['accepted']} 人"
@@ -1552,7 +1700,7 @@ class QzonePublisherPlugin(Star):
             )
             return (
                 f"未识别该功能名「{arg}」，{kept}。\n"
-                f"可用的功能名：早安、晚安、节日。\n{self._pm_text(qq)}"
+                f"可用的功能名：早安、晚安、节日、闲聊。\n{self._pm_text(qq)}"
             )
 
         self.prefs.set_feature(qq, feature, enable)
@@ -1571,7 +1719,8 @@ class QzonePublisherPlugin(Star):
         }.get(state, "/私聊开 或 /私聊关")
         return (
             "用法: /私聊开 开启全部｜/私聊关 关闭全部｜"
-            "/私聊开 早安|晚安|节日 只开某一项｜/私聊关 早安|晚安|节日 只关某一项\n"
+            "/私聊开 早安|晚安|节日|闲聊 只开某一项｜"
+            "/私聊关 早安|晚安|节日|闲聊 只关某一项\n"
             f"随时可以改回来：{back}"
         )
 
@@ -1588,6 +1737,10 @@ class QzonePublisherPlugin(Star):
             "holiday": "holiday",
             "节日": "holiday",
             "节日祝福": "holiday",
+            "chat": "chat",
+            "闲聊": "chat",
+            "聊天": "chat",
+            "日常闲聊": "chat",
         }
         return table.get(str(token).strip().lower())
 
@@ -1601,7 +1754,8 @@ class QzonePublisherPlugin(Star):
             "时间段（由管理员设置，只读）: "
             f"早安 {describe_cron(self.cfg.greet_morning_cron)}"
             f"｜晚安 {describe_cron(self.cfg.greet_night_cron)}"
-            f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}",
+            f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}"
+            f"｜日常闲聊 {describe_windows(self.greet.chat_windows)}",
         ]
         if state == "未回答":
             lines.append("说明: 未回答视为不接受，不会收到任何主动消息")
@@ -1830,6 +1984,90 @@ class QzonePublisherPlugin(Star):
             return
 
         yield event.plain_result(self._greet_result_text(f"{slot.name}问候", result))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间闲聊", alias={"space chat", "qz chat"})
+    async def cmd_chat(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """查看或开关主动闲聊；now 立刻发一条测试（仅管理员）"""
+        self._remember_client(event)
+        parts = str(action).split()
+        require_optin = bool(self.cfg.active_msg_require_optin)
+
+        if not parts:
+            windows = self.greet.chat_windows
+            today = datetime.now(self.cfg.timezone).date()
+            targets = self._feature_targets(CHAT_KEY)
+            lines = [
+                f"主动闲聊: {'开启' if bool(self.cfg.chat_open_enabled) else '关闭'}",
+                f"时间窗口: {describe_windows(windows)}"
+                "（在每个窗口内随机取一个时刻发送）",
+                f"每天上限: {self.greet.chat_per_day} 条｜每次只发 1 人"
+                "｜同一个人每天最多 1 条",
+                f"收件人: {'已同意的用户' if require_optin else 'greet_users'}"
+                f"｜本次将发给 {len(targets)} 人（已同意）",
+                f"今日已发: {self.greet.sent_today(self.greet.chat_slot_key(today))} 人"
+                f"｜下一个窗口: {self.next_chat_window_text()}",
+                "说明: 主动闲聊是私聊内容且已获对方同意，不经过草稿确认",
+                "用法: /空间闲聊 on|off 开关；"
+                "/空间闲聊 now 立刻发一条测试（忽略时间窗口与当日去重）",
+            ]
+            if bool(self.cfg.chat_open_enabled) and not windows:
+                lines.append("　⚠️ 没有可用的时间窗口，请在配置里按 HH:MM-HH:MM 填写")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        flag = parts[0].lower()
+        if flag in _ON_FLAGS or flag in _OFF_FLAGS:
+            enabled = flag in _ON_FLAGS
+            self.cfg.set("chat_open_enabled", enabled)
+            crons = self._rebuild_chat_tasks()
+            windows = self.greet.chat_windows
+            if not enabled:
+                yield event.plain_result("主动闲聊已关闭")
+                return
+            if not windows:
+                yield event.plain_result(
+                    "已开启，但没有可用的时间窗口："
+                    "请在「主动闲聊的时间窗口」里按 HH:MM-HH:MM 填写"
+                )
+                return
+            yield event.plain_result(
+                f"主动闲聊已开启\n"
+                f"时间窗口: {describe_windows(windows)}｜每天最多 "
+                f"{self.greet.chat_per_day} 条\n"
+                f"下次执行: {self.next_chat_window_text()}"
+                f"（已排期 {len([item for item in crons if item])} 个窗口）"
+            )
+            return
+
+        if flag not in _NOW_FLAGS:
+            yield event.plain_result(
+                "用法: /空间闲聊 on|off，或 /空间闲聊 now 立刻发一条测试"
+            )
+            return
+
+        targets = self._feature_targets(CHAT_KEY)
+        if not targets:
+            note = (
+                self._no_consent_note("日常闲聊", CHAT_KEY)
+                if require_optin
+                else "没有可发送对象：请在配置里填写对象"
+            )
+            yield event.plain_result(f"主动闲聊没有发送：{note}")
+            return
+
+        yield event.plain_result(
+            f"正在给 {len(targets)} 个对象里的一位发送一条测试搭话"
+            "（忽略时间窗口与当日去重，仍遵守主动消息同意设置）..."
+        )
+        try:
+            result = await self.greet.send_chat_open(
+                targets=targets, force=True, record=False
+            )
+        except Exception as e:
+            yield event.plain_result(f"发送失败：{e}")
+            return
+        yield event.plain_result(self._greet_result_text("主动闲聊", result))
 
     @staticmethod
     def _greet_result_text(name: str, result) -> str:

@@ -9,7 +9,7 @@
         "first_seen": 1790000000,
         "asked_at": 1790000050,
         "opted_in": true,
-        "features": {"morning": true, "night": true, "holiday": true},
+        "features": {"morning": true, "night": true, "holiday": true, "chat": true},
         "updated_at": 1790000050
       }
     }
@@ -36,13 +36,14 @@ from astrbot.api import logger
 from .config import PluginConfig
 
 # 需要用户逐项同意的主动消息功能
-FEATURES: tuple[str, ...] = ("morning", "night", "holiday")
+FEATURES: tuple[str, ...] = ("morning", "night", "holiday", "chat")
 
 # 功能名 -> 展示名
 FEATURE_LABELS: dict[str, str] = {
     "morning": "早安",
     "night": "晚安",
     "holiday": "节日祝福",
+    "chat": "日常闲聊",
 }
 
 
