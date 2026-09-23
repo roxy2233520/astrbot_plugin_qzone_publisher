@@ -11,7 +11,7 @@
 **回复自己说说下的评论**（``interact_reply_enabled``，默认关闭）：
 只处理自己 ``interact_days`` 天内发布的说说，别人的评论才回复；
 同一条评论只回复一次，每轮最多 ``interact_reply_max_per_run`` 条，
-且同一条说说每轮最多回一条；开启 ``draft_for_reply`` 时先转草稿确认。
+且同一条说说每轮最多回一条；回复一律直接发出，不经过草稿确认。
 
 去重依据分别是 ``uin_tid``（好友互动）与 ``说说tid_评论tid``（回复），
 存在 ``<插件数据目录>/interacted_tids.json`` 与 ``replied_comments.json``。
@@ -201,7 +201,7 @@ class InteractService:
         if bool(self.cfg.interact_comment):
             parts.append("评论(先确认)" if bool(self.cfg.draft_for_comment) else "评论")
         if bool(self.cfg.interact_reply_enabled):
-            parts.append("回复(先确认)" if bool(self.cfg.draft_for_reply) else "回复")
+            parts.append("回复")
         return " + ".join(parts)
 
     @property
@@ -519,8 +519,7 @@ class InteractService:
         """给状态与指令用的回复模式描述。"""
         if not bool(self.cfg.interact_reply_enabled):
             return "关闭"
-        tail = "先确认" if bool(self.cfg.draft_for_reply) else "直接回复"
-        return f"开启（每轮最多 {self.reply_limit} 条，{tail}，已回复 {self.replied_count} 条）"
+        return f"开启（每轮最多 {self.reply_limit} 条，巡检到即直接回复，已回复 {self.replied_count} 条）"
 
     async def run_replies_once(self, *, force: bool = False) -> ReplyResult:
         """巡检一轮：回复自己说说下别人留下的新评论。
@@ -582,18 +581,13 @@ class InteractService:
                 f"自己的说说都在 {days} 天窗口之外（窗口由 interact_reply_days 决定）"
             )
 
-        pending = self.drafts.pending
-        occupied = (
-            pending.target_comment_tid if pending and pending.kind == "reply" else ""
-        )
-
         for post in sorted(fresh, key=lambda item: item.created_time, reverse=True):
-            if result.replied + result.drafted >= limit:
+            if result.replied >= limit:
                 break
 
             comments = await self._comments_of(post, result)
             for comment in comments:
-                if result.replied + result.drafted >= limit:
+                if result.replied >= limit:
                     break
 
                 result.checked += 1
@@ -606,10 +600,6 @@ class InteractService:
                 if self.replied(post.tid, comment.tid):
                     result.skipped += 1
                     continue
-                if not force and comment.tid == occupied:
-                    result.skipped += 1
-                    reason = "有一条新评论正在等你确认草稿，本轮跳过"
-                    continue
 
                 try:
                     await self._reply_to_comment(post, comment, result)
@@ -618,7 +608,7 @@ class InteractService:
                 # 同一条说说每轮最多回一条
                 break
 
-        if result.replied + result.drafted >= limit:
+        if result.replied >= limit:
             reason = (
                 f"本轮达到每轮上限 {limit} 条，"
                 "剩余新评论会在下一轮继续处理（可调大「每轮最多回复几条」）"
@@ -687,25 +677,7 @@ class InteractService:
         """
         content = await self._generate_reply(post, comment)
 
-        if bool(self.cfg.draft_for_reply):
-            self.drafts.put(
-                Draft(
-                    kind="reply",
-                    text=content,
-                    source="interact",
-                    target_uin=post.uin,
-                    target_tid=post.tid,
-                    target_name=comment.display_name(),
-                    target_text=comment.content,
-                    target_comment_tid=comment.tid,
-                    target_comment_uin=comment.uin,
-                    target_post_text=post.text,
-                )
-            )
-            result.drafted += 1
-            logger.info(f"已生成回复草稿：{post.tid}/{comment.tid}")
-            return
-
+        # 回复一律直接发出：不生成草稿、也不需要用户确认
         resp = await self.api.reply(
             post.uin, post.tid, comment.tid, comment.uin, content
         )
@@ -757,28 +729,3 @@ class InteractService:
         if not cleaned:
             raise RuntimeError("AI 生成的回复内容为空")
         return cleaned[:limit]
-
-    async def rewrite_reply(self, draft: Draft) -> str:
-        """按草稿记录的目标重新生成一版回复。
-
-        Args:
-            draft: 回复草稿，需带 target_tid / target_comment_tid / target_text。
-
-        Returns:
-            新生成的回复正文。
-
-        Raises:
-            RuntimeError: AI 返回内容为空时抛出。
-        """
-        post = FeedPost(
-            uin=draft.target_uin,
-            tid=draft.target_tid,
-            text=draft.target_post_text,
-        )
-        comment = FeedComment(
-            uin=draft.target_comment_uin,
-            tid=draft.target_comment_tid,
-            nickname=draft.target_name,
-            content=draft.target_text,
-        )
-        return await self._generate_reply(post, comment)

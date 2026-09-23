@@ -1,10 +1,13 @@
 """草稿确认。
 
 开启 ``draft_enabled`` 后，定时发布不会直接生效；``draft_for_comment`` /
-``draft_for_reply`` / ``draft_for_greet`` 决定评论、回复评论与问候是否也走确认。
+``draft_for_greet`` 决定评论与问候是否也走确认。
 内容先放进草稿箱并通知管理员，由 ``/空间确认``、``/空间放弃``、``/空间重写`` 处理；
 ``draft_timeout_minutes`` 大于 0 时，超时无人处理会自动放行。
 草稿会持久化到磁盘，AstrBot 重启也不会丢。
+
+回复自己说说下的评论**不再走草稿确认**（巡检到即直接发出），因此草稿箱里不会出现
+回复类草稿；旧版本遗留的回复草稿会在启动时被丢弃。
 """
 
 from __future__ import annotations
@@ -24,18 +27,17 @@ class Draft:
     """一条待确认的草稿。
 
     Attributes:
-        kind: post（说说）/ comment（评论）/ reply（回复评论）/ greet（问候）。
+        kind: post（说说）/ comment（评论）/ greet（问候）。
         text: 待发布内容。
         source: 内容来源标识，如 llm / pool / file / interact / greet。
         created_time: 生成时间戳。
-        target_uin: 评论目标作者 QQ 号（kind=comment 时为好友，
-            kind=reply 时为该说说所在的自己账号）。
-        target_tid: 评论目标说说 ID（kind=comment / reply 时有效）。
+        target_uin: 评论目标作者 QQ 号（kind=comment 时为好友）。
+        target_tid: 评论目标说说 ID（kind=comment 时有效）。
         target_name: 评论目标昵称，仅用于展示。
-        target_text: 评论目标说说正文（kind=comment）/ 被回复的评论正文（kind=reply）。
-        target_comment_tid: 被回复评论的 ID（kind=reply 时有效）。
-        target_comment_uin: 被回复评论的作者 QQ 号（kind=reply 时有效）。
-        target_post_text: 被回复评论所在说说的正文，用于重写时提供上下文。
+        target_text: 评论目标说说正文（kind=comment）。
+        target_comment_tid: 旧版本回复草稿遗留字段，仅为兼容旧数据保留。
+        target_comment_uin: 旧版本回复草稿遗留字段，仅为兼容旧数据保留。
+        target_post_text: 旧版本回复草稿遗留字段，仅为兼容旧数据保留。
         targets: 问候目标 QQ 号列表（kind=greet 时有效）。
         images: 附带图片数量（仅说说草稿有意义；图片本身不会持久化）。
     """
@@ -86,11 +88,6 @@ class Draft:
                 str(self.target_uin) if self.target_uin else "好友"
             )
             return f"评论草稿（给 {who}）"
-        if self.kind == "reply":
-            who = self.target_name or (
-                str(self.target_comment_uin) if self.target_comment_uin else "评论者"
-            )
-            return f"回复草稿（回 {who} 的评论）"
         if self.kind == "greet":
             return f"问候草稿（{len(self.targets)} 人）"
         return "说说草稿"
@@ -104,16 +101,6 @@ class Draft:
             lines.append(kv("图片", f"{self.images} 张"))
         if self.kind == "comment" and self.target_tid:
             lines.append(kv("目标说说", self.target_tid))
-        if self.kind == "reply":
-            lines.append(
-                kv(
-                    "被回复的评论",
-                    f"{self.target_name or self.target_comment_uin}"
-                    f"（{self.target_text or '无正文'}）",
-                )
-            )
-            if self.target_tid:
-                lines.append(kv("所在说说", self.target_tid))
         if self.kind == "greet" and self.targets:
             lines.append(kv("发送对象", "、".join(self.targets)))
         return lines

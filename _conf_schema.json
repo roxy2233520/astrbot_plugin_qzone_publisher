@@ -790,12 +790,6 @@
         "type": "bool",
         "default": true
       },
-      "draft_for_reply": {
-        "description": "回复评论也先走草稿确认",
-        "hint": "开启后巡检到的新评论会先转成草稿等你确认，回复会被显著延迟；关闭（默认）则巡检到即直接回复。评论巡检每 5 分钟一轮，想即时回复就保持关闭",
-        "type": "bool",
-        "default": false
-      },
       "draft_for_greet": {
         "description": "定时问候也走草稿确认",
         "hint": "开启后问候不会按时直接发出，而是先进入草稿箱，由你确认后再发给问候对象",

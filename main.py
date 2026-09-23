@@ -189,6 +189,11 @@ class QzonePublisherPlugin(Star):
     async def _resume_pending_draft(self) -> None:
         """重启后处理遗留草稿：超过超时时间就立即放行，否则补上剩余计时。"""
         draft = self.drafts.pending
+        if draft is not None and draft.kind == "reply":
+            # 回复一律直接发出，旧版本遗留的回复草稿不再需要确认，直接丢弃
+            self.drafts.pop()
+            logger.info("已丢弃旧版本遗留的回复草稿（回复不再走草稿确认）")
+            draft = self.drafts.pending
         if draft is None:
             return
 
@@ -509,7 +514,7 @@ class QzonePublisherPlugin(Star):
             await self._notify(f"\n{DIVIDER}\n".join(lines))
 
         pending = self.drafts.pending
-        if pending is not None and pending.kind in ("comment", "reply"):
+        if pending is not None and pending.kind == "comment":
             await self._send_draft(pending)
             await self._arm_draft_timer(pending)
 
@@ -998,27 +1003,6 @@ class QzonePublisherPlugin(Star):
             return plain_receipt(
                 "评论已发布",
                 [kv("草稿", draft.title()), kv("内容", draft.text)],
-                icon=ICON_OK,
-            )
-
-        if draft.kind == "reply":
-            if not (draft.target_tid and draft.target_comment_tid):
-                raise RuntimeError("草稿缺少目标说说或评论 ID，无法回复")
-            resp = await self.api.reply(
-                draft.target_uin,
-                draft.target_tid,
-                draft.target_comment_tid,
-                draft.target_comment_uin,
-                draft.text,
-            )
-            if not resp.ok:
-                raise RuntimeError(str(resp.message or resp.code))
-            # 回复真正发出后才记入去重；草稿被丢弃时下次巡检仍会重试
-            self.interact.mark_replied(draft.target_tid, draft.target_comment_tid)
-            who = draft.target_name or draft.target_comment_uin
-            return plain_receipt(
-                "已回复评论",
-                [kv("对象", who), kv("内容", draft.text)],
                 icon=ICON_OK,
             )
 
@@ -1567,8 +1551,7 @@ class QzonePublisherPlugin(Star):
                 "评论回复",
                 f"{self.interact.reply_mode_text()}"
                 f"｜巡检 {self.reply_task.cron or '未设置'}"
-                f"｜窗口 {self.interact.reply_days} 天"
-                f"｜{'先确认' if bool(self.cfg.draft_for_reply) else '直接回复'}",
+                f"｜窗口 {self.interact.reply_days} 天",
             )
         )
 
@@ -1987,12 +1970,6 @@ class QzonePublisherPlugin(Star):
                     "（旧说说下的新评论同样会被发现）",
                 ),
                 kv(
-                    "回复方式",
-                    "先转草稿等确认"
-                    if bool(self.cfg.draft_for_reply)
-                    else "巡检到即直接回复",
-                ),
-                kv(
                     "每轮上限",
                     f"{self.interact.reply_limit} 条"
                     "；同一条说说每轮最多回 1 条，多余的在下一轮继续",
@@ -2022,12 +1999,6 @@ class QzonePublisherPlugin(Star):
                     [
                         kv("巡检间隔", self.interact_reply_interval_text()),
                         kv("下次巡检", self.reply_task.next_run_time),
-                        kv(
-                            "回复方式",
-                            "先转草稿等确认"
-                            if bool(self.cfg.draft_for_reply)
-                            else "巡检到即直接回复",
-                        ),
                         kv(
                             "说明",
                             "QQ空间没有评论推送，评论只能靠定时轮询发现"
@@ -2067,9 +2038,6 @@ class QzonePublisherPlugin(Star):
                     icon=ICON_INFO,
                 )
             )
-            pending = self.drafts.pending
-            if pending is not None and pending.kind == "reply":
-                yield event.plain_result(pending.describe())
             return
 
         yield event.plain_result(
@@ -2369,7 +2337,7 @@ class QzonePublisherPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
         pending = self.drafts.pending
-        if pending is not None and pending.kind in ("comment", "reply"):
+        if pending is not None and pending.kind == "comment":
             yield event.plain_result(pending.describe())
 
     # ------------------------------------------------------------------
@@ -2995,19 +2963,22 @@ class QzonePublisherPlugin(Star):
                     target_text=draft.target_text,
                 )
             elif draft.kind == "reply":
-                text = await self.interact.rewrite_reply(draft)
-                new_draft = Draft(
-                    kind="reply",
-                    text=text,
-                    source="interact",
-                    target_uin=draft.target_uin,
-                    target_tid=draft.target_tid,
-                    target_name=draft.target_name,
-                    target_text=draft.target_text,
-                    target_comment_tid=draft.target_comment_tid,
-                    target_comment_uin=draft.target_comment_uin,
-                    target_post_text=draft.target_post_text,
+                # 回复不再走草稿：旧版本遗留的回复草稿无法重写，直接丢弃
+                self.drafts.clear()
+                yield event.plain_result(
+                    plain_receipt(
+                        "遗留草稿已失效",
+                        [
+                            kv("原因", "回复评论不再经过草稿确认"),
+                            kv(
+                                "说明",
+                                "这条旧版本的回复草稿已丢弃，回复会由巡检直接发出",
+                            ),
+                        ],
+                        icon=ICON_WARN,
+                    )
                 )
+                return
             else:
                 text = await self.content.rewrite(previous=draft.text)
                 new_draft = Draft(

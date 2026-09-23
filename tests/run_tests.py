@@ -3407,7 +3407,6 @@ async def main() -> int:
     cfg.set("interact_reply_enabled", True)
     cfg.set("interact_reply_max_per_run", 3)
     cfg.set("interact_reply_max_chars", 80)
-    cfg.set("draft_for_reply", False)
     cfg.set("draft_enabled", False)
     cfg.set("interact_days", 3)
     plugin.drafts.clear()
@@ -3568,66 +3567,29 @@ async def main() -> int:
     plugin.interact._replied = []
     replies.clear()
     plugin.drafts.clear()
-    cfg.set("draft_for_reply", True)
     feeds_payload[:] = [
         my_post(
-            "S6", 1, [comment_item("C6", "草稿模式的评论", uin=888888, name="小红")]
+            "S6", 1, [comment_item("C6", "直接回复的评论", uin=888888, name="小红")]
         )
     ]
     res = await plugin.interact.run_replies_once()
-    pending_reply = plugin.drafts.pending
     check(
-        "草稿模式：不直接发出，转成 reply 草稿",
-        res.drafted == 1
-        and res.replied == 0
-        and not replies
-        and pending_reply is not None
-        and pending_reply.kind == "reply",
-        res.summary(),
+        "回复一律直接发出，不产生任何草稿",
+        res.replied == 1
+        and res.drafted == 0
+        and len(replies) == 1
+        and plugin.drafts.pending is None,
+        f"{res.summary()}/{plugin.drafts.pending}",
     )
     check(
-        "回复草稿带目标说说 / 评论 / 评论人",
-        pending_reply is not None
-        and pending_reply.target_tid == "S6"
-        and pending_reply.target_comment_tid == "C6"
-        and pending_reply.target_comment_uin == 888888
-        and pending_reply.target_name == "小红"
-        and "草稿模式的评论" in pending_reply.target_text,
-        str(pending_reply)[:140],
-    )
-    check(
-        "回复草稿标题与描述写清回复谁",
-        pending_reply is not None
-        and "回复草稿" in pending_reply.title()
-        and "小红" in pending_reply.title()
-        and "被回复的评论" in pending_reply.describe(),
-        pending_reply.title() if pending_reply else "None",
-    )
-
-    res = await plugin.interact.run_replies_once()
-    check(
-        "已有待确认回复草稿时不再重复生成",
-        res.drafted == 0 and res.skipped == 1 and not replies,
-        res.summary(),
-    )
-
-    replies.clear()
-    out = await collect(plugin.cmd_confirm(FakeEvent()))
-    check(
-        "确认回复草稿后真的调用回复接口",
-        len(replies) == 1 and replies[-1]["form"].get("commentId") == "C6",
-        str(out)[:140],
-    )
-    check(
-        "确认后才记入去重，草稿清空",
-        plugin.interact.replied("S6", "C6") and plugin.drafts.pending is None,
-        str(plugin.interact.replied_count),
+        "回复发出后即记入去重与今日计数",
+        plugin.interact.replied("S6", "C6") and plugin.interact.replied_today >= 1,
+        f"{plugin.interact.replied_count}/{plugin.interact.replied_today}",
     )
 
     plugin.interact._replied = []
     replies.clear()
     details.clear()
-    cfg.set("draft_for_reply", False)
     detail_comments[:] = [
         comment_item("C7", "详情接口里的评论", uin=777777, name="小刚")
     ]
@@ -3665,14 +3627,22 @@ async def main() -> int:
         str(out)[:200],
     )
     check(
-        "/空间回复 状态含开关、回复方式、今日已回与下次巡检",
+        "/空间回复 状态含开关、巡检间隔、时间窗口、每轮上限与下次巡检",
         any(
             "开关：" in item
-            and "回复方式：" in item
+            and "巡检间隔：" in item
+            and "时间窗口：" in item
+            and "每轮上限：" in item
             and "今日已回" in item
             and "下次巡检" in item
             for item in out
         ),
+        str(out)[:240],
+    )
+    check(
+        "/空间回复 状态里不再出现草稿字样",
+        all("草稿" not in item for item in out)
+        and all("先确认" not in item for item in out),
         str(out)[:240],
     )
     check(
@@ -5685,20 +5655,19 @@ async def main() -> int:
     )
 
     draft_for_ui = Draft(
-        kind="reply",
+        kind="comment",
         text="排版测试的草稿正文",
         source="interact",
         target_name="小明",
         target_text="原评论",
         target_tid="TID_X",
-        target_comment_tid="CID_X",
-        target_comment_uin=10001,
     )
     draft_plain, draft_markdown = draft_for_ui.describe_pair()
     check(
         "草稿描述：纯文本版含关键信息且不含 Markdown 标记",
         "📌【草稿待确认】" in draft_plain
-        and "被回复的评论" in draft_plain
+        and "评论草稿（给 小明）" in draft_plain
+        and "目标说说" in draft_plain
         and "空间确认" in draft_plain
         and not _ui.has_markdown(draft_plain),
         draft_plain[:200],
@@ -5808,10 +5777,19 @@ async def main() -> int:
         and fresh_cfg.interact_reply_jitter == 60,
         f"{fresh_cfg.interact_reply_cron}/{fresh_cfg.interact_reply_jitter}",
     )
+    schema_now = _json.loads(
+        (REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+    )
     check(
-        "回复默认直接发出（draft_for_reply 默认关闭）",
-        fresh_cfg.draft_for_reply is False,
-        str(fresh_cfg.draft_for_reply),
+        "配置项 draft_for_reply 已从 schema 中移除",
+        "draft_for_reply" not in schema_now
+        and "draft_for_reply" not in schema_now["sec_draft"]["items"],
+        str([k for k in schema_now if "reply" in k]),
+    )
+    check(
+        "草稿确认板块不再有回复相关配置",
+        not any("reply" in key for key in schema_now["sec_draft"]["items"]),
+        str(list(schema_now["sec_draft"]["items"])),
     )
 
     # 每轮无论有没有新评论都写一行日志
@@ -5845,7 +5823,6 @@ async def main() -> int:
     )
 
     # 达到每轮上限时写明原因（剩余留到下一轮）
-    plugin.cfg.set("draft_for_reply", False)
     plugin.cfg.set("interact_reply_max_per_run", 1)
     plugin.interact._replied = []
     replies.clear()
@@ -5913,6 +5890,30 @@ async def main() -> int:
             for item in out
         ),
         str([item for item in out if "评论回复" in item])[:240],
+    )
+
+    plugin.drafts.clear()
+    plugin.interact._replied = []
+    replies.clear()
+    feeds_payload[:] = [
+        my_post("S_FILE", 1, [comment_item("C_FILE", "落盘检查的评论")])
+    ]
+    plugin.cfg.set("interact_reply_max_per_run", 3)
+    await plugin.interact.run_replies_once()
+    draft_file = plugin.cfg.draft_file
+    draft_raw = (
+        draft_file.read_text(encoding="utf-8").strip() if draft_file.exists() else ""
+    )
+    check(
+        "回复巡检不写任何草稿文件",
+        plugin.drafts.pending is None and draft_raw in ("", "{}"),
+        f"{plugin.drafts.pending}/{draft_raw[:60]}",
+    )
+    check(
+        "配置对象里不再有 draft_for_reply",
+        not hasattr(fresh_cfg, "draft_for_reply")
+        and not hasattr(plugin.cfg, "draft_for_reply"),
+        str(getattr(fresh_cfg, "draft_for_reply", "不存在")),
     )
 
     out = await collect(plugin.cmd_reply(FakeEvent(), "now"))
