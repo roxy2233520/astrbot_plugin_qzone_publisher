@@ -3943,41 +3943,91 @@ async def main() -> int:
     festival_of = _holidays.festival_of
     next_festival = _holidays.next_festival
     check(
-        "节日表覆盖 50 条",
-        len(_holidays.FESTIVALS) == 50,
-        str(len(_holidays.FESTIVALS)),
+        "支持的节日清单为 7 个",
+        _holidays.FESTIVAL_NAMES
+        == ("除夕", "春节", "元宵", "情人节", "七夕", "中秋", "国庆"),
+        str(_holidays.FESTIVAL_NAMES),
     )
     check(
-        "节日表范围说明",
+        "农历节日表覆盖 25 条（5 个节日 × 5 年）",
+        len(_holidays.LUNAR_FESTIVALS) == 25,
+        str(len(_holidays.LUNAR_FESTIVALS)),
+    )
+    check(
+        "固定公历节日为情人节与国庆",
+        _holidays.FIXED_FESTIVALS == {"02-14": "情人节", "10-01": "国庆"},
+        str(_holidays.FIXED_FESTIVALS),
+    )
+    check(
+        "农历表范围说明",
         _holidays.table_range_text() == "2026-2030 年",
         _holidays.table_range_text(),
     )
     for name, day, expected in (
-        ("春节", date(2026, 2, 17), "春节"),
+        # 2026：五个农历节日 + 两个固定公历节日
         ("除夕", date(2026, 2, 16), "除夕"),
-        ("元宵", date(2028, 2, 9), "元宵"),
-        ("清明", date(2029, 4, 4), "清明"),
-        ("端午", date(2030, 6, 5), "端午"),
-        ("七夕", date(2027, 8, 8), "七夕"),
-        ("中秋", date(2028, 10, 3), "中秋"),
-        ("重阳", date(2030, 10, 5), "重阳"),
-        ("腊八", date(2028, 1, 4), "腊八"),
-        ("小年", date(2029, 2, 6), "小年"),
+        ("春节", date(2026, 2, 17), "春节"),
+        ("元宵", date(2026, 3, 3), "元宵"),
+        ("七夕", date(2026, 8, 19), "七夕"),
+        ("中秋", date(2026, 9, 25), "中秋"),
+        ("情人节", date(2026, 2, 14), "情人节"),
+        ("国庆", date(2026, 10, 1), "国庆"),
+        # 其余年份抽查
+        ("2027 春节", date(2027, 2, 6), "春节"),
+        ("2027 中秋", date(2027, 9, 15), "中秋"),
+        ("2028 除夕", date(2028, 1, 25), "除夕"),
+        ("2028 中秋", date(2028, 10, 3), "中秋"),
+        ("2029 元宵", date(2029, 2, 27), "元宵"),
+        ("2030 七夕", date(2030, 8, 5), "七夕"),
+        ("2030 国庆", date(2030, 10, 1), "国庆"),
     ):
         check(f"{name} 日期正确", festival_of(day) == expected, str(festival_of(day)))
     check("非节日返回 None", festival_of(date(2026, 3, 1)) is None, "None")
-    check("超出表范围返回 None", festival_of(date(2032, 2, 1)) is None, "None")
+    check(
+        "不在清单内的日期不命中",
+        festival_of(date(2030, 6, 5)) is None,
+        "非节日日期",
+    )
+    check(
+        "农历表范围外的农历日期返回 None",
+        festival_of(date(2032, 2, 1)) is None,
+        "None",
+    )
+    check(
+        "固定公历节日不受年份限制",
+        festival_of(date(2032, 2, 14)) == "情人节"
+        and festival_of(date(2035, 10, 1)) == "国庆",
+        str(festival_of(date(2032, 2, 14))),
+    )
     found = next_festival(date(2026, 9, 20))
     check(
         "下一个节日查询正确",
         found == ("中秋", date(2026, 9, 25)),
         str(found),
     )
-    same_day = next_festival(date(2027, 6, 9))
+    same_day = next_festival(date(2026, 2, 17))
     check(
         "当天是节日时返回当天",
-        same_day is not None and same_day[1] == date(2027, 6, 9),
+        same_day is not None and same_day[1] == date(2026, 2, 17),
         str(same_day),
+    )
+    before_valentine = next_festival(date(2026, 2, 10))
+    check(
+        "下一个节日包含情人节",
+        before_valentine == ("情人节", date(2026, 2, 14)),
+        str(before_valentine),
+    )
+    before_national = next_festival(date(2026, 9, 30))
+    check(
+        "下一个节日包含国庆",
+        before_national == ("国庆", date(2026, 10, 1)),
+        str(before_national),
+    )
+    beyond_table = next_festival(date(2031, 1, 1))
+    check(
+        "农历表范围外仍能找到固定公历节日",
+        beyond_table == ("情人节", date(2031, 2, 14)),
+        str(beyond_table),
     )
 
     plugin.cfg.set("greet_users", ["10020"])

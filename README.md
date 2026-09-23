@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-441%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-452%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -37,7 +37,7 @@
 | 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限，默认先转草稿确认 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
 | 定时问候 | 按时间给指定用户**私聊**发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
-| 节日祝福 | 传统节日当天给指定用户**私聊**发一条祝福（`holiday_enabled`，**默认关闭**）：覆盖 2026-2030 年的除夕、春节、元宵、清明、端午、七夕、中秋、重阳、腊八、小年；当天不是节日不发，同一节日只发一次 |
+| 节日祝福 | 节日当天给指定用户**私聊**发一条祝福（`holiday_enabled`，**默认关闭**）：支持除夕、春节、元宵、情人节、七夕、中秋、国庆共 7 个节日，当天不是节日不发，同一节日只发一次 |
 | 用户同意 | 主动消息默认**需要对方同意**：用户第一次私聊会收到一条简短说明，可用 `/空间偏好` 接受、拒绝或逐项开关；未接受的人不会被主动打扰 |
 | 运维 | 发布历史、失败通知、`/空间状态` 一屏看全、`/空间删除` 按 tid 删说说 |
 
@@ -292,9 +292,13 @@
 | `holiday_prompt` | 见默认值 | 节日祝福提示词，`{festival}` 会被替换成节日名 |
 | `holiday_pool` | 3 条示例 | 节日祝福文案池（AI 不可用时随机取一条，同样支持 `{festival}`） |
 
-节日祝福覆盖 2026-2030 年的除夕、春节、元宵、清明、端午、七夕、中秋、重阳、腊八、小年
-（依香港天文台《公曆與農曆日期對照表》逐年核对，见 `core/holidays.py` 开头说明）；
-超出范围的年份会写 warning 日志提醒更新，不会静默失效。
+节日清单共 7 个：
+
+- 农历节日 5 个：除夕、春节、元宵、七夕、中秋。公历日期覆盖 2026-2030 年，
+  依香港天文台《公曆與農曆對照表》逐年核对（来源与核对方式写在 `core/holidays.py` 开头）；
+  超出范围的年份会写 warning 日志提醒更新，不会静默失效（农历节日在表外年份不触发）。
+- 固定公历节日 2 个：情人节（2 月 14 日）、国庆（10 月 1 日），任何年份都生效。
+
 是否先转草稿确认沿用 `draft_for_greet`。
 
 ### 空间说说
@@ -559,7 +563,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 441 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 452 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png
