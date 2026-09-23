@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -20,6 +21,123 @@ from .config import PluginConfig
 
 _TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{1,2})$")
 _UNSET = object()
+# 计算「下一个匹配时刻」时最多向前搜索的天数
+_NEXT_MOMENT_SEARCH_DAYS = 8
+
+
+def _parse_field(field: str) -> set[int] | None:
+    """解析 Cron 的一个字段，返回它包含的取值集合。
+
+    支持 ``*``、``a``、``a,b``、``a-b`` 与 ``*/n``；其它写法（含 5 段以上的复杂语法）返回 None，
+    表示无法精确计算。
+
+    Args:
+        field: Cron 中的单个字段，例如 ``0,30`` 或 ``12-13,20-22``。
+
+    Returns:
+        取值集合；无法解析时返回 None。
+    """
+    text = str(field or "").strip()
+    if not text:
+        return None
+    if text == "*":
+        return None  # 由调用方按「任意值」处理
+
+    values: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            return None
+        step = re.match(r"^(\d+)-(\d+)/(\d+)$", part)
+        if step:
+            start, end, size = (int(item) for item in step.groups())
+            if size <= 0:
+                return None
+            values.update(range(start, end + 1, size))
+            continue
+        every = re.match(r"^\*/(\d+)$", part)
+        if every:
+            size = int(every.group(1))
+            if size <= 0:
+                return None
+            values.update(range(0, 60, size))
+            continue
+        span = re.match(r"^(\d+)-(\d+)$", part)
+        if span:
+            start, end = (int(item) for item in span.groups())
+            values.update(range(start, end + 1))
+            continue
+        if part.isdigit():
+            values.add(int(part))
+            continue
+        return None
+    return values or None
+
+
+def next_cron_moment(cron: str, now: datetime) -> datetime | None:
+    """计算给定时刻之后的下一个 Cron 匹配时刻。
+
+    只按「分钟」与「小时」两个字段计算（本插件用它回答「下一轮什么时候跑」）；
+    日 / 月 / 周字段不是 ``*`` 时无法判断，直接返回 None，交由调度器决定。
+
+    Args:
+        cron: 5 段 Cron 表达式。
+        now: 当前时刻（带时区）。
+
+    Returns:
+        下一个匹配时刻；无法计算时返回 None。
+    """
+    fields = str(cron or "").split()
+    if len(fields) != 5:
+        return None
+    minute_field, hour_field, day, month, day_of_week = fields
+    if any(item != "*" for item in (day, month, day_of_week)):
+        return None
+
+    minutes = _parse_field(minute_field)
+    hours = _parse_field(hour_field)
+    minute_set = minutes if minutes is not None else set(range(60))
+    hour_set = hours if hours is not None else set(range(24))
+
+    moment = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    for _ in range(_NEXT_MOMENT_SEARCH_DAYS * 24 * 60):
+        if moment.hour in hour_set and moment.minute in minute_set:
+            return moment
+        moment += timedelta(minutes=1)
+    return None
+
+
+def describe_cron_windows(cron: str) -> str:
+    """把 Cron 里的小时范围说成「每天 12:00-14:00、20:00-23:00」这样的人话。
+
+    只在小 / 时字段是「连续区间列表」且分钟字段固定时给出区间描述；否则返回空串。
+
+    Args:
+        cron: 5 段 Cron 表达式。
+
+    Returns:
+        时段描述；无法归纳时返回空串。
+    """
+    fields = str(cron or "").split()
+    if len(fields) != 5:
+        return ""
+    _minute_field, hour_field, day, month, day_of_week = fields
+    if any(item != "*" for item in (day, month, day_of_week)):
+        return ""
+
+    hours = _parse_field(hour_field)
+    if not hours:
+        return ""
+
+    spans: list[tuple[int, int]] = []
+    for hour in sorted(hours):
+        if spans and hour == spans[-1][1] + 1:
+            spans[-1] = (spans[-1][0], hour)
+        else:
+            spans.append((hour, hour))
+
+    labels = [f"{start:02d}:00-{end + 1:02d}:00" for start, end in spans]
+    return "每天 " + "、".join(labels)
 
 
 def normalize_cron(spec: str) -> str | None:

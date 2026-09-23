@@ -5733,7 +5733,7 @@ async def main() -> int:
     plugin.api.FEEDS_URL = "http://127.0.0.1:8792/feeds"
     plugin.api.DETAIL_URL = "http://127.0.0.1:8792/detail"
     plugin.api.REPLY_URL = "http://127.0.0.1:8792/reply"
-    plugin.cfg.set("interact_reply_cron", "*/30 8-23 * * *")
+    plugin.cfg.set("interact_reply_cron", "0,30 12-13,20-22 * * *")
     plugin.cfg.set("interact_reply_jitter", 120)
     plugin.cfg.set("interact_reply_days", 7)
     plugin.cfg.set("interact_cron", "0 21 * * *")
@@ -5742,7 +5742,7 @@ async def main() -> int:
     check(
         "回复巡检按自己的时间配置调度",
         plugin.reply_task.name == "qzone_reply"
-        and cron == "*/30 8-23 * * *"
+        and cron == "0,30 12-13,20-22 * * *"
         and plugin.reply_task.running,
         f"{plugin.reply_task.name}/{cron}/{plugin.reply_task.running}",
     )
@@ -5759,10 +5759,14 @@ async def main() -> int:
         f"{plugin.interact_task.cron}/{plugin.reply_task.cron}",
     )
     check(
-        "巡检间隔的人话说明能读出每 N 分钟与最坏延迟",
-        "每 30 分钟一次（*/30 8-23 * * *）" in plugin.interact_reply_interval_text()
-        and "发现延迟上限约 30 分钟 + 抖动 120 秒"
-        in plugin.interact_reply_interval_text(),
+        "巡检间隔的人话说明含时段、下一轮与最坏延迟",
+        "每 30 分钟一轮" in plugin.interact_reply_interval_text()
+        and "时段：每天 12:00-14:00、20:00-23:00"
+        in plugin.interact_reply_interval_text()
+        and "下一轮" in plugin.interact_reply_interval_text()
+        and "最坏延迟：时段内 30 分钟 + 抖动 120 秒"
+        in plugin.interact_reply_interval_text()
+        and "跨时段则等到下一个时段" in plugin.interact_reply_interval_text(),
         plugin.interact_reply_interval_text(),
     )
 
@@ -5774,8 +5778,8 @@ async def main() -> int:
         f"{fresh_cfg.interact_reply_days}/{fresh_cfg.interact_days}",
     )
     check(
-        "回复巡检间隔默认每 30 分钟，抖动 120 秒",
-        fresh_cfg.interact_reply_cron == "*/30 8-23 * * *"
+        "回复巡检默认只在中午与晚上两个时段、每 30 分钟一轮",
+        fresh_cfg.interact_reply_cron == "0,30 12-13,20-22 * * *"
         and fresh_cfg.interact_reply_jitter == 120,
         f"{fresh_cfg.interact_reply_cron}/{fresh_cfg.interact_reply_jitter}",
     )
@@ -5871,8 +5875,9 @@ async def main() -> int:
         plugin.cfg.interact_reply_enabled is True
         and plugin.reply_task.running
         and any("下次巡检" in item for item in out)
-        and any("每 30 分钟一次" in item for item in out)
-        and any("发现延迟上限约 30 分钟" in item for item in out),
+        and any("每 30 分钟一轮" in item for item in out)
+        and any("时段：每天 12:00-14:00、20:00-23:00" in item for item in out)
+        and any("最坏延迟" in item for item in out),
         str(out)[:240],
     )
     check(
@@ -5887,7 +5892,7 @@ async def main() -> int:
         "状态里的评论回复行含巡检间隔与窗口",
         any(
             "评论回复" in item
-            and "巡检 */30 8-23 * * *" in item
+            and "巡检 0,30 12-13,20-22 * * *" in item
             and "窗口 7 天" in item
             for item in out
         ),
@@ -5928,6 +5933,77 @@ async def main() -> int:
         "now 不改变开关状态",
         plugin.cfg.interact_reply_enabled is True,
         str(plugin.cfg.interact_reply_enabled),
+    )
+
+    # 巡检时段：中午 12:00-14:00 与晚上 20:00-23:00，每 30 分钟一轮
+    _sched_mod = _imp("core.scheduler")
+    _next_moment = _sched_mod.next_cron_moment
+    _window_text = _sched_mod.describe_cron_windows
+    reply_cron = plugin.reply_task.cron or ""
+    check(
+        "默认巡检时段归纳为中午与晚上两段",
+        _window_text(reply_cron) == "每天 12:00-14:00、20:00-23:00",
+        _window_text(reply_cron),
+    )
+
+    def _moment_before(text: str):
+        """取某个时刻的前一分钟，用来断言它是否是巡检时刻。"""
+        hour, minute = (int(item) for item in text.split(":"))
+        return datetime(2026, 9, 24, hour, minute, tzinfo=tz) - timedelta(minutes=1)
+
+    for hit in ("12:00", "13:30", "20:00", "22:30"):
+        got = _next_moment(reply_cron, _moment_before(hit))
+        check(
+            f"{hit} 是巡检时刻",
+            got is not None and got.strftime("%H:%M") == hit,
+            str(got),
+        )
+
+    for miss, expect in (
+        ("11:30", "12:00"),
+        ("14:30", "20:00"),
+        ("19:30", "20:00"),
+        ("23:30", "次日 12:00"),
+    ):
+        base = _moment_before(miss)
+        got = _next_moment(reply_cron, base)
+        first = expect.replace("次日 ", "")
+        ok = got is not None and got.strftime("%H:%M") == first
+        if expect.startswith("次日"):
+            ok = ok and got is not None and got.date() != base.date()
+        check(f"{miss} 不是巡检时刻（下一轮 {expect}）", ok, str(got))
+
+    check(
+        "状态里的下一轮在时段内给出整点半点",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 13, 0, tzinfo=tz))
+        == "13:30",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 13, 0, tzinfo=tz)),
+    )
+    check(
+        "时段外的下一轮落到下一个时段",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 19, 30, tzinfo=tz))
+        == "20:00",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)),
+    )
+    check(
+        "23:40 的下一轮是次日中午 12:00",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 23, 40, tzinfo=tz))
+        == "次日 12:00",
+        plugin.next_reply_run_text(now=datetime(2026, 9, 24, 23, 40, tzinfo=tz)),
+    )
+    check(
+        "间隔说明里也会给出时段与下一轮",
+        "时段：每天 12:00-14:00、20:00-23:00"
+        in plugin.interact_reply_interval_text(
+            now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)
+        )
+        and "下一轮 20:00"
+        in plugin.interact_reply_interval_text(
+            now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)
+        ),
+        plugin.interact_reply_interval_text(
+            now=datetime(2026, 9, 24, 19, 30, tzinfo=tz)
+        ),
     )
 
     # ==================================================================

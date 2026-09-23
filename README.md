@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-686%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-699%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -139,7 +139,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 - 说说互动：在面板里把 `interact_uins` 填成要关注的 QQ 号，`interact_enabled` 打开即可开始只读巡检；
   点赞（`interact_like`）与 AI 评论（`interact_comment`）需要单独打开。
-- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开即可；默认巡检到就直接回复，回复间隔由 `interact_reply_cron` 决定（默认每 30 分钟一轮，可自行调紧）。
+- 回复评论：用 `/空间回复 on` 或配置项 `interact_reply_enabled` 打开即可；默认巡检到就直接回复，巡检时段与间隔由 `interact_reply_cron` 决定（默认只在中午 12:00–14:00 与晚上 20:00–23:00 每 30 分钟一轮，可自行调整）。
 
 ### 第七步：确认通知与管理员
 
@@ -433,11 +433,15 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 - **没有评论推送，只能轮询**：OneBot(NapCat) 只推送 QQ 消息事件，QQ空间的新评论没有
   推送或回调通道，因此评论只能靠定时轮询发现。回复巡检是**独立任务**
-  （`interact_reply_cron`，默认 `*/30 8-23 * * *` 即白天到晚上每 30 分钟一轮，
+  （`interact_reply_cron`，默认 `0,30 12-13,20-22 * * *`，
   另有 `interact_reply_jitter` 随机抖动），不再搭在一天一次的好友巡检上。
-  **最坏延迟 = 巡检间隔 + 抖动**（默认约 30~32 分钟）；巡检越频繁发现越及时，
-  但请求次数越多越可能触发风控与登录态失效：30 分钟一轮约每天 50~100 次请求，
-  5 分钟一轮约 300~600 次，可按需在面板里调整。
+  默认**只在中午与晚上两个时段巡检**，每 30 分钟一轮：
+  中午 12:00 / 12:30 / 13:00 / 13:30，晚上 20:00 / 20:30 / 21:00 / 21:30 / 22:00 / 22:30，
+  各加 0~2 分钟抖动；**不在时段内的评论要等到下一个时段才会被回复**
+  （例如 23:40 的评论，次日中午 12:00 才处理）。
+  因此最坏延迟是：时段内 ≤ 巡检间隔 + 抖动，跨时段则等到下一个时段。
+  时段与间隔都可以在面板里调整；巡检越频繁越及时，但请求次数越多越可能
+  触发风控与登录态失效（每轮都要拉一次自己的说说列表，必要时还要取详情）。
 - **回复有自己的时间窗口** `interact_reply_days`（默认 7 天）：只处理这么多天内
   **自己发布的**说说，比好友互动的 `interact_days`（默认 3 天）更长，
   旧说说下新来的评论同样会被发现；说说列表没带评论明细时，会再请求一次说说详情补取，
@@ -623,8 +627,8 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
 | `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复；默认巡检到就直接回复 |
-| `interact_reply_cron` | `*/30 8-23 * * *` | **评论回复的巡检间隔**：默认白天到晚上每 30 分钟检查一次自己的说说有没有新评论。QQ空间没有评论推送通道，评论只能靠定时轮询发现；巡检越频繁越及时，但请求越多越可能触发风控：30 分钟一轮约每天 50~100 次请求，5 分钟一轮约 300~600 次；支持 `HH:MM` 或 5 段 Cron |
-| `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒，避免卡在同一秒；最坏延迟 = 间隔 + 抖动 |
+| `interact_reply_cron` | `0,30 12-13,20-22 * * *` | **评论回复的巡检时段与间隔**：默认只在中午 12:00–14:00 与晚上 20:00–23:00 每 30 分钟巡检一轮，实际触发点为 12:00 / 12:30 / 13:00 / 13:30 与 20:00 / 20:30 / 21:00 / 21:30 / 22:00 / 22:30；**时段外的评论要等到下一个时段**（例如 23:40 的评论次日 12:00 才处理）。QQ空间没有评论推送通道，评论只能靠定时轮询发现；巡检越频繁越及时，但请求越多越可能触发风控与登录态失效；支持 `HH:MM` 或 5 段 Cron，可自行调整时段与间隔 |
+| `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒（默认最多 2 分钟），避免卡在同一秒；最坏延迟 = 时段内的巡检间隔 + 抖动，跨时段则等到下一个时段 |
 | `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |
 | `llm_reply_provider_id` | 空 | 回复单独指定模型提供商（留空用全局） |
 | `interact_reply_prompt` | 见默认值 | 回复提示词 |

@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import re
 import time
 from datetime import date, datetime
+from itertools import pairwise
 from typing import Any
 
 from astrbot.api import logger
@@ -40,7 +40,10 @@ from .core.render import ReceiptRenderer
 from .core.scheduler import (
     CronTask,
     CronTaskGroup,
+    _parse_field,
     describe_cron,
+    describe_cron_windows,
+    next_cron_moment,
     normalize_cron,
     split_times,
 )
@@ -755,35 +758,76 @@ class QzonePublisherPlugin(Star):
         )
         return "｜".join(parts)
 
-    def interact_reply_interval_text(self) -> str:
-        """评论巡检间隔的人话说明（含最坏延迟）。
+    def next_reply_run_text(self, now: datetime | None = None) -> str:
+        """下一轮评论巡检的时刻（人话）。
+
+        Args:
+            now: 注入的当前时刻，缺省取当前时间。
 
         Returns:
-            形如「每 30 分钟一次（*/30 8-23 * * *）｜发现延迟上限约 30 分钟 + 抖动 120 秒」。
+            形如 ``20:00``；跨到第二天时形如 ``次日 12:00``；无法计算时给出说明。
+        """
+        moment = now or datetime.now(self.cfg.timezone)
+        # 用 Cron 计算基础触发时刻（不含随机抖动），这样显示的是整点/半点，
+        # 例如「下一轮 20:00」；算不出来时才退回调度器的排期时间。
+        stamp = next_cron_moment(str(self.reply_task.cron or ""), moment)
+        if stamp is None:
+            stamp = self.reply_task.next_run_datetime
+        if stamp is None:
+            return "未排期"
+        text = stamp.strftime("%H:%M")
+        if stamp.date() != moment.date():
+            return f"次日 {text}"
+        return text
+
+    def interact_reply_interval_text(self, now: datetime | None = None) -> str:
+        """评论巡检间隔的人话说明（含时段、下一轮与最坏延迟）。
+
+        Args:
+            now: 注入的当前时刻，缺省取当前时间。
+
+        Returns:
+            形如「每 30 分钟一轮｜时段：每天 12:00-14:00、20:00-23:00｜下一轮 20:00
+            ｜最坏延迟：时段内 30 分钟 + 抖动 120 秒，跨时段则等到下一个时段」。
         """
         cron = str(self.reply_task.cron or "").strip()
         if not cron:
             return "未设置（不会自动巡检）"
 
         every_minutes = 0
-        fields = cron.split()
-        if len(fields) == 5:
-            minute, hour = fields[0], fields[1]
-            step = re.match(r"^\*/(\d+)$", minute)
-            if step:
-                every_minutes = max(int(step.group(1)), 1)
-            elif minute.isdigit() and hour.isdigit():
-                every_minutes = 24 * 60
+        minutes = _parse_field(cron.split()[0]) if len(cron.split()) == 5 else None
+        if minutes and len(minutes) > 1:
+            ordered = sorted(minutes)
+            step = ordered[1] - ordered[0]
+            if step > 0 and all(
+                later - earlier == step for earlier, later in pairwise(ordered)
+            ):
+                every_minutes = step
 
         jitter = max(int(self.reply_task.jitter or 0), 0)
+        window = describe_cron_windows(cron)
         if every_minutes <= 0:
-            return f"按 {cron}｜发现延迟取决于巡检间隔 + 抖动 {jitter} 秒"
+            return (
+                f"按 {cron}｜下一轮 {self.next_reply_run_text(now)}"
+                f"｜最坏延迟取决于巡检间隔 + 抖动 {jitter} 秒"
+            )
         if every_minutes >= 24 * 60:
-            return f"每天一次（{cron}）｜发现延迟上限约 24 小时 + 抖动 {jitter} 秒"
-        return (
-            f"每 {every_minutes} 分钟一次（{cron}）"
-            f"｜发现延迟上限约 {every_minutes} 分钟 + 抖动 {jitter} 秒"
+            return (
+                f"每天一次（{cron}）｜下一轮 {self.next_reply_run_text(now)}"
+                f"｜最坏延迟：约 24 小时 + 抖动 {jitter} 秒"
+            )
+
+        parts = [f"每 {every_minutes} 分钟一轮"]
+        if window:
+            parts.append(f"时段：{window}")
+        else:
+            parts.append(f"按 {cron}")
+        parts.append(f"下一轮 {self.next_reply_run_text(now)}")
+        parts.append(
+            f"最坏延迟：时段内 {every_minutes} 分钟 + 抖动 {jitter} 秒，"
+            "跨时段则等到下一个时段"
         )
+        return "｜".join(parts)
 
     def next_chat_window_text(self) -> str:
         """下一个主动闲聊窗口的时刻文本。
