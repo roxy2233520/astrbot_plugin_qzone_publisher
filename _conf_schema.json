@@ -47,12 +47,24 @@
   },
   "sec_private": {
     "description": "私聊问候",
-    "hint": "定时给指定用户私聊发早安 / 晚安",
+    "hint": "定时给指定用户私聊发早安 / 晚安与传统节日祝福",
     "type": "object",
     "items": {
+      "active_msg_require_optin": {
+        "description": "主动消息需要用户同意",
+        "hint": "开启后，只有用 /空间偏好 明确接受过的用户才会收到早安、晚安与节日祝福；未接受的人会被跳过，并在结果里计入「因未接受主动消息跳过」",
+        "type": "bool",
+        "default": true
+      },
       "greet_enabled": {
         "description": "启用定时问候",
         "hint": "按下面的时间，给 greet_users 里的每个人私聊发送问候；默认关闭",
+        "type": "bool",
+        "default": false
+      },
+      "holiday_enabled": {
+        "description": "启用节日祝福",
+        "hint": "中国传统节日当天给配置的对象发一条私聊祝福；需对方在 /空间偏好 里接受节日祝福；默认关闭",
         "type": "bool",
         "default": false
       },
@@ -74,6 +86,12 @@
         "type": "string",
         "default": "0 23 * * *"
       },
+      "holiday_cron": {
+        "description": "节日祝福的发送时间",
+        "hint": "支持 HH:MM 或 5 段 Cron；当天不是内置节日则不发送",
+        "type": "string",
+        "default": "0 9 * * *"
+      },
       "greet_jitter": {
         "description": "问候时间的随机抖动（秒）",
         "hint": "在触发时间上随机延后 0~N 秒，让问候不像定时机器人",
@@ -85,9 +103,27 @@
         },
         "default": 600
       },
+      "holiday_jitter": {
+        "description": "节日祝福的随机抖动（秒）",
+        "hint": "触发后随机延后 0~N 秒，不固定在同一秒发出",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 3600,
+          "step": 1
+        },
+        "default": 600
+      },
       "llm_greet_provider_id": {
         "description": "生成问候语用的提供商（可选）",
         "hint": "greet_use_ai 开启时生效；留空则沿用上面的提供商",
+        "type": "string",
+        "_special": "select_provider",
+        "default": ""
+      },
+      "llm_holiday_provider_id": {
+        "description": "节日祝福使用的提供商（可选）",
+        "hint": "留空则使用 AstrBot 当前默认提供商",
         "type": "string",
         "_special": "select_provider",
         "default": ""
@@ -126,12 +162,31 @@
           "今天辛苦了，晚安。",
           "晚安，做个好梦。"
         ]
+      },
+      "holiday_prompt": {
+        "description": "节日祝福的提示词",
+        "hint": "可用占位符：{festival}（会被替换成节日名）",
+        "type": "text",
+        "editor_mode": true,
+        "editor_language": "markdown",
+        "editor_theme": "vs-dark",
+        "default": "用你自己的说话风格，给一个你很在意的人写一句{festival}祝福，一到两句话，自然、有温度，不要解释、不要加引号、不要分点或罗列。"
+      },
+      "holiday_pool": {
+        "description": "节日祝福文案池",
+        "hint": "AI 不可用或返回为空时，从这里随机取一条",
+        "type": "list",
+        "default": [
+          "{festival}到了，愿你今天顺心。",
+          "又是一年{festival}，记得吃好一点。",
+          "{festival}快乐，我这边一切都好。"
+        ]
       }
     }
   },
   "sec_post": {
     "description": "空间说说",
-    "hint": "手动 / 定时发布说说，内容来源与联网素材都在这里",
+    "hint": "手动 / 定时发布说说：每天几条、什么时间、内容来源与联网素材",
     "type": "object",
     "items": {
       "auto_publish_enabled": {
@@ -140,9 +195,28 @@
         "hint": "默认关闭，避免与其他 QQ空间插件重复发说说。确认好发布时间后用 /空间开关 on 打开",
         "default": false
       },
+      "publish_per_day": {
+        "description": "每天自动发布几条",
+        "hint": "0 表示不自动发布；超过时间点个数时按时间点个数算",
+        "type": "int",
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        },
+        "default": 1
+      },
+      "publish_times": {
+        "description": "发布时间点列表",
+        "hint": "例如 [\"08:30\", \"12:30\"]；按列表顺序取前「每天自动发布几条」个，每个时间点各自加随机抖动。留空或全部无法识别时，回退用下面「自动发布时间」",
+        "type": "list",
+        "default": [
+          "08:30"
+        ]
+      },
       "publish_cron": {
-        "description": "自动发布时间",
-        "hint": "支持两种写法：① HH:MM，例如 08:30；② 5 段 Cron 表达式，例如 30 8 * * *（分 时 日 月 周）。留空表示不自动发布",
+        "description": "自动发布时间（兼容项）",
+        "hint": "仅当「发布时间点列表」为空或全部无法识别时，作为唯一时间点生效；支持 HH:MM 或 5 段 Cron",
         "type": "string",
         "default": "30 8 * * *"
       },

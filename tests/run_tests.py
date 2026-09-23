@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 import types
+from datetime import date
 from pathlib import Path
 from typing import ClassVar
 
@@ -214,12 +215,24 @@ def install_stubs() -> None:
             ADMIN = "admin"
             MEMBER = "member"
 
+        class EventMessageType:
+            """事件类型枚举（与 AstrBot 一致的含义）。"""
+
+            GROUP_MESSAGE = "group"
+            PRIVATE_MESSAGE = "private"
+            OTHER_MESSAGE = "other"
+            ALL = "all"
+
         @staticmethod
         def permission_type(*args, **kwargs):
             return lambda func: func
 
         @staticmethod
         def command(*args, **kwargs):
+            return lambda func: func
+
+        @staticmethod
+        def event_message_type(*args, **kwargs):
             return lambda func: func
 
         @staticmethod
@@ -460,11 +473,29 @@ class FakeContext:
 class FakeEvent:
     """模拟消息事件。"""
 
-    def __init__(self, message=None, bot=None) -> None:
-        self.unified_msg_origin = "aiocqhttp:FriendMessage:123456"
+    def __init__(
+        self,
+        message=None,
+        bot=None,
+        *,
+        text: str = "",
+        sender_id: str = "123456",
+        umo: str = "",
+    ) -> None:
+        self.unified_msg_origin = umo or "aiocqhttp:FriendMessage:123456"
         self.message_obj = types.SimpleNamespace(message=message or [])
         self.bot = bot
         self.results: list[str] = []
+        self.message_str = text
+        self._sender_id = sender_id
+
+    def get_sender_id(self) -> str:
+        """发送者 QQ 号（默认与私聊 UMO 里的会话号一致）。"""
+        return self._sender_id
+
+    def is_private_chat(self) -> bool:
+        """是否私聊（按 UMO 判断）。"""
+        return ":FriendMessage:" in self.unified_msg_origin
 
     def plain_result(self, text: str) -> str:
         return text
@@ -1001,13 +1032,19 @@ async def main() -> int:
     check("历史指令有输出", "发布记录" in out[0], out[0][:120])
 
     out = await collect(plugin.cmd_schedule(FakeEvent(), ""))
-    check("定时指令查看模式", "当前自动发布时间" in out[0], out[0][:120])
+    check(
+        "定时指令查看模式",
+        any("自动发布" in item and "每天" in item for item in out)
+        and any("下次执行" in item for item in out),
+        str(out)[:140],
+    )
 
     out = await collect(plugin.cmd_schedule(FakeEvent(), "09:45"))
     check(
-        "定时指令设置 HH:MM",
-        any("45 9 * * *" in item for item in out)
-        and raw_config["sec_post"]["publish_cron"] == "45 9 * * *",
+        "定时指令设置单个时间点",
+        any("09:45" in item for item in out)
+        and raw_config["sec_post"]["publish_times"] == ["09:45"]
+        and raw_config["sec_post"]["publish_per_day"] == 1,
         str(out),
     )
 
@@ -1017,7 +1054,8 @@ async def main() -> int:
     out = await collect(plugin.cmd_schedule(FakeEvent(), "off"))
     check(
         "定时指令关闭",
-        raw_config["sec_post"]["publish_cron"] == ""
+        raw_config["sec_post"]["publish_times"] == []
+        and raw_config["sec_post"]["publish_per_day"] == 0
         and not plugin.publish_task.running,
         str(out),
     )
@@ -2511,6 +2549,10 @@ async def main() -> int:
     plugin.cfg.set("greet_morning_pool", ["早上好呀"])
     plugin.cfg.set("greet_night_pool", ["晚安咯"])
     plugin.cfg.set("llm_greet_provider_id", "")
+    # 主动消息默认需要用户同意：这里先让这两个号「已接受」，模拟用户用 /空间偏好 表过态
+    plugin.cfg.set("active_msg_require_optin", True)
+    plugin.prefs.set_opted_in("10001", True)
+    plugin.prefs.set_opted_in("10002", True)
     plugin.greet._sent.clear()
 
     out = await collect(plugin.cmd_greet(FakeEvent(), ""))
@@ -2898,6 +2940,7 @@ async def main() -> int:
     plugin.cfg.set("draft_timeout_minutes", 0)
     plugin.cfg.set("admin_uins", ["20001"])  # 管理员与问候对象分开，便于区分发给谁
     plugin.cfg.set("greet_users", ["10001"])
+    plugin.prefs.set_opted_in("10001", True)  # 草稿模式同样只在对方接受后才发
     plugin.cfg.set("greet_use_ai", False)
     plugin.cfg.set("greet_morning_pool", ["早上好呀"])
     plugin.drafts.clear()
@@ -3115,6 +3158,7 @@ async def main() -> int:
 
     plugin.greet._sent = {}
     StarTools.sent.clear()
+    plugin.prefs.set_opted_in("10003", True)  # 主动消息需要同意，手动发送同样按偏好判断
     out = await collect(plugin.cmd_greet(FakeEvent(), "morning 10003"))
     check(
         "手动指令不占用今日自动问候名额，并回报发送地址",
@@ -3533,6 +3577,514 @@ async def main() -> int:
 
     plugin.drafts.clear()
     plugin.interact._replied = []
+
+    print("\n[31] 私聊用户偏好与首次引导")
+
+    UserPrefStore = _imp("core.user_prefs").UserPrefStore
+    prefs = UserPrefStore(plugin.cfg)
+    prefs._users.clear()
+    prefs.save()
+
+    check("首次标记返回 True", prefs.mark_seen("10001") is True, "第一次")
+    check("再次标记返回 False", prefs.mark_seen("10001") is False, "第二次")
+    check(
+        "未回答时不接受主动消息", prefs.allowed("10001", "morning") is False, "未回答"
+    )
+    check(
+        "未回答的状态文本",
+        UserPrefStore.state_text(prefs.get("10001")) == "未回答",
+        UserPrefStore.state_text(prefs.get("10001")),
+    )
+    check("统计未回答人数", prefs.stats()["unanswered"] == 1, str(prefs.stats()))
+
+    prefs.set_opted_in("10001", True)
+    check("接受后允许", prefs.allowed("10001", "morning") is True, "已接受")
+    prefs.set_feature("10001", "holiday", False)
+    check("单功能关闭后不允许", prefs.allowed("10001", "holiday") is False, "节日关")
+    check("其他功能不受影响", prefs.allowed("10001", "night") is True, "晚安仍开")
+    prefs.set_all_features("10001", False)
+    check(
+        "全部关闭",
+        prefs.allowed("10001", "morning") is False
+        and prefs.allowed("10001", "night") is False,
+        "全关",
+    )
+    prefs.set_all_features("10001", True)
+    check("全部开启", prefs.allowed("10001", "holiday") is True, "全开")
+
+    prefs.set_opted_in("10002", False)
+    check("拒绝后不允许", prefs.allowed("10002", "morning") is False, "已拒绝")
+    check(
+        "统计接受与拒绝人数",
+        prefs.stats()["accepted"] == 1 and prefs.stats()["declined"] == 1,
+        str(prefs.stats()),
+    )
+
+    reloaded = UserPrefStore(plugin.cfg)
+    check(
+        "偏好落盘并能重新加载",
+        reloaded.allowed("10001", "morning") is True
+        and reloaded.allowed("10002", "morning") is False,
+        str(reloaded.stats()),
+    )
+
+    plugin.cfg.set("greet_morning_cron", "0 8 * * *")
+    plugin.cfg.set("greet_night_cron", "0 23 * * *")
+    plugin.cfg.set("holiday_cron", "0 9 * * *")
+    fresh_prefs = UserPrefStore(plugin.cfg)
+    fresh_prefs._users.clear()
+    fresh_prefs.save()
+    plugin.prefs = fresh_prefs
+    check("干净偏好表下需要引导", plugin.prefs.needs_guidance("10003") is True, "需要")
+
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="你好", sender_id="10003"))
+    )
+    check(
+        "首次私聊发出引导",
+        len(out) == 1 and "空间偏好" in out[0] and "可能的时间段" in out[0],
+        str(out)[:160],
+    )
+    check(
+        "引导文案不超过 6 行",
+        len(out[0].splitlines()) <= 6,
+        str(len(out[0].splitlines())),
+    )
+    check(
+        "引导里给出时间段与功能说明",
+        "早安 每天 08:00" in out[0]
+        and "晚安 每天 23:00" in out[0]
+        and "节日祝福 每天 09:00" in out[0]
+        and "可能打扰到的功能" in out[0],
+        out[0],
+    )
+    check(
+        "引导里没有疑问句",
+        "？" not in out[0] and "?" not in out[0],
+        out[0],
+    )
+
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="在吗", sender_id="10003"))
+    )
+    check("同一个人只引导一次", out == [], str(out))
+
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="/空间偏好", sender_id="10004"))
+    )
+    check("以 / 开头的指令不触发引导", out == [], str(out))
+    check("被跳过的人仍算没问过", plugin.prefs.needs_guidance("10004") is True, "需要")
+
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="空间状态", sender_id="10004"))
+    )
+    check("剥掉唤醒前缀的插件指令不触发引导", out == [], str(out))
+
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="space prefs", sender_id="10004"))
+    )
+    check("英文别名同样不触发引导", out == [], str(out))
+
+    out = await collect(
+        plugin.on_private_message(
+            FakeEvent(text="你好", sender_id="10005", umo="aiocqhttp:GroupMessage:999")
+        )
+    )
+    check("群聊消息不触发引导", out == [], str(out))
+
+    plugin.cfg.set("active_msg_require_optin", False)
+    out = await collect(
+        plugin.on_private_message(FakeEvent(text="你好", sender_id="10006"))
+    )
+    check("关闭同意机制后不发引导", out == [], str(out))
+    plugin.cfg.set("active_msg_require_optin", True)
+
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), ""))
+    check(
+        "偏好指令展示状态、功能与用法",
+        "未回答" in out[0]
+        and "功能开关" in out[0]
+        and "时间段" in out[0]
+        and "用法: /空间偏好" in out[0],
+        str(out)[:200],
+    )
+    check(
+        "未回答时说明不会收到消息", "尚未回答时不会收到任何主动消息" in out[0], out[0]
+    )
+
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "接受"))
+    check(
+        "接受指令写入偏好",
+        plugin.prefs.allowed("10007", "morning") is True and "已接受" in out[0],
+        str(out)[:140],
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "晚安 off"))
+    check(
+        "单项关闭生效", plugin.prefs.allowed("10007", "night") is False, str(out)[:120]
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "night on"))
+    check(
+        "英文子命令可用", plugin.prefs.allowed("10007", "night") is True, str(out)[:120]
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "全部关闭"))
+    check(
+        "全部关闭生效",
+        plugin.prefs.allowed("10007", "holiday") is False
+        and plugin.prefs.allowed("10007", "morning") is False,
+        str(out)[:120],
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "全部开启"))
+    check(
+        "全部开启生效", plugin.prefs.allowed("10007", "holiday") is True, str(out)[:120]
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "拒绝"))
+    check(
+        "拒绝后不再允许并回执当前状态",
+        plugin.prefs.allowed("10007", "morning") is False and "已拒绝" in out[0],
+        str(out)[:140],
+    )
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "早安"))
+    check("缺少开关参数时提示用法", "早安 on" in out[0], str(out)[:120])
+    out = await collect(plugin.cmd_prefs(FakeEvent(sender_id="10007"), "乱写"))
+    check("未知参数给出用法", "用法: /空间偏好" in out[0], str(out)[:120])
+
+    # 未接受的人在发送时被跳过，并计入汇总
+    plugin.cfg.set("greet_users", ["10010", "10011"])
+    plugin.cfg.set("greet_use_ai", False)
+    plugin.cfg.set("greet_morning_pool", ["早上好呀"])
+    plugin.cfg.set("active_msg_require_optin", True)
+    plugin.prefs.set_opted_in("10010", True)
+    plugin.prefs.set_opted_in("10011", False)
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    result = await plugin.greet.send("morning", force=True, feature="morning")
+    check(
+        "未接受的用户被跳过并计数",
+        result.sent == 1 and result.blocked == 1,
+        result.summary(),
+    )
+    check(
+        "汇总里写明未接受人数",
+        "因未接受主动消息跳过 1 人" in result.summary(),
+        result.summary(),
+    )
+    check(
+        "只给接受过的人发消息",
+        [item[0] for item in StarTools.sent] == ["aiocqhttp:FriendMessage:10010"],
+        str([item[0] for item in StarTools.sent]),
+    )
+
+    plugin.cfg.set("active_msg_require_optin", False)
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    relaxed = await plugin.greet.send("morning", force=True, feature="morning")
+    check(
+        "关闭同意机制后不再跳过",
+        relaxed.sent == 2 and relaxed.blocked == 0,
+        relaxed.summary(),
+    )
+    plugin.cfg.set("active_msg_require_optin", True)
+
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里显示主动消息同意情况",
+        any("主动消息同意:" in item and "已接受" in item for item in out),
+        str(out)[:200],
+    )
+
+    print("\n[32] 每天多条发布（多时间点调度）")
+
+    CronTaskGroup = _imp("core.scheduler").CronTaskGroup
+    group_config = StubAstrBotConfig(
+        {
+            "sec_post": {
+                "publish_times": ["08:30", "12:30", "21:00"],
+                "publish_per_day": 2,
+                "publish_cron": "",
+                "publish_jitter": 0,
+                "auto_publish_enabled": True,
+            }
+        }
+    )
+    fired: list[int] = []
+
+    async def _job() -> None:
+        fired.append(1)
+
+    group = CronTaskGroup.from_config(
+        PluginConfig(group_config, FakeContext(onebot)),
+        name="qzone_auto_publish",
+        job=_job,
+        times_key="publish_times",
+        per_day_key="publish_per_day",
+        cron_key="publish_cron",
+        jitter_key="publish_jitter",
+        enabled_key="auto_publish_enabled",
+    )
+    check(
+        "每天条数决定取前几个时间点",
+        group.crons == ["30 8 * * *", "30 12 * * *"],
+        str(group.crons),
+    )
+    check(
+        "描述文本含条数与时间点",
+        "每天 2 条" in group.describe() and "08:30" in group.describe(),
+        group.describe(),
+    )
+    check("启动前没有子任务", group.tasks == [], str(group.tasks))
+    started = group.start()
+    check(
+        "启动后每个时间点一个任务",
+        started == ["30 8 * * *", "30 12 * * *"] and len(group.tasks) == 2,
+        str(started),
+    )
+    check(
+        "子任务名带序号",
+        [task.name for task in group.tasks]
+        == ["qzone_auto_publish[1]", "qzone_auto_publish[2]"],
+        str([task.name for task in group.tasks]),
+    )
+    check(
+        "每个时间点各自有下次执行时间",
+        all(task.next_run_time != "未调度" for task in group.tasks),
+        str([task.next_run_time for task in group.tasks]),
+    )
+    check(
+        "组的下次执行取最早的一个",
+        group.next_run_time == min(task.next_run_time for task in group.tasks),
+        group.next_run_time,
+    )
+    check("组处于运行状态", group.running is True, "running")
+    group.stop()
+    check(
+        "停止后没有子任务且不再运行",
+        group.running is False and group.tasks == [],
+        "stopped",
+    )
+
+    group.reconfigure(per_day=0)
+    check(
+        "per_day=0 表示不发布",
+        group.crons == [] and group.describe().startswith("每天 0 条"),
+        group.describe(),
+    )
+
+    group.reconfigure(times=[], per_day=1, cron="0 6 * * *")
+    check(
+        "时间点为空时回退兼容项",
+        group.crons == ["0 6 * * *"] and group.times_used == ["0 6 * * *"],
+        str(group.crons),
+    )
+    group.reconfigure(times=["乱写", "25:99"], per_day=2, cron="0 7 * * *")
+    check(
+        "时间点全部非法时回退",
+        group.crons == ["0 7 * * *"],
+        f"{group.crons}/{group.error}",
+    )
+    check("非法时间点写进提示", "无法识别" in group.error, group.error)
+    group.reconfigure(times=["08:30", "乱写"], per_day=2, cron="")
+    check(
+        "部分非法时保留合法的",
+        group.crons == ["30 8 * * *"] and "乱写" in group.error,
+        f"{group.crons}/{group.error}",
+    )
+
+    group.reconfigure(times=["08:30", "12:30"], per_day=2, jitter=300)
+    check(
+        "抖动传给每个子任务",
+        all(task.jitter == 300 for task in group.tasks),
+        str([task.jitter for task in group.tasks]),
+    )
+    check("每个时间点的抖动独立生效", len(group.tasks) == 2, str(len(group.tasks)))
+    group.stop()
+
+    plugin.cfg.set("auto_publish_enabled", True)
+    out = await collect(plugin.cmd_schedule(FakeEvent(), "08:30,12:30,21:00"))
+    check(
+        "指令可设置多个时间点",
+        plugin.publish_task.times_used == ["08:30", "12:30", "21:00"]
+        and plugin.publish_task.per_day == 3,
+        str(out)[:160],
+    )
+    check("指令回执写明每天条数", "每天 3 条" in " ".join(out), " ".join(out)[:160])
+
+    out = await collect(plugin.cmd_schedule(FakeEvent(), "每天 2 08:30,12:30,21:00"))
+    check(
+        "指令支持「每天 N」前缀",
+        plugin.publish_task.per_day == 2
+        and plugin.publish_task.times_used == ["08:30", "12:30"],
+        str(out)[:160],
+    )
+
+    out = await collect(plugin.cmd_schedule(FakeEvent(), "30 8 * * *"))
+    check(
+        "单个 Cron 走兼容项",
+        plugin.publish_task.times_used == ["30 8 * * *"]
+        and plugin.cfg.publish_times == [],
+        str(out)[:160],
+    )
+
+    out = await collect(plugin.cmd_schedule(FakeEvent(), "08:30,乱写"))
+    check("非法项被忽略并提示", "已忽略" in " ".join(out), " ".join(out)[:160])
+    out = await collect(plugin.cmd_schedule(FakeEvent(), "乱写"))
+    check("全部非法时报错", "设置失败" in " ".join(out), " ".join(out)[:120])
+
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里显示每天条数与时间点",
+        any("定时发布:" in item and "每天" in item for item in out),
+        str(out)[:200],
+    )
+    plugin.publish_task.stop()
+
+    print("\n[33] 传统节日祝福")
+
+    _holidays = _imp("core.holidays")
+    festival_of = _holidays.festival_of
+    next_festival = _holidays.next_festival
+    check(
+        "节日表覆盖 50 条",
+        len(_holidays.FESTIVALS) == 50,
+        str(len(_holidays.FESTIVALS)),
+    )
+    check(
+        "节日表范围说明",
+        _holidays.table_range_text() == "2026-2030 年",
+        _holidays.table_range_text(),
+    )
+    for name, day, expected in (
+        ("春节", date(2026, 2, 17), "春节"),
+        ("除夕", date(2026, 2, 16), "除夕"),
+        ("元宵", date(2028, 2, 9), "元宵"),
+        ("清明", date(2029, 4, 4), "清明"),
+        ("端午", date(2030, 6, 5), "端午"),
+        ("七夕", date(2027, 8, 8), "七夕"),
+        ("中秋", date(2028, 10, 3), "中秋"),
+        ("重阳", date(2030, 10, 5), "重阳"),
+        ("腊八", date(2028, 1, 4), "腊八"),
+        ("小年", date(2029, 2, 6), "小年"),
+    ):
+        check(f"{name} 日期正确", festival_of(day) == expected, str(festival_of(day)))
+    check("非节日返回 None", festival_of(date(2026, 3, 1)) is None, "None")
+    check("超出表范围返回 None", festival_of(date(2032, 2, 1)) is None, "None")
+    found = next_festival(date(2026, 9, 20))
+    check(
+        "下一个节日查询正确",
+        found == ("中秋", date(2026, 9, 25)),
+        str(found),
+    )
+    same_day = next_festival(date(2027, 6, 9))
+    check(
+        "当天是节日时返回当天",
+        same_day is not None and same_day[1] == date(2027, 6, 9),
+        str(same_day),
+    )
+
+    plugin.cfg.set("greet_users", ["10020"])
+    plugin.prefs.set_opted_in("10020", True)
+    plugin.cfg.set("active_msg_require_optin", True)
+    plugin.cfg.set("greet_use_ai", False)
+    plugin.cfg.set("holiday_prompt", "写一句{festival}祝福")
+    plugin.cfg.set("holiday_pool", ["{festival}到了，愿你今天顺心。"])
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+
+    captured_prompts: list[str] = []
+    original_chat = plugin.ai.chat
+
+    async def holiday_chat(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        captured_prompts.append(str(system_prompt))
+        return "中秋的月亮很圆，记得早点回去。"
+
+    plugin.ai.chat = holiday_chat
+    result = await plugin.greet.send_holiday(
+        value_date=date(2026, 9, 25), targets=["10020"], force=True
+    )
+    plugin.ai.chat = original_chat
+    check(
+        "节日当天发送祝福",
+        result.sent == 1 and "中秋" in result.text,
+        f"{result.summary()}/{result.text}",
+    )
+    check(
+        "提示词里的 {festival} 被替换成节日名",
+        bool(captured_prompts)
+        and "{festival}" not in captured_prompts[-1]
+        and "中秋祝福" in captured_prompts[-1],
+        str(captured_prompts[-1:])[:160],
+    )
+    check(
+        "记录标识带节日日期",
+        any(
+            "holiday:2026-09-25" in item
+            for item in plugin.greet._sent.get(plugin.greet._today(), [])
+        ),
+        str(plugin.greet._sent),
+    )
+
+    again = await plugin.greet.send_holiday(
+        value_date=date(2026, 9, 25), targets=["10020"]
+    )
+    check(
+        "同一天同一节日只发一次",
+        again.sent == 0 and again.skipped == 1,
+        again.summary(),
+    )
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    not_festival = await plugin.greet.send_holiday(
+        value_date=date(2026, 3, 1), targets=["10020"]
+    )
+    check(
+        "非节日不发送",
+        not_festival.sent == 0
+        and any("不是内置" in item for item in not_festival.errors),
+        not_festival.summary(),
+    )
+    check("非节日没有发出任何消息", StarTools.sent == [], str(StarTools.sent))
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    forced = await plugin.greet.send_holiday(
+        value_date=date(2026, 3, 1), targets=["10020"], force=True, record=False
+    )
+    check("手动测试忽略节日判断", forced.sent == 1, forced.summary())
+
+    async def failing_chat(**kwargs):
+        raise RuntimeError("AI 挂了")
+
+    original_chat = plugin.ai.chat
+    plugin.ai.chat = failing_chat
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    fallback = await plugin.greet.send_holiday(
+        value_date=date(2027, 2, 6), targets=["10020"], force=True, record=False
+    )
+    check(
+        "AI 失败时回退文案池并替换节日名",
+        fallback.sent == 1 and "春节" in fallback.text,
+        f"{fallback.summary()}/{fallback.text}",
+    )
+    plugin.ai.chat = original_chat
+
+    plugin.greet._sent.clear()
+    StarTools.sent.clear()
+    out = await collect(plugin.cmd_greet(FakeEvent(), "holiday 10020"))
+    check(
+        "问候指令支持 holiday 测试入口",
+        any("节日祝福" in item for item in out) and "成功 1 人" in " ".join(out),
+        " ".join(out)[:200],
+    )
+
+    out = await collect(plugin.cmd_status(FakeEvent()))
+    check(
+        "状态里显示节日祝福与下一个节日",
+        any("节日祝福:" in item and "下一个节日" in item for item in out),
+        str(out)[:220],
+    )
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from astrbot.api import logger
@@ -30,23 +30,36 @@ from .core.config import PluginConfig
 from .core.content import ContentGenerator
 from .core.draft import Draft, DraftBox
 from .core.greet import GreetingService
+from .core.holidays import days_until, table_range_text
 from .core.interact import InteractService
 from .core.life import LifeManager, time_desc
 from .core.llm import AIClient
 from .core.qzone import QzoneAPI, QzoneSession
 from .core.render import ReceiptRenderer
-from .core.scheduler import CronTask, normalize_cron
+from .core.scheduler import (
+    CronTask,
+    CronTaskGroup,
+    describe_cron,
+    normalize_cron,
+    split_times,
+)
 from .core.store import PublishRecord, PublishStore
+from .core.user_prefs import FEATURE_LABELS, UserPrefStore
 from .core.web import WebSearchBridge
 
 _ON_FLAGS = {"on", "开", "开启", "true", "1", "yes"}
 _OFF_FLAGS = {"off", "关", "关闭", "false", "0", "no", "none", "disable"}
+_ACCEPT_FLAGS = {"accept", "yes", "ok", "接受", "同意", "可以", "好"}
+_DENY_FLAGS = {"deny", "refuse", "reject", "no", "拒绝", "不同意", "不接受"}
+_ALL_ON_FLAGS = {"全部开启", "全部打开", "全开", "all on"}
+_ALL_OFF_FLAGS = {"全部关闭", "全部关掉", "全关", "all off"}
 _RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"}
 _NOW_FLAGS = {"now", "run", "立刻", "立即", "现在"}
 _PUBLISH_TASK = "qzone_auto_publish"
 _INTERACT_TASK = "qzone_interact"
 _GREET_MORNING_TASK = "qzone_greet_morning"
 _GREET_NIGHT_TASK = "qzone_greet_night"
+_HOLIDAY_TASK = "qzone_greet_holiday"
 
 
 class QzonePublisherPlugin(Star):
@@ -77,18 +90,23 @@ class QzonePublisherPlugin(Star):
         self.render = ReceiptRenderer(self.cfg)
         # 最近一次与某个 QQ 的真实私聊会话地址（umo），问候优先用它，避免地址拼错
         self._private_umos: dict[str, str] = {}
+        # 私聊用户偏好：谁接受机器人的主动消息、接受哪些功能
+        self.prefs = UserPrefStore(self.cfg)
         self.greet = GreetingService(
             self.cfg,
             self.ai,
             self._platform_id,
             life_context_provider=self.life.prompt_context,
             umo_resolver=self._greet_umo,
+            opted_in_checker=self._active_msg_allowed,
         )
 
-        self.publish_task = CronTask.from_config(
+        self.publish_task = CronTaskGroup.from_config(
             self.cfg,
             name=_PUBLISH_TASK,
             job=self._auto_publish,
+            times_key="publish_times",
+            per_day_key="publish_per_day",
             cron_key="publish_cron",
             jitter_key="publish_jitter",
             enabled_key="auto_publish_enabled",
@@ -117,6 +135,14 @@ class QzonePublisherPlugin(Star):
             jitter_key="greet_jitter",
             enabled_key="greet_enabled",
         )
+        self.holiday_task = CronTask.from_config(
+            self.cfg,
+            name=_HOLIDAY_TASK,
+            job=self._greet_holiday,
+            cron_key="holiday_cron",
+            jitter_key="holiday_jitter",
+            enabled_key="holiday_enabled",
+        )
         self._client: Any = None
         self._draft_timer: asyncio.Task | None = None
 
@@ -126,6 +152,7 @@ class QzonePublisherPlugin(Star):
         self.interact_task.start()
         self.greet_morning_task.start()
         self.greet_night_task.start()
+        self.holiday_task.start()
         await self._resume_pending_draft()
 
     async def _resume_pending_draft(self) -> None:
@@ -164,6 +191,7 @@ class QzonePublisherPlugin(Star):
         self.interact_task.stop()
         self.greet_morning_task.stop()
         self.greet_night_task.stop()
+        self.holiday_task.stop()
         await self.api.close()
 
     # ------------------------------------------------------------------
@@ -329,6 +357,190 @@ class QzonePublisherPlugin(Star):
         """定时任务：群发晚安问候。"""
         await self._run_greet("night")
 
+    async def _greet_holiday(self) -> None:
+        """定时任务：节日当天群发节日祝福。"""
+        await self._run_holiday()
+
+    def _active_msg_allowed(self, qq: str, feature: str) -> bool:
+        """判断该 QQ 是否接受这个功能的主动消息。
+
+        Args:
+            qq: 目标 QQ 号。
+            feature: 功能标识（morning / night / holiday）。
+
+        Returns:
+            允许时返回 True；``active_msg_require_optin`` 关闭时一律允许。
+        """
+        if not bool(self.cfg.active_msg_require_optin):
+            return True
+        return self.prefs.allowed(qq, feature)
+
+    def _allowed_targets(self, feature: str) -> tuple[list[str], int]:
+        """按「主动消息需要同意」过滤问候目标（草稿模式使用）。
+
+        草稿模式不经过发送服务的逐个校验，所以要在这里先过滤，
+        否则未接受主动消息的人会在确认草稿后收到消息。
+
+        Args:
+            feature: 功能标识。
+
+        Returns:
+            (允许发送的 QQ 列表, 因未接受而跳过的人数)。
+        """
+        targets = list(self.greet.targets)
+        if not bool(self.cfg.active_msg_require_optin):
+            return targets, 0
+        allowed = [qq for qq in targets if self.prefs.allowed(qq, feature)]
+        return allowed, len(targets) - len(allowed)
+
+    async def _draft_greet(
+        self, *, slot_key: str, slot_name: str, feature: str, text: str
+    ) -> None:
+        """把问候或节日祝福转成待确认草稿。
+
+        Args:
+            slot_key: 记录标识。
+            slot_name: 展示名（早安 / 晚安 / 节日祝福）。
+            feature: 用于用户偏好检查的功能标识。
+            text: 已生成好的内容。
+        """
+        allowed, blocked = self._allowed_targets(feature)
+        if not allowed:
+            logger.info(f"{slot_name}：{blocked} 人未接受主动消息，没有可发送对象")
+            if bool(self.cfg.notify_enabled) and blocked:
+                await self._notify(f"{slot_name}没有发送：{blocked} 人未接受主动消息")
+            return
+
+        draft = self.drafts.put(
+            Draft(
+                kind="greet",
+                text=text,
+                source=f"greet:{slot_key}",
+                targets=allowed,
+            )
+        )
+        await self._send_draft(draft)
+        await self._arm_draft_timer(draft)
+        if blocked:
+            logger.info(f"{slot_name}草稿已生成：{blocked} 人未接受主动消息，已排除")
+
+    async def _report_greet(self, slot_name: str, result) -> None:
+        """问候类任务的统一通知。"""
+        if not bool(self.cfg.notify_enabled):
+            return
+        if result.sent == 0 and result.errors:
+            # 别再用「已发送」这种说法掩盖失败：一条都没发出去时明确报警
+            await self._notify(
+                f"⚠️ {slot_name}没有发出去：{result.summary()}" + self._usage_note()
+            )
+            return
+        await self._notify(
+            f"{slot_name}已发送：{result.summary()}\n内容：{result.text}"
+            + self._usage_note(),
+        )
+
+    def greet_holiday_status(self, upcoming: tuple[str, date, int] | None) -> str:
+        """拼节日祝福的状态说明。
+
+        Args:
+            upcoming: ``days_until()`` 的结果（节日名 / 日期 / 相隔天数）。
+
+        Returns:
+            形如「下一个节日 中秋（2026-09-25，还有 2 天）｜今日已发 0 人」的文本。
+        """
+        today = datetime.now(self.cfg.timezone).date()
+        parts: list[str] = []
+        if upcoming is None:
+            parts.append(f"节日表只覆盖 {table_range_text()}，需要更新插件")
+        else:
+            name, day, left = upcoming
+            when = "就是今天" if left == 0 else f"还有 {left} 天"
+            parts.append(f"下一个节日 {name}（{day.isoformat()}，{when}）")
+        parts.append(
+            f"今日已发 {self.greet.sent_today(f'holiday:{today.isoformat()}')} 人"
+        )
+        if bool(self.cfg.holiday_enabled) and not self.greet.targets:
+            parts.append("⚠️ 还没配置 greet_users，节日祝福不会发出")
+        return "｜".join(parts)
+
+    def _guidance_text(self) -> str:
+        """首次私聊引导的文案（不超过 6 行）。"""
+        morning = describe_cron(self.cfg.greet_morning_cron)
+        night = describe_cron(self.cfg.greet_night_cron)
+        holiday = describe_cron(self.cfg.holiday_cron)
+        return (
+            "本机器人可能会主动私聊发消息。\n"
+            f"可能的时间段：早安 {morning}、晚安 {night}、节日祝福 {holiday}"
+            "（实际时间会随机延后，不会固定在同一秒）\n"
+            "可能打扰到的功能：早安、晚安、传统节日祝福，"
+            "以及说说发布与互动结果的通知。\n"
+            "如需接收，回复 /空间偏好 接受；如不希望接收，回复 /空间偏好 拒绝。\n"
+            "随时可用 /空间偏好 查看与修改。"
+        )
+
+    @staticmethod
+    def _looks_like_command(text: str, wake_prefixes: list[str]) -> bool:
+        """判断这条私聊消息是不是指令，避免引导与指令互相打扰。
+
+        Args:
+            text: 已去掉首尾空白的消息正文。
+            wake_prefixes: AstrBot 配置里的唤醒前缀列表。
+
+        Returns:
+            看起来像指令时返回 True。
+        """
+        if not text:
+            return True
+        if text.startswith("/"):
+            return True
+        for prefix in wake_prefixes:
+            if prefix and text.startswith(prefix):
+                return True
+        # 唤醒前缀会被 AstrBot 剥掉，所以还要识别指令本身的名字
+        if text.startswith("空间"):
+            return True
+        return text.split(maxsplit=1)[0].lower() in {"space", "qz"}
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def on_private_message(self, event: AstrMessageEvent):
+        """私聊首次引导：说明可能收到的主动消息并引导设置偏好。
+
+        只在私聊、且该用户还没被问过时发送一次；指令、唤醒开头与群聊都会跳过。
+        """
+        if not bool(self.cfg.active_msg_require_optin):
+            return
+
+        # 过滤器已限定私聊，这里再挡一次：直接调用本方法（例如测试）时也不越界
+        private_checker = getattr(event, "is_private_chat", None)
+        if callable(private_checker):
+            try:
+                if not private_checker():
+                    return
+            except Exception:
+                return
+
+        text = str(getattr(event, "message_str", "") or "").strip()
+        try:
+            wake_prefixes = [
+                str(item)
+                for item in (self.context.get_config().get("wake_prefix") or [])
+            ]
+        except Exception:
+            wake_prefixes = []
+        if self._looks_like_command(text, wake_prefixes):
+            return
+
+        qq = str(event.get_sender_id() or "").strip()
+        if not qq.isdigit():
+            return
+        if not self.prefs.needs_guidance(qq):
+            return
+
+        self.prefs.mark_seen(qq)
+        self.prefs.mark_asked(qq)
+        logger.info(f"已向 {qq} 发出首次主动消息引导")
+        yield event.plain_result(self._guidance_text())
+
     async def _run_greet(self, slot_key: str) -> None:
         """执行一次问候：草稿确认开启时先转草稿，否则直接发送。
 
@@ -349,36 +561,49 @@ class QzonePublisherPlugin(Star):
                 logger.error(f"问候内容生成失败: {e}")
                 await self._notify(f"{slot_name}问候失败：内容生成异常\n{e}")
                 return
-            draft = self.drafts.put(
-                Draft(
-                    kind="greet",
-                    text=text,
-                    source=f"greet:{slot_key}",
-                    targets=list(self.greet.targets),
-                )
+            await self._draft_greet(
+                slot_key=slot_key, slot_name=slot_name, feature=slot_key, text=text
             )
-            await self._send_draft(draft)
-            await self._arm_draft_timer(draft)
             return
 
         try:
-            result = await self.greet.send(slot_key)
+            result = await self.greet.send(slot_key, feature=slot_key)
         except Exception as e:
             logger.error(f"问候发送失败: {e}")
             return
 
-        if bool(self.cfg.notify_enabled):
-            if result.sent == 0 and result.errors:
-                # 别再用「已发送」这种说法掩盖失败：一条都没发出去时明确报警
-                await self._notify(
-                    f"⚠️ {slot_name}问候没有发出去：{result.summary()}"
-                    + self._usage_note()
-                )
-            else:
-                await self._notify(
-                    f"{slot_name}问候已发送：{result.summary()}\n内容：{result.text}"
-                    + self._usage_note(),
-                )
+        await self._report_greet(slot_name, result)
+
+    async def _run_holiday(self) -> None:
+        """执行一次节日祝福：当天不是内置节日就不发送。"""
+        slot_name = "节日祝福"
+
+        if not self.greet.targets:
+            logger.info("未配置 greet_users，跳过本次节日祝福")
+            return
+
+        if bool(self.cfg.draft_for_greet):
+            try:
+                preview = await self.greet.build_holiday_preview()
+            except Exception as e:
+                logger.error(f"节日祝福内容生成失败: {e}")
+                await self._notify(f"{slot_name}失败：内容生成异常\n{e}")
+                return
+            if preview is None:
+                return
+            slot_key, text = preview
+            await self._draft_greet(
+                slot_key=slot_key, slot_name=slot_name, feature="holiday", text=text
+            )
+            return
+
+        try:
+            result = await self.greet.send_holiday()
+        except Exception as e:
+            logger.error(f"节日祝福发送失败: {e}")
+            return
+
+        await self._report_greet(slot_name, result)
 
     async def _dispatch_post(self, text: str, *, source: str, prefix: str) -> None:
         """统一的自动发布出口：草稿模式先转人工确认。
@@ -851,12 +1076,12 @@ class QzonePublisherPlugin(Star):
 
         lines.append(
             f"定时发布: {'开启' if self.publish_task.running else '关闭'}"
-            f"（{self.publish_task.cron or '未设置'}，抖动 {self.publish_task.jitter} 秒）"
+            f"（{self.publish_task.describe()}，抖动 {self.publish_task.jitter} 秒）"
         )
         lines.append(f"　内容来源: {self.cfg.content_source}")
         lines.append(f"　下次执行: {self.publish_task.next_run_time}")
         if self.publish_task.error:
-            lines.append(f"　⚠️ 时间配置错误: {self.publish_task.error}")
+            lines.append(f"　⚠️ {self.publish_task.error}")
 
         lines.append(
             f"说说互动: {self.interact.mode_text()}"
@@ -902,6 +1127,21 @@ class QzonePublisherPlugin(Star):
         if self.greet.targets:
             lines.append(f"　发送地址: {self.greet.umo_for(self.greet.targets[0])}")
 
+        upcoming = days_until(datetime.now(self.cfg.timezone).date())
+        holiday_text = self.greet_holiday_status(upcoming)
+        lines.append(
+            f"节日祝福: {'开启' if bool(self.cfg.holiday_enabled) else '关闭'}"
+            f"｜{holiday_text}"
+        )
+
+        stats = self.prefs.stats()
+        lines.append(
+            f"主动消息同意: 已接受 {stats['accepted']} 人"
+            f"｜已拒绝 {stats['declined']} 人"
+            f"｜未回答 {stats['unanswered']} 人"
+            f"（需要同意: {'开' if bool(self.cfg.active_msg_require_optin) else '关'}）"
+        )
+
         last = self.store.last_success()
         if last:
             lines.append(f"上次发布: {self._format_time(last.time)}（tid {last.tid}）")
@@ -931,48 +1171,98 @@ class QzonePublisherPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间定时", alias={"space cron", "qz cron"})
     async def cmd_schedule(self, event: AstrMessageEvent, spec: GreedyStr = ""):
-        """查看或设置自动发布时间，支持 HH:MM 与 Cron"""
+        """查看或设置自动发布时间：支持多个时间点、HH:MM、5 段 Cron 与 off"""
         self._remember_client(event)
         text = str(spec).strip()
 
         if not text:
-            yield event.plain_result(
-                "当前自动发布时间: "
-                f"{self.cfg.publish_cron or '未设置'}\n"
-                f"下次执行: {self.publish_task.next_run_time}\n"
-                "用法: /空间定时 08:30 或 /空间定时 30 8 * * * 或 /空间定时 off"
-            )
+            yield event.plain_result(self._schedule_text())
             return
 
         if text.lower() in _OFF_FLAGS:
+            self.cfg.set("publish_times", [])
+            self.cfg.set("publish_per_day", 0)
             self.cfg.set("publish_cron", "")
-            self.publish_task.reconfigure(cron="")
-            yield event.plain_result("已清空发布时间，定时自动发布已关闭")
+            self.publish_task.reconfigure(times=[], per_day=0, cron="")
+            yield event.plain_result("已清空发布时间点，定时自动发布已关闭")
             return
 
-        try:
-            normalized = normalize_cron(text)
-        except ValueError as e:
-            yield event.plain_result(f"设置失败：{e}")
+        # 可选前缀「每天 N」：只改每天发布条数
+        per_day: int | None = None
+        head, _, rest = text.partition(" ")
+        if head in {"每天", "每天发", "daily"} and rest.strip():
+            number, _, tail = rest.strip().partition(" ")
+            if number.isdigit():
+                per_day = min(max(int(number), 0), 10)
+                text = tail.strip()
+        if not text:
+            yield event.plain_result("设置失败：没有可用的时间点")
             return
 
-        if normalized is None:
-            yield event.plain_result("设置失败：时间不能为空")
+        valid: list[str] = []
+        invalid: list[str] = []
+        # 单个 5 段 Cron 里带空格，不能按空格拆开，先整体识别
+        fields = text.split()
+        candidates = (
+            [text]
+            if len(fields) == 5 and not any(sep in text for sep in (",", "，", "、"))
+            else split_times(text)
+        )
+        for item in candidates:
+            try:
+                normalize_cron(item)
+            except ValueError:
+                invalid.append(item)
+                continue
+            valid.append(item)
+
+        if not valid:
+            yield event.plain_result(
+                f"设置失败：这些时间点无法识别（{'、'.join(invalid)}）；"
+                "请使用 HH:MM 或 5 段 Cron"
+            )
             return
 
-        self.cfg.set("publish_cron", normalized)
+        # 只给了一个 5 段 Cron 时，按兼容项 publish_cron 处理
+        single_cron = len(valid) == 1 and len(valid[0].split()) == 5
+        days = per_day if per_day is not None else (1 if single_cron else len(valid))
+        times = [] if single_cron else valid
+
+        self.cfg.set("publish_times", times)
+        self.cfg.set("publish_cron", normalize_cron(valid[0]) or "")
+        self.cfg.set("publish_per_day", days)
         if not bool(self.cfg.auto_publish_enabled):
             self.cfg.set("auto_publish_enabled", True)
 
-        effective = self.publish_task.reconfigure(cron=normalized, enabled=True)
-        if effective is None:
-            reason = self.publish_task.error or "调度器未能启动，请查看 AstrBot 日志"
-            yield event.plain_result(f"设置失败：{reason}")
-            return
-
-        yield event.plain_result(
-            f"已将自动发布时间设置为 {effective}\n下次执行: {self.publish_task.next_run_time}"
+        self.publish_task.reconfigure(
+            times=times,
+            per_day=days,
+            cron=normalize_cron(valid[0]) or "",
+            enabled=True,
         )
+
+        lines = [f"已设置自动发布时间：{self.publish_task.describe()}"]
+        lines.append(f"下次执行: {self.publish_task.next_run_time}")
+        if invalid:
+            lines.append(f"已忽略无法识别的时间点：{'、'.join(invalid)}")
+        yield event.plain_result("\n".join(lines))
+
+    def _schedule_text(self) -> str:
+        """自动发布时间的展示文本。"""
+        lines = [
+            f"自动发布: {'开启' if self.publish_task.running else '关闭'}"
+            f"｜{self.publish_task.describe()}",
+            f"抖动: {self.publish_task.jitter} 秒"
+            f"｜下次执行: {self.publish_task.next_run_time}",
+        ]
+        if self.publish_task.error:
+            lines.append(f"⚠️ {self.publish_task.error}")
+        lines.append(
+            "用法: /空间定时 08:30,12:30,21:00（多个时间点）"
+            "｜/空间定时 每天 2 08:30,12:30（只发前 2 个）"
+            "｜/空间定时 30 8 * * *（单个 Cron）｜/空间定时 off"
+        )
+        return "\n".join(lines)
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间开关", alias={"space toggle", "qz toggle"})
@@ -982,23 +1272,20 @@ class QzonePublisherPlugin(Star):
         flag = str(state).strip().lower()
 
         if not flag:
-            yield event.plain_result(
-                f"定时自动发布当前为: "
-                f"{'开启' if self.publish_task.running else '关闭'}\n"
-                "用法: /空间开关 on 或 /空间开关 off"
-            )
+            yield event.plain_result(self._schedule_text())
             return
 
         if flag in _ON_FLAGS:
             self.cfg.set("auto_publish_enabled", True)
-            cron = self.publish_task.reconfigure(enabled=True)
-            if cron is None:
+            crons = self.publish_task.reconfigure(enabled=True)
+            if not crons:
                 yield event.plain_result(
-                    "已开启定时发布，但没有可用的发布时间，请用 /空间定时 设置"
+                    "已开启定时发布，但没有可用的发布时间点：请用 /空间定时 设置"
                 )
                 return
             yield event.plain_result(
-                f"定时自动发布已开启：{cron}\n下次执行: {self.publish_task.next_run_time}"
+                f"定时自动发布已开启：{self.publish_task.describe()}\n"
+                f"下次执行: {self.publish_task.next_run_time}"
             )
             return
 
@@ -1161,6 +1448,96 @@ class QzonePublisherPlugin(Star):
             f"日程：{state.schedule}"
         )
 
+    @filter.command("空间偏好", alias={"space prefs", "qz prefs"})
+    async def cmd_prefs(self, event: AstrMessageEvent, action: GreedyStr = ""):
+        """查看或修改本人在主动消息上的偏好（所有用户可用）"""
+        self._remember_client(event)
+        qq = str(event.get_sender_id() or "").strip()
+        if not qq.isdigit():
+            yield event.plain_result("无法识别你的 QQ 号，暂时不能查看或修改偏好")
+            return
+
+        parts = str(action).split()
+        if not parts:
+            yield event.plain_result(self._prefs_text(qq))
+            return
+
+        head = parts[0].lower()
+        if head in _ACCEPT_FLAGS:
+            self.prefs.set_opted_in(qq, True)
+            yield event.plain_result(f"已记录：接受主动消息\n{self._prefs_text(qq)}")
+            return
+        if head in _DENY_FLAGS:
+            self.prefs.set_opted_in(qq, False)
+            yield event.plain_result(f"已记录：不接受主动消息\n{self._prefs_text(qq)}")
+            return
+        if head in _ALL_ON_FLAGS or head in _ALL_OFF_FLAGS:
+            value = head in _ALL_ON_FLAGS
+            self.prefs.set_all_features(qq, value)
+            yield event.plain_result(
+                f"已{'开启' if value else '关闭'}全部主动消息功能\n{self._prefs_text(qq)}"
+            )
+            return
+
+        feature = self._feature_of(head)
+        if feature is not None:
+            if len(parts) < 2 or parts[1].lower() not in (_ON_FLAGS | _OFF_FLAGS):
+                yield event.plain_result(
+                    f"用法: /空间偏好 {FEATURE_LABELS[feature]} on 或 off"
+                )
+                return
+            value = parts[1].lower() in _ON_FLAGS
+            self.prefs.set_feature(qq, feature, value)
+            yield event.plain_result(
+                f"已{'开启' if value else '关闭'}{FEATURE_LABELS[feature]}\n"
+                f"{self._prefs_text(qq)}"
+            )
+            return
+
+        yield event.plain_result(self._prefs_usage())
+
+    @staticmethod
+    def _prefs_usage() -> str:
+        """偏好指令的用法说明。"""
+        return (
+            "用法: /空间偏好 接受｜/空间偏好 拒绝｜"
+            "/空间偏好 早安 on|off｜/空间偏好 晚安 on|off｜"
+            "/空间偏好 节日 on|off｜/空间偏好 全部开启｜/空间偏好 全部关闭"
+        )
+
+    @staticmethod
+    def _feature_of(token: str) -> str | None:
+        """把用户输入的功能名映射成内部标识。"""
+        table = {
+            "morning": "morning",
+            "早安": "morning",
+            "早上": "morning",
+            "night": "night",
+            "晚安": "night",
+            "晚上": "night",
+            "holiday": "holiday",
+            "节日": "holiday",
+            "节日祝福": "holiday",
+        }
+        return table.get(str(token).strip().lower())
+
+    def _prefs_text(self, qq: str) -> str:
+        """拼本人偏好的展示文本。"""
+        user = self.prefs.get(qq)
+        state = UserPrefStore.state_text(user)
+        lines = [
+            f"主动消息偏好（{qq}）: {state}",
+            f"功能开关: {UserPrefStore.features_text(user)}",
+            "时间段（由管理员设置，只读）: "
+            f"早安 {describe_cron(self.cfg.greet_morning_cron)}"
+            f"｜晚安 {describe_cron(self.cfg.greet_night_cron)}"
+            f"｜节日祝福 {describe_cron(self.cfg.holiday_cron)}",
+        ]
+        if state == "未回答":
+            lines.append("说明: 尚未回答时不会收到任何主动消息")
+        lines.append(self._prefs_usage())
+        return "\n".join(lines)
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("空间读说说", alias={"space read", "qz read"})
     async def cmd_read(self, event: AstrMessageEvent, force: GreedyStr = ""):
@@ -1261,6 +1638,7 @@ class QzonePublisherPlugin(Star):
         if not parts:
             morning = self.greet.slot_of("morning")
             night = self.greet.slot_of("night")
+            upcoming = days_until(datetime.now(self.cfg.timezone).date())
             yield event.plain_result(
                 f"问候开关: {'开' if bool(self.cfg.greet_enabled) else '关'}"
                 f"｜内容来源: {'AI 生成' if bool(self.cfg.greet_use_ai) else '文案池'}\n"
@@ -1269,8 +1647,13 @@ class QzonePublisherPlugin(Star):
                 f"（下次 {self.greet_morning_task.next_run_time}）"
                 f"｜{night.name if night else '晚安'}: {self.greet_night_task.cron or '未设置'}"
                 f"（下次 {self.greet_night_task.next_run_time}）\n"
+                f"节日祝福: {'开' if bool(self.cfg.holiday_enabled) else '关'}"
+                f"｜{self.greet_holiday_status(upcoming)}\n"
+                f"主动消息同意: {'需要' if bool(self.cfg.active_msg_require_optin) else '不需要'}"
+                f"（用户可用 /空间偏好 自行设置）\n"
                 "用法: /空间问候 on|off 开关定时问候；"
-                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试（忽略当日去重）"
+                "/空间问候 morning 123456 立刻发一条给指定 QQ 用于测试（忽略当日去重）；"
+                "/空间问候 holiday 测试节日祝福"
             )
             return
 
@@ -1300,10 +1683,12 @@ class QzonePublisherPlugin(Star):
             yield event.plain_result("定时问候已关闭")
             return
 
+        is_holiday = flag in {"holiday", "节日", "节日祝福"}
         slot = self.greet.slot_of(flag)
-        if slot is None:
+        if slot is None and not is_holiday:
             yield event.plain_result(
-                "用法: /空间问候 on|off，或 /空间问候 morning 123456"
+                "用法: /空间问候 on|off，或 /空间问候 morning 123456，"
+                "或 /空间问候 holiday"
             )
             return
 
@@ -1313,6 +1698,22 @@ class QzonePublisherPlugin(Star):
                 "没指定 QQ 号，且 greet_users 也是空的："
                 "请用 /空间问候 morning 123456 指定一个"
             )
+            return
+
+        if is_holiday:
+            who = "、".join(targets) if targets else "配置里的对象"
+            yield event.plain_result(
+                f"正在发送节日祝福给 {who}"
+                "（测试发送：忽略今天是否节日、忽略当日去重）..."
+            )
+            try:
+                result = await self.greet.send_holiday(
+                    targets=targets or None, force=True, record=False
+                )
+            except Exception as e:
+                yield event.plain_result(f"发送失败：{e}")
+                return
+            yield event.plain_result(self._greet_result_text("节日祝福", result))
             return
 
         yield event.plain_result(
@@ -1328,14 +1729,27 @@ class QzonePublisherPlugin(Star):
             yield event.plain_result(f"发送失败：{e}")
             return
 
-        lines = [f"{slot.name}问候：{result.summary()}"]
+        yield event.plain_result(self._greet_result_text(f"{slot.name}问候", result))
+
+    @staticmethod
+    def _greet_result_text(name: str, result) -> str:
+        """拼一条问候类结果的回执文本。
+
+        Args:
+            name: 展示名（早安问候 / 节日祝福…）。
+            result: ``GreetResult``。
+
+        Returns:
+            多行回执文本。
+        """
+        lines = [f"{name}：{result.summary()}"]
         if result.targets_used:
             lines.append(
                 "发送地址: "
                 + "；".join(f"{qq} → {umo}" for qq, umo in result.targets_used.items())
             )
         lines.append(f"内容：{result.text}")
-        yield event.plain_result("\n".join(lines))
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 指令：草稿确认

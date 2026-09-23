@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-352%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-441%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -25,7 +25,7 @@
 | :--- | :--- |
 | 登录 | 自动向 OneBot 取空间域 Cookie，免抓包；支持手动 Cookie 兜底；登录态失效自动重取并重试一次 |
 | 发布 | `/空间发布` 立即发说说，消息里带的图片会一起上传发布（最多 9 张） |
-| 定时 | 支持 `HH:MM` 或 5 段 Cron，带随机抖动；改配置即时生效 |
+| 定时 | 可设置**每天发几条**与**具体时间点列表**（每个时间点各自随机抖动）；也兼容单个 `HH:MM` 或 5 段 Cron，改配置即时生效 |
 | 手动触发 | `/空间自动发` 立刻按人设生成并发一条说说：与定时发布走**同一条链路**，所以受草稿确认开关影响（开了就先给你草稿） |
 | 内容来源 | 文案池随机 / 文本文件随机一行 / AI 按人设生成（可参考今日日程、最近聊天记录与联网资料） |
 | 联网素材 | **接入 AstrBot 自带的联网搜索**：先联网查资料，再让 AI 结合资料写说说；搜索不可用时自动降级 |
@@ -37,6 +37,8 @@
 | 回复评论 | 自己说说下有人评论时，用 AI 回一句话（`interact_reply_enabled`，**默认关闭**）：只回别人的评论、同一条评论只回一次、每轮总数与每条说说都有上限，默认先转草稿确认 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
 | 定时问候 | 按时间给指定用户**私聊**发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
+| 节日祝福 | 传统节日当天给指定用户**私聊**发一条祝福（`holiday_enabled`，**默认关闭**）：覆盖 2026-2030 年的除夕、春节、元宵、清明、端午、七夕、中秋、重阳、腊八、小年；当天不是节日不发，同一节日只发一次 |
+| 用户同意 | 主动消息默认**需要对方同意**：用户第一次私聊会收到一条简短说明，可用 `/空间偏好` 接受、拒绝或逐项开关；未接受的人不会被主动打扰 |
 | 运维 | 发布历史、失败通知、`/空间状态` 一屏看全、`/空间删除` 按 tid 删说说 |
 
 ---
@@ -162,19 +164,24 @@
 
 ## 定时问候
 
-按时间给指定用户发私聊问候（早安 / 晚安）：
+按时间给指定用户发私聊问候（早安 / 晚安）与传统节日祝福：
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `greet_enabled` | `false` | 总开关，也可用 `/空间问候 on` 打开 |
-| `greet_users` | `[]` | 问候对象的 QQ 号，例如 `["123456"]` |
+| `active_msg_require_optin` | `true` | 主动消息需要用户同意：开启时只有接受过的用户会收到，见本节末尾 |
+| `greet_enabled` | `false` | 早安 / 晚安总开关，也可用 `/空间问候 on` 打开 |
+| `holiday_enabled` | `false` | 节日祝福总开关（默认关闭） |
+| `greet_users` | `[]` | 问候与祝福对象的 QQ 号，例如 `["123456"]` |
 | `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
 | `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
+| `holiday_cron` | `0 9 * * *` | 节日祝福时间；当天不是内置节日则不发送 |
 | `greet_jitter` | `600` | 触发后随机延后 0~N 秒，不固定在同一秒发出 |
+| `holiday_jitter` | `600` | 节日祝福的随机抖动（秒） |
 | `greet_use_ai` | `false` | 用 AI 结合人设与当日生活日程生成；关闭则从文案池随机取 |
 | `greet_prompt` | 见默认值 | AI 提示词，`{slot}` 会被替换成「早安 / 晚安」 |
 | `greet_morning_pool` / `greet_night_pool` | 各 3 条示例 | 文案池 |
-| `llm_greet_provider_id` | 空 | 问候单独指定 AstrBot 提供商（留空用全局） |
+| `holiday_prompt` / `holiday_pool` | 见默认值 / 3 条示例 | 节日祝福的提示词与文案池，`{festival}` 会被替换成节日名 |
+| `llm_greet_provider_id` / `llm_holiday_provider_id` | 空 | 分别给问候、节日祝福指定 AstrBot 提供商（留空用全局） |
 
 - 同一天同一时段对同一个人只发一次（记录在 `greet_state.json`），
   随机抖动或错过的补偿触发都不会造成重复问候。
@@ -185,6 +192,9 @@
 - AI 生成失败、返回空都会自动回退到文案池；某个 QQ 发不出去只记日志并汇总，不影响其他人。
 - 先用 `/空间问候 morning 你的QQ号` 手动测一条，确认能收到再开定时；
   回执里会带上实际使用的发送地址（`平台:消息类型:QQ`），排查时先看这一行。
+- **主动消息需要对方同意**（`active_msg_require_optin`，默认开）：对象第一次私聊机器人时
+  会收到一条简短说明，可用 `/空间偏好` 接受、拒绝或按功能开关；未接受的人不会被主动打扰，
+  只会出现在结果汇总的「因未接受主动消息跳过 N 人」里。
 
 ---
 
@@ -265,22 +275,36 @@
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `greet_enabled` | `false` | 总开关，也可用 `/空间问候 on` 打开 |
-| `greet_users` | `[]` | 问候对象的 QQ 号，例如 `["123456"]` |
+| `active_msg_require_optin` | `true` | 主动消息需要用户同意：**开启时只有用 `/空间偏好` 明确接受过的用户才会收到**早安、晚安与节日祝福；未接受的人被跳过并计入「因未接受主动消息跳过」 |
+| `greet_enabled` | `false` | 早安 / 晚安总开关，也可用 `/空间问候 on` 打开 |
+| `holiday_enabled` | `false` | 节日祝福总开关（默认关闭，见下方说明） |
+| `greet_users` | `[]` | 问候与祝福对象的 QQ 号，例如 `["123456"]` |
 | `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
 | `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
+| `holiday_cron` | `0 9 * * *` | 节日祝福的发送时间；当天不是内置节日则不发送 |
 | `greet_jitter` | `600` | 触发后随机延后 0~N 秒，不固定在同一秒发出 |
+| `holiday_jitter` | `600` | 节日祝福的随机抖动（秒） |
 | `llm_greet_provider_id` | 空 | 问候单独指定模型提供商（留空用全局） |
+| `llm_holiday_provider_id` | 空 | 节日祝福单独指定模型提供商（留空用全局） |
 | `greet_use_ai` | `false` | 用 AI 结合人设与当日生活日程生成；关闭则从文案池随机取 |
 | `greet_prompt` | 见默认值 | AI 提示词，`{slot}` 会被替换成「早安 / 晚安」 |
 | `greet_morning_pool` / `greet_night_pool` | 各 3 条示例 | 文案池 |
+| `holiday_prompt` | 见默认值 | 节日祝福提示词，`{festival}` 会被替换成节日名 |
+| `holiday_pool` | 3 条示例 | 节日祝福文案池（AI 不可用时随机取一条，同样支持 `{festival}`） |
+
+节日祝福覆盖 2026-2030 年的除夕、春节、元宵、清明、端午、七夕、中秋、重阳、腊八、小年
+（依香港天文台《公曆與農曆日期對照表》逐年核对，见 `core/holidays.py` 开头说明）；
+超出范围的年份会写 warning 日志提醒更新，不会静默失效。
+是否先转草稿确认沿用 `draft_for_greet`。
 
 ### 空间说说
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
 | `auto_publish_enabled` | `false` | 定时自动发布总开关 |
-| `publish_cron` | `30 8 * * *` | `HH:MM` 或 5 段 Cron（分 时 日 月 周），留空=不发布 |
+| `publish_per_day` | `1` | 每天自动发布几条；`0` 表示不自动发布，超过时间点个数时按时间点个数算 |
+| `publish_times` | `["08:30"]` | 发布时间点列表（`HH:MM`），按顺序取前 `publish_per_day` 个，每个时间点各自加随机抖动 |
+| `publish_cron` | `30 8 * * *` | 兼容项：仅当 `publish_times` 为空或全部无法识别时，作为唯一时间点生效 |
 | `publish_jitter` | `600` | 触发后随机延后 0~N 秒，0=精确触发 |
 | `llm_provider_id` | 空 | 写说说使用哪个模型提供商（留空用全局） |
 | `content_source` | `pool` | 下拉选择：文案池 / 文本文件 / AI 生成 |
@@ -367,12 +391,13 @@
 | :--- | :--- | :--- |
 | `/空间发布 <内容>` | 管理员 | 立即发说说，消息里的图片一起发（不走草稿） |
 | `/空间自动发`（别名 `/空间生成`） | 管理员 | 立刻用 AI 按人设生成并发一条说说（与定时发布同一条链路） |
-| `/空间状态` | 所有人 | 登录态 / 管理员 / AI 接入 / 生成依据 / 日程 / 定时任务 / 问候 / Token 用量 / 草稿 |
+| `/空间状态` | 所有人 | 登录态 / 管理员 / AI 接入 / 生成依据 / 日程 / 定时任务 / 问候与节日祝福 / 主动消息同意情况 / Token 用量 / 草稿 |
+| `/空间偏好 [接受\|拒绝\|功能 on/off]` | 所有人 | 设置本人是否接收机器人的主动消息，以及早安 / 晚安 / 节日祝福的分项开关 |
 | `/空间用量 [天数]` | 管理员 | 查看 AI token 用量估算（按功能分组） |
 | `/空间管理员 [add\|remove] <QQ>` | 管理员 | 查看或维护插件内管理员名单 |
-| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` | 管理员 | 开关定时问候 / 立刻测试发一条（**不占用当日定时名额**，并回报实际发送地址） |
+| `/空间问候 [on\|off]` / `/空间问候 morning <QQ>` / `/空间问候 holiday [QQ]` | 管理员 | 开关定时问候 / 立刻测试发一条（**不占用当日定时名额**，回报实际发送地址）/ 测试节日祝福（忽略当天是否节日与当日去重） |
 | `/空间重登` | 管理员 | 强制重取 Cookie |
-| `/空间定时 [时间]` | 管理员 | 查看或设置发布时间（`08:30` / `30 8 * * *` / `off`） |
+| `/空间定时 [时间点…]` | 管理员 | 查看或设置发布时间：`08:30,12:30,21:00`（多个时间点）、`每天 2 08:30,12:30`（只发前 2 个）、`30 8 * * *`（单个 Cron）、`off`（关闭） |
 | `/空间开关 [on\|off]` | 管理员 | 定时发布开关 |
 | `/空间互动 [on\|off]` | 管理员 | 说说巡检开关（点赞/评论在配置里单独开） |
 | `/空间读说说 [force]` | 管理员 | 立刻巡检一轮（好友说说 + 自己说说下的评论） |
@@ -432,7 +457,9 @@ astrbot_plugin_qzone_publisher/
 │   ├── life.py                一体化生活日程（生成 / 缓存 / 注入）
 │   ├── usage.py               Token 用量估算与统计
 │   ├── content.py             内容来源（文案池 / 文件 / AI / 联网素材）
-│   ├── greet.py               定时问候（私聊早安/晚安、去重、文案池或 AI）
+│   ├── greet.py               定时问候与节日祝福（私聊、去重、文案池或 AI、用户同意）
+│   ├── holidays.py            传统节日公历日期表与查询（2026-2030，逐年核对）
+│   ├── user_prefs.py          私聊用户偏好（是否接受主动消息、分项开关）
 │   ├── web.py                 接入 AstrBot 自带联网搜索的桥
 │   ├── interact.py            说说互动（巡检、去重、点赞、AI 评论）
 │   ├── draft.py               草稿箱（持久化、确认 / 放弃 / 重写）
@@ -450,7 +477,9 @@ astrbot_plugin_qzone_publisher/
 ├── publish_history.json   发布历史
 ├── life_schedule.json     生活日程缓存
 ├── draft.json             待确认草稿
-├── greet_state.json       今日已发过谁（问候去重）
+├── greet_state.json       今日已发过谁（问候与节日祝福去重）
+├── user_prefs.json        每个私聊用户的主动消息偏好
+├── replied_comments.json  已回复过的评论（去重）
 └── interacted_tids.json   已处理过的说说（去重用）
 ```
 
@@ -497,6 +526,16 @@ A：按这个顺序查：
 A：不会。同一天同一时段对同一个人只发一次，记录在 `greet_state.json`；
 只有**定时任务**会写这条记录，`/空间问候` 手动发送不写（否则手动测过之后，当天的定时问候会被误判为已发而跳过）。
 
+**Q：节日祝福会打扰我吗？**
+A：不会在未同意的情况下发出。节日祝福默认关闭；开启后也只发给在 `/空间偏好` 里接受过「节日祝福」的人。
+对方随时可以用 `/空间偏好 节日 off` 单独关闭，或用 `/空间偏好 拒绝` 关闭全部主动消息。
+
+**Q：为什么某个好友一直收不到问候？**
+A：先看 `/空间状态` 的「主动消息同意: 」一行，以及问候通知里的「因未接受主动消息跳过 N 人」。
+在 `active_msg_require_optin` 开启（默认）时，只有明确接受过的用户会收到主动消息；
+对方第一次私聊机器人时会收到一条说明，回复 `/空间偏好 接受` 即可。
+若你确认不需要这层同意，可把该项关掉，恢复成「只按 `greet_users` 发送」。
+
 **Q：图片上传失败？**
 A：图片接口本身较脆弱。失败时整条说说不会发布（避免发出半截内容），可以少带几张图重试。
 
@@ -520,7 +559,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 352 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 441 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

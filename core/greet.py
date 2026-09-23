@@ -1,11 +1,15 @@
-"""定时问候：按时间给指定用户发私聊问候（早安 / 晚安等）。
+"""定时问候：按时间给指定用户发私聊问候（早安 / 晚安）与传统节日祝福。
 
-- **发给谁**：``greet_users`` 里的 QQ 号，逐个私聊发送；
+- **发给谁**：``greet_users`` 里的 QQ 号，逐个私聊发送；开启
+  ``active_msg_require_optin`` 时，只有明确接受过主动消息的用户才会收到（见
+  :mod:`core.user_prefs`），未接受的人只计入「因未接受主动消息跳过」。
 - **什么时候发**：``greet_morning_cron`` / ``greet_night_cron`` 各自独立，留空即关闭该时段；
+  节日祝福走 ``holiday_cron``，当天不是内置节日就不发。
 - **发什么**：文案池随机取，或用 AI 结合人设与当日生活日程生成（``greet_use_ai``）；
+  节日祝福用 ``holiday_prompt``（``{festival}`` 替换成节日名），失败回退 ``holiday_pool``。
 - **不重复**：同一天同一时段对同一个人只发一次（落盘 ``greet_state.json``），
-  避免随机抖动或错过补偿导致重复问候；
-- AI 调用只走 AstrBot 提供商（可用 ``llm_greet_provider_id`` 单独指定）。
+  节日祝福按 ``holiday:<日期>`` 记录，避免抖动或补偿触发导致重复问候。
+- AI 调用只走 AstrBot 提供商（可用 ``llm_greet_provider_id`` / ``llm_holiday_provider_id`` 单独指定）。
 """
 
 from __future__ import annotations
@@ -14,13 +18,14 @@ import json
 import random
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from astrbot.api import logger
 
 from .config import PluginConfig
+from .holidays import as_date, festival_of, next_festival
 
 if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
     from .llm import AIClient
@@ -28,6 +33,14 @@ if TYPE_CHECKING:  # pragma: no cover - 仅用于类型标注
 DEFAULT_GREET_PROMPT = (
     "用你自己的说话风格，给一个你很在意的人写一句{slot}问候，"
     "一到两句话，自然、有温度，不要解释、不要加引号、不要提“问候”“说说”这类词。"
+)
+
+# 节日祝福的功能标识（与用户偏好里的 features 键一致）
+HOLIDAY_KEY = "holiday"
+
+DEFAULT_HOLIDAY_PROMPT = (
+    "用你自己的说话风格，给一个你很在意的人写一句{festival}祝福，"
+    "一到两句话，自然、有温度，不要解释、不要加引号、不要分点或罗列。"
 )
 
 
@@ -63,6 +76,7 @@ class GreetResult:
         text: 实际发送的内容。
         sent: 成功发送人数（AstrBot 确认找到平台、消息已交给协议端）。
         skipped: 跳过人数（今天已发过 / 没配目标）。
+        blocked: 因用户未接受主动消息而跳过的人数。
         record: 是否写入「今日已问候」记录；手动测试时为 False，
             否则手动发一次会把当天的自动问候名额用掉。
         targets_used: 实际使用的发送地址（QQ -> UMO），用于排查发不出去的问题。
@@ -73,6 +87,7 @@ class GreetResult:
     text: str = ""
     sent: int = 0
     skipped: int = 0
+    blocked: int = 0
     record: bool = True
     targets_used: dict[str, str] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -80,6 +95,8 @@ class GreetResult:
     def summary(self) -> str:
         """生成可读汇总。"""
         parts = [f"成功 {self.sent} 人", f"跳过 {self.skipped} 人"]
+        if self.blocked:
+            parts.append(f"因未接受主动消息跳过 {self.blocked} 人")
         if not self.record:
             parts.append("手动发送（不占用今日自动问候名额）")
         text = "，".join(parts)
@@ -99,6 +116,7 @@ class GreetingService:
         *,
         life_context_provider: Callable[[], object] | None = None,
         umo_resolver: Callable[[str], str] | None = None,
+        opted_in_checker: Callable[[str, str], bool] | None = None,
         sender: Callable[[str, str], object] | None = None,
     ) -> None:
         """初始化服务。
@@ -110,6 +128,8 @@ class GreetingService:
             life_context_provider: 可选的异步函数，返回当日日程文本。
             umo_resolver: 可选的 ``(qq) -> umo``，优先用「最近一次真实私聊会话地址」，
                 拿不到时返回空串表示回退到按平台 id 拼装。
+            opted_in_checker: 可选的 ``(qq, feature) -> bool``，判断该用户是否接受
+                这个功能的主动消息；返回 False 的人会被跳过并计入 blocked。
             sender: 可选的异步发送函数 ``(umo, text) -> bool``，便于测试注入。
         """
         self.cfg = config
@@ -117,6 +137,7 @@ class GreetingService:
         self._platform_id_provider = platform_id_provider
         self._life_context_provider = life_context_provider
         self._umo_resolver = umo_resolver
+        self._optin = opted_in_checker
         self._sender = sender
         self.file = Path(config.data_dir) / "greet_state.json"
         self._sent: dict[str, list[str]] = {}
@@ -270,16 +291,121 @@ class GreetingService:
 
     def _from_pool(self, slot: GreetSlot) -> str:
         """从对应文案池随机取一条。"""
+        return self._from_pool_key(
+            slot.pool_key, slot.name, "且未开启 AI 生成（greet_use_ai）"
+        )
+
+    def _from_pool_key(
+        self, pool_key: str, label: str, why: str = "且 AI 不可用"
+    ) -> str:
+        """从指定文案池随机取一条。
+
+        Args:
+            pool_key: 文案池配置项名。
+            label: 出错提示里用的名字。
+            why: 出错提示里的补充说明。
+
+        Returns:
+            文案池里的一条文案。
+
+        Raises:
+            RuntimeError: 文案池为空时抛出。
+        """
         pool = [
             str(item).strip()
-            for item in (getattr(self.cfg, slot.pool_key, None) or [])
+            for item in (getattr(self.cfg, pool_key, None) or [])
             if str(item).strip()
         ]
         if not pool:
-            raise RuntimeError(
-                f"{slot.name}文案池为空，且未开启 AI 生成（greet_use_ai）"
-            )
+            raise RuntimeError(f"{label}文案池为空，{why}")
         return random.choice(pool)
+
+    @staticmethod
+    def _fill_festival(text: str, festival: str) -> str:
+        """把文案里的 ``{festival}`` 占位符替换成节日名。
+
+        Args:
+            text: 含占位符的文案。
+            festival: 节日名。
+
+        Returns:
+            替换后的文案；占位符写法异常时原样返回。
+        """
+        try:
+            return text.format(festival=festival)
+        except Exception:
+            return text.replace("{festival}", festival)
+
+    async def build_holiday_text(self, festival: str) -> str:
+        """生成节日祝福内容。
+
+        Args:
+            festival: 节日名，用于替换提示词里的 ``{festival}``。
+            value_date: 不参与生成，仅用于调用方语义清晰。
+
+        Returns:
+            祝福文本；AI 不可用或返回为空时回退 ``holiday_pool``。
+
+        Raises:
+            RuntimeError: 节日文案池为空且 AI 也不可用时抛出。
+        """
+        name = str(festival or "").strip() or "节日"
+        prompt_template = (
+            str(self.cfg.holiday_prompt or "").strip() or DEFAULT_HOLIDAY_PROMPT
+        )
+        try:
+            hint = prompt_template.format(festival=name)
+        except Exception:
+            hint = prompt_template
+
+        life_context = ""
+        if self._life_context_provider is not None:
+            try:
+                life_context = str(await self._life_context_provider() or "")
+            except Exception as e:
+                logger.debug(f"获取节日祝福用的日程上下文失败: {e}")
+
+        try:
+            text = await self.ai.chat(
+                system_prompt=(
+                    f"{hint}\n\n# 输出要求\n只输出祝福正文，"
+                    "不要引号、不要解释、不要换行分段。"
+                ),
+                prompt=life_context or None,
+                provider_id=str(self.cfg.llm_holiday_provider_id or ""),
+                feature="节日祝福",
+            )
+        except Exception as e:
+            logger.warning(f"AI 生成节日祝福失败，改用文案池: {e}")
+            return self._fill_festival(
+                self._from_pool_key("holiday_pool", "节日祝福"), name
+            )
+
+        cleaned = " ".join(text.split()).strip("\"'“”‘’")
+        if not cleaned:
+            return self._fill_festival(
+                self._from_pool_key("holiday_pool", "节日祝福"), name
+            )
+        return cleaned
+
+    def _allowed(self, qq: str, feature: str) -> bool:
+        """按用户偏好判断是否允许给这个人发这个功能的主动消息。
+
+        Args:
+            qq: 目标 QQ 号。
+            feature: 功能标识（morning / night / holiday）。
+
+        Returns:
+            允许时返回 True；没有配置检查器、或检查异常时按「不允许」处理，
+            避免在拿不准的情况下打扰用户。
+        """
+        if self._optin is None:
+            return True
+        try:
+            return bool(self._optin(qq, feature))
+        except Exception as e:
+            logger.warning(f"检查 {qq} 的主动消息偏好失败，按不允许处理: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # 发送
@@ -292,6 +418,7 @@ class GreetingService:
         targets: list[str] | None = None,
         force: bool = False,
         record: bool = True,
+        feature: str = "",
     ) -> GreetResult:
         """生成并发送一次问候。
 
@@ -301,6 +428,7 @@ class GreetingService:
             force: 为 True 时忽略今日去重（用于手动测试）。
             record: 是否写入「今日已问候」记录。手动测试应传 False，
                 否则会把当天的自动问候名额用掉，定时任务到点会直接跳过。
+            feature: 用于用户偏好检查的功能标识；留空表示不检查偏好。
 
         Returns:
             GreetResult 汇总。
@@ -319,7 +447,91 @@ class GreetingService:
             return result
 
         result.text = await self.build_text(slot)
-        await self._deliver(result, watch, slot.key, force=force, record=record)
+        await self._deliver(
+            result,
+            watch,
+            slot.key,
+            force=force,
+            record=record,
+            feature=feature or slot.key,
+        )
+        return result
+
+    async def build_holiday_preview(
+        self,
+        value_date: date | datetime | str | None = None,
+        *,
+        force: bool = False,
+    ) -> tuple[str, str] | None:
+        """生成节日祝福内容但不发送（草稿模式使用）。
+
+        Args:
+            value_date: 目标日期；缺省用今天。
+            force: 为 True 时忽略「今天不是节日」（手动测试用）。
+
+        Returns:
+            (记录标识, 祝福文本)；当天不是内置节日且未 force 时返回 None。
+
+        Raises:
+            RuntimeError: 内容生成失败（文案池为空且 AI 不可用）时抛出。
+        """
+        day = as_date(value_date)
+        festival = festival_of(day)
+        if not festival and not force:
+            logger.info(f"[greet] {day.isoformat()} 不是内置传统节日，跳过节日祝福")
+            return None
+        if not festival:
+            # 手动测试落在非节日：用下一个节日的名字占位，避免提示词里没有节日名
+            upcoming = next_festival(day)
+            festival = upcoming[0] if upcoming else "节日"
+        text = await self.build_holiday_text(festival)
+        return f"{HOLIDAY_KEY}:{day.isoformat()}", text
+
+    async def send_holiday(
+        self,
+        *,
+        value_date: date | datetime | str | None = None,
+        targets: list[str] | None = None,
+        force: bool = False,
+        record: bool = True,
+    ) -> GreetResult:
+        """发送一次传统节日祝福。
+
+        Args:
+            value_date: 目标日期；缺省用今天（按系统时区）。
+            targets: 覆盖本次目标；缺省用配置里的 greet_users。
+            force: 为 True 时忽略「今天不是节日」与当日去重（手动测试用）。
+            record: 是否写入当日记录。
+
+        Returns:
+            GreetResult 汇总；当天不是节日且未 force 时，结果里只有一条说明。
+
+        Raises:
+            RuntimeError: 内容生成失败（文案池为空且 AI 不可用）时抛出。
+        """
+        day = as_date(value_date)
+        result = GreetResult(slot=f"{HOLIDAY_KEY}:{day.isoformat()}", record=record)
+
+        preview = await self.build_holiday_preview(value_date, force=force)
+        if preview is None:
+            result.errors.append("今天不是内置的传统节日，未发送节日祝福")
+            return result
+        slot_key, text = preview
+
+        watch = targets if targets is not None else self.targets
+        if not watch:
+            result.errors.append("未配置 greet_users，不知道要问候谁")
+            return result
+
+        result.text = text
+        await self._deliver(
+            result,
+            watch,
+            slot_key,
+            force=force,
+            record=record,
+            feature=HOLIDAY_KEY,
+        )
         return result
 
     async def send_text(
@@ -330,6 +542,7 @@ class GreetingService:
         slot_key: str = "custom",
         force: bool = True,
         record: bool = True,
+        feature: str = "",
     ) -> GreetResult:
         """发送一段已经定好的文本（草稿确认放行时使用）。
 
@@ -339,6 +552,7 @@ class GreetingService:
             slot_key: 记录用的标识。
             force: 为 True 时忽略当日去重。
             record: 是否写入「今日已问候」记录。
+            feature: 用于用户偏好检查的功能标识；留空表示不检查偏好。
 
         Returns:
             GreetResult 汇总。
@@ -349,7 +563,9 @@ class GreetingService:
             result.errors.append("未配置 greet_users，不知道要问候谁")
             return result
 
-        await self._deliver(result, watch, slot_key, force=force, record=record)
+        await self._deliver(
+            result, watch, slot_key, force=force, record=record, feature=feature
+        )
         return result
 
     async def _deliver(
@@ -360,6 +576,7 @@ class GreetingService:
         *,
         force: bool,
         record: bool = True,
+        feature: str = "",
     ) -> None:
         """逐个私聊发送并记录去重状态。"""
         platform_id = str(self._platform_id_provider() or "").strip()
@@ -371,6 +588,10 @@ class GreetingService:
             return
 
         for qq in watch:
+            if feature and not self._allowed(qq, feature):
+                result.blocked += 1
+                logger.info(f"[greet] {qq} 未接受主动消息（{feature}），本次跳过")
+                continue
             if not force and self._already_sent(slot_key, qq):
                 result.skipped += 1
                 continue
