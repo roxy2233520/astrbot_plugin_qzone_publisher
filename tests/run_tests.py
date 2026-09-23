@@ -16,6 +16,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 from typing import ClassVar
@@ -1118,6 +1119,34 @@ async def main() -> int:
     likes: list[dict] = []
     comments: list[dict] = []
 
+    # 假空间返回的说说列表：测试里可以整体替换，用来构造各种时间窗口场景
+    now_ts = int(time.time())
+
+    def friend_post(
+        tid: str, ago_hours: float, uin: int = 999999, name: str = "小明"
+    ) -> dict:
+        """造一条「ago_hours 小时前发布」的好友说说。"""
+        return {
+            "uin": uin,
+            "tid": tid,
+            "name": name,
+            "content": "今天天气不错[em]e100[/em]",
+            "created_time": int(now_ts - ago_hours * 3600),
+            "pic": [{"url2": "http://img/1.jpg"}],
+            "commentlist": [{"tid": 1}],
+        }
+
+    feeds_payload: list[dict] = [
+        friend_post("T1", 1),
+        {
+            "uin": 123456,
+            "tid": "T2",
+            "name": "我自己",
+            "content": "我发的说说",
+            "created_time": now_ts - 2 * 3600,
+        },
+    ]
+
     async def handle_ai(request):
         body = await request.json()
         ai_requests.append(
@@ -1157,25 +1186,7 @@ async def main() -> int:
 
     async def handle_feeds(request):
         feeds_calls.append(dict(request.query))
-        msglist = [
-            {
-                "uin": 999999,
-                "tid": "T1",
-                "name": "小明",
-                "content": "今天天气不错[em]e100[/em]",
-                "created_time": 1700000000,
-                "pic": [{"url2": "http://img/1.jpg"}],
-                "commentlist": [{"tid": 1}],
-            },
-            {
-                "uin": 123456,
-                "tid": "T2",
-                "name": "我自己",
-                "content": "我发的说说",
-                "created_time": 1700000001,
-            },
-        ]
-        return web.json_response({"code": 0, "msglist": msglist})
+        return web.json_response({"code": 0, "msglist": feeds_payload})
 
     async def handle_like(request):
         form = await request.post()
@@ -1419,20 +1430,31 @@ async def main() -> int:
     plugin.ai.chat = comment_chat
     cfg.set("interact_uins", ["999999"])
     cfg.set("interact_count", 3)
+    cfg.set("interact_days", 3)
     cfg.set("interact_like", False)
     cfg.set("interact_comment", False)
     cfg.set("interact_skip_self", True)
     cfg.set("draft_for_comment", True)
     cfg.set("interact_enabled", True)
 
+    feeds_payload[:] = [
+        friend_post("T1", 1),
+        {
+            "uin": 123456,
+            "tid": "T2",
+            "name": "我自己",
+            "content": "我发的说说",
+            "created_time": now_ts - 2 * 3600,
+        },
+    ]
     plugin.interact._seen = []
     likes.clear()
     comments.clear()
     plugin.drafts.clear()
     result = await plugin.interact.run_once()
     check(
-        "只读模式：检查 2 条、跳过自己 1 条",
-        result.checked == 2 and result.skipped == 1,
+        "只读模式：每个好友只取窗口内最新一条",
+        result.checked == 1 and result.skipped == 0 and result.stale == 0,
         result.summary(),
     )
     check(
@@ -1449,13 +1471,118 @@ async def main() -> int:
     result = await plugin.interact.run_once()
     check(
         "第二轮被去重",
-        result.checked == 2 and result.skipped == 2 and result.liked == 0,
+        result.checked == 1 and result.skipped == 1 and result.liked == 0,
         result.summary(),
     )
     result = await plugin.interact.run_once(force=True)
     check(
-        "force 忽略去重", result.checked == 2 and result.skipped == 1, result.summary()
+        "force 忽略去重", result.checked == 1 and result.skipped == 0, result.summary()
     )
+
+    print("\n[15a] 互动时间窗口：只看最近 N 天内最新的一条")
+    plugin.interact._seen = []
+    likes.clear()
+    comments.clear()
+    plugin.drafts.clear()
+    cfg.set("interact_like", True)
+    cfg.set("interact_comment", True)
+    cfg.set("draft_for_comment", True)
+
+    feeds_payload[:] = [friend_post("T_OLD", 24 * 5)]
+    result = await plugin.interact.run_once()
+    check(
+        "最新一条在 5 天前：整条跳过",
+        result.checked == 0
+        and result.stale == 1
+        and result.liked == 0
+        and result.commented == 0
+        and result.drafted == 0,
+        result.summary(),
+    )
+    check(
+        "窗口外不发任何请求",
+        len(likes) == 0 and len(comments) == 0 and plugin.drafts.pending is None,
+        f"{len(likes)}/{len(comments)}",
+    )
+    check("窗口外写在汇总里", "超出时间窗口" in result.summary(), result.summary())
+
+    plugin.interact._seen = []
+    comments.clear()
+    plugin.drafts.clear()
+    cfg.set("interact_like", False)
+    feeds_payload[:] = [friend_post("T_TWO_DAYS", 24 * 2), friend_post("T_NEW", 1)]
+    result = await plugin.interact.run_once()
+    pending_comment = plugin.drafts.pending
+    check(
+        "窗口内多条只处理最新一条",
+        result.checked == 1
+        and result.drafted == 1
+        and pending_comment is not None
+        and pending_comment.target_tid == "T_NEW",
+        result.summary(),
+    )
+
+    plugin.interact._seen = []
+    plugin.drafts.clear()
+    feeds_payload[:] = [friend_post("T_2DAYS", 24 * 2)]
+    cfg.set("interact_days", 1)
+    result = await plugin.interact.run_once()
+    check(
+        "interact_days=1 时 2 天前的说说被跳过",
+        result.checked == 0 and result.stale == 1,
+        result.summary(),
+    )
+    cfg.set("interact_days", 3)
+    result = await plugin.interact.run_once()
+    check(
+        "interact_days=3 时同一条会被处理",
+        result.checked == 1 and result.stale == 0,
+        result.summary(),
+    )
+
+    plugin.interact._seen = []
+    plugin.drafts.clear()
+    feeds_payload[:] = [
+        friend_post("T_FRIEND", 5),
+        {
+            "uin": 123456,
+            "tid": "T_SELF",
+            "name": "我自己",
+            "content": "我发的说说",
+            "created_time": now_ts - 3600,
+        },
+    ]
+    result = await plugin.interact.run_once()
+    check(
+        "窗口内最新一条是自己发的：跳过自己",
+        result.checked == 1 and result.skipped == 1 and result.drafted == 0,
+        result.summary(),
+    )
+
+    plugin.interact._seen = []
+    plugin.drafts.clear()
+    feeds_payload[:] = [
+        {
+            "uin": 999999,
+            "tid": "T_NOTIME",
+            "name": "小明",
+            "content": "没有时间戳的说说",
+            "created_time": 0,
+        }
+    ]
+    result = await plugin.interact.run_once()
+    check(
+        "时间戳缺失时按窗口内处理，不整批跳过",
+        result.checked == 1 and result.stale == 0,
+        result.summary(),
+    )
+
+    # 复原成默认那条，后面的指令测试继续用它
+    feeds_payload[:] = [friend_post("T1", 1)]
+    plugin.interact._seen = []
+    plugin.drafts.clear()
+    cfg.set("interact_comment", False)
+    cfg.set("interact_days", 3)
 
     plugin.interact._seen = []
     likes.clear()
@@ -1523,7 +1650,7 @@ async def main() -> int:
     cfg.set("draft_for_comment", True)
     check(
         "互动模式描述",
-        plugin.interact.mode_text() == "只读 + 评论(先确认)",
+        plugin.interact.mode_text() == "只读 + 3 天内最新一条 + 评论(先确认)",
         plugin.interact.mode_text(),
     )
 
@@ -2776,6 +2903,60 @@ async def main() -> int:
     plugin.cfg.set("draft_timeout_minutes", 0)
     plugin.cfg.set("draft_enabled", False)
     plugin._cancel_draft_timer()
+
+    print("\n[27] 手动触发 AI 自动发说说（/空间自动发）")
+
+    async def auto_chat(
+        *, system_prompt, prompt=None, contexts=None, provider_id=None, feature=None
+    ):
+        return "手动自动发的说说正文"
+
+    plugin.ai.chat = auto_chat
+    plugin.cfg.set("content_source", "llm")
+    plugin.cfg.set("llm_use_life_context", False)
+    plugin.cfg.set("draft_enabled", False)
+    plugin.drafts.clear()
+    received.pop("publish", None)
+
+    out = await collect(plugin.cmd_auto_publish(FakeEvent()))
+    check(
+        "手动自动发：直接发布并回报 tid",
+        any("手动自动发成功" in item for item in out)
+        and any("tid:" in item for item in out),
+        str(out)[:140],
+    )
+    check(
+        "手动自动发：发出去的就是 AI 生成结果",
+        str(received.get("publish", {}).get("form", {}).get("con"))
+        == "手动自动发的说说正文",
+        str(received.get("publish", {}).get("form", {}).get("con"))[:60],
+    )
+
+    plugin.cfg.set("draft_enabled", True)
+    plugin.drafts.clear()
+    received.pop("publish", None)
+    out = await collect(plugin.cmd_auto_publish(FakeEvent()))
+    pending_post = plugin.drafts.pending
+    check(
+        "手动自动发：开着草稿确认时转成草稿",
+        pending_post is not None
+        and pending_post.kind == "post"
+        and any("草稿" in item for item in out),
+        f"{str(out)[:80]} | {pending_post}",
+    )
+    check(
+        "草稿正文来自 AI 生成",
+        pending_post is not None and "手动自动发的说说正文" in pending_post.text,
+        str(pending_post)[:80],
+    )
+    check(
+        "草稿模式下没有真的发出去",
+        "publish" not in received,
+        str(sorted(received)),
+    )
+
+    plugin.cfg.set("draft_enabled", False)
+    plugin.drafts.clear()
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()

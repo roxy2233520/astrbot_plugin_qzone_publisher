@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-292%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-305%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -26,13 +26,14 @@
 | 登录 | 自动向 OneBot 取空间域 Cookie，免抓包；支持手动 Cookie 兜底；登录态失效自动重取并重试一次 |
 | 发布 | `/空间发布` 立即发说说，消息里带的图片会一起上传发布（最多 9 张） |
 | 定时 | 支持 `HH:MM` 或 5 段 Cron，带随机抖动；改配置即时生效 |
+| 手动触发 | `/空间自动发` 立刻按人设生成并发一条说说：与定时发布走**同一条链路**，所以受草稿确认开关影响（开了就先给你草稿） |
 | 内容来源 | 文案池随机 / 文本文件随机一行 / AI 按人设生成（可参考今日日程、最近聊天记录与联网资料） |
 | 联网素材 | **接入 AstrBot 自带的联网搜索**：先联网查资料，再让 AI 结合资料写说说；搜索不可用时自动降级 |
 | Token 用量 | 估算每次生成大概用多少 token，累计到 `/空间状态` 与 `/空间用量`；草稿与发布通知里也会带上 |
 | 回执图 | 通知与草稿可附带一张渲染出来的回执图（用 AstrBot 自带文转图，不加字体、不加体积；渲染失败自动降级纯文本） |
 | AI 接入 | **只复用 AstrBot 已配置的 LLM 提供商**，插件不保存密钥、不自己发请求 |
 | 生活日程 | 自己用 AI 生成「今日穿搭 + 日程」（按天缓存、懒加载、创意池、防重复）；可选注入 system prompt |
-| 说说互动 | 定时读取关注 QQ 号的最近说说（**默认只读**），可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
+| 说说互动 | 定时读取关注 QQ 号**最近 N 天内最新的一条**说说（`interact_days`，**默认只读**）；最新一条超出窗口就整体跳过，不去评论几天前的老说说。可选自动点赞与 AI 评论，按 `uin_tid` 去重 |
 | 草稿确认 | 自动发布/自动评论前先发给你确认：`/空间确认` 发、`/空间放弃` 丢、`/空间重写` 让 AI 再写一版 |
 | 定时问候 | 按时间给指定用户**私聊**发早安 / 晚安，内容可用文案池或 AI 按人设生成，同一天同一时段不重复发 |
 | 运维 | 发布历史、失败通知、`/空间状态` 一屏看全、`/空间删除` 按 tid 删说说 |
@@ -293,7 +294,8 @@
 | `interact_enabled` | `true` | 定时读说说（只读）总开关 |
 | `interact_cron` / `interact_jitter` | `0 21 * * *` / `600` | 巡检时间与抖动 |
 | `interact_uins` | `[]` | **关注谁的空间**，填 QQ 号；留空则巡检不做任何事 |
-| `interact_count` | `3` | 每个对象读几条 |
+| `interact_count` | `3` | 每个对象拉取几条；只用于在时间窗口内挑出最新一条，不会逐条处理 |
+| `interact_days` | `3` | **时间窗口**：每个好友只看最近几天内最新的一条说说。最新一条超出窗口就整体跳过（不点赞、不评论），避免去评论几天前的老说说 |
 | `interact_skip_self` | `true` | 跳过自己发的 |
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
@@ -337,6 +339,7 @@
 | 指令 | 权限 | 说明 |
 | :--- | :--- | :--- |
 | `/空间发布 <内容>` | 管理员 | 立即发说说，消息里的图片一起发（不走草稿） |
+| `/空间自动发`（别名 `/空间生成`） | 管理员 | 立刻用 AI 按人设生成并发一条说说（与定时发布同一条链路） |
 | `/空间状态` | 所有人 | 登录态 / 管理员 / AI 接入 / 生成依据 / 日程 / 定时任务 / 问候 / Token 用量 / 草稿 |
 | `/空间用量 [天数]` | 管理员 | 查看 AI token 用量估算（按功能分组） |
 | `/空间管理员 [add\|remove] <QQ>` | 管理员 | 查看或维护插件内管理员名单 |
@@ -353,7 +356,7 @@
 | `/空间删除 <tid>` | 管理员 | 删除指定说说 |
 
 英文别名：上面每条指令都有 `/space xxx` 与 `/qz xxx` 两种英文写法，可用的词是
-`post` / `status` / `relogin` / `cron` / `toggle` / `interact` / `search` / `life` /
+`post` / `auto` / `status` / `relogin` / `cron` / `toggle` / `interact` / `search` / `life` /
 `read` / `admin` / `greet` / `usage` / `ok` / `drop` / `redo` / `history` / `delete`
 （例如 `/space post`、`/qz post`）。另外 `/空间登录` 等价于 `/空间状态`。
 
@@ -479,7 +482,7 @@ A：用的是网页端私有协议，且没有官方保障。请把频率控制�
 ```bash
 pip install aiohttp apscheduler pyyaml
 
-python tests/run_tests.py        # 292 项功能自测（不需要安装 AstrBot）
+python tests/run_tests.py        # 305 项功能自测（不需要安装 AstrBot）
 python tests/check_metadata.py   # 元数据 / 必需文件 / 隐私体检
 python tests/check_schema.py     # 用 AstrBot 真实逻辑校验配置 schema
 python tests/check_logo.py       # 校验 logo.png

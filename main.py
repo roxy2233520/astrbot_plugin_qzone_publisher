@@ -703,6 +703,46 @@ class QzonePublisherPlugin(Star):
 
         yield event.plain_result(self._format_record(record))
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("空间自动发", alias={"space auto", "qz auto", "空间生成"})
+    async def cmd_auto_publish(self, event: AstrMessageEvent):
+        """立刻用 AI 生成并发布一条说说（与定时发布同一条链路）"""
+        self._remember_client(event)
+        self.content.remember_umo(event.unified_msg_origin)
+        self.ai.remember_umo(event.unified_msg_origin)
+
+        yield event.plain_result("正在按人设生成内容...")
+        try:
+            text, source = await self.content.generate()
+        except Exception as e:
+            yield event.plain_result(f"生成失败：{e}")
+            return
+
+        # 与定时发布保持一致：开了草稿确认就先转草稿，不直接发出去
+        if bool(self.cfg.draft_enabled):
+            draft = self.drafts.put(Draft(kind="post", text=text, source=source))
+            sent = await self._send_draft(draft)
+            await self._arm_draft_timer(draft)
+            note = f"（草稿已发给 {sent} 个会话）" if sent else "（没有可用的通知会话）"
+            yield event.plain_result(
+                f"已生成说说草稿{note}{self._usage_note()}\n\n{draft.describe()}"
+            )
+            return
+
+        try:
+            record = await self._publish(text, source=source)
+        except Exception as e:
+            await self._notify(f"手动自动发失败：{e}" + self._usage_note())
+            yield event.plain_result(f"发布失败：{e}{self._usage_note()}")
+            return
+
+        await self._notify(
+            self._format_record(record, prefix="手动自动发成功") + self._usage_note()
+        )
+        yield event.plain_result(
+            self._format_record(record, prefix="手动自动发成功") + self._usage_note()
+        )
+
     @filter.command("空间状态", alias={"space status", "qz status", "空间登录"})
     async def cmd_status(self, event: AstrMessageEvent):
         """查看登录态、AI 接入、日程与各定时任务状态"""
