@@ -25,7 +25,7 @@ desc: |
   - Token 用量估算：/空间状态 与 /空间用量 可看，草稿与通知里也会附上
   - 管理员名单可在插件内维护（/空间管理员），也可沿用 AstrBot 的 admins_id
   - 发布历史、失败通知、按 tid 删除说说
-version: 2.11.0
+version: 2.10.2
 author: roxy2233520
 repo: https://github.com/roxy2233520/astrbot_plugin_qzone_publisher
 astrbot_version: ">=4.16,<5"

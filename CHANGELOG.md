@@ -3,7 +3,7 @@
 本文件记录插件的重要变更，格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [2.11.0] - 2026-09-24
+## [2.10.2] - 2026-09-24
 
 ### 变更
 
