@@ -37,6 +37,21 @@ _MISSING = object()
 # 旧版扁平键的迁移标记（同样是隐藏项，不出现在面板里）
 MIGRATION_FLAG = "_flat_keys_migrated"
 
+# 名单类配置搬进「名单与权限」板块的标记（隐藏项）
+AUDIENCE_MOVED_FLAG = "_audience_keys_moved"
+
+# 从别的板块搬进「名单与权限」的键 -> 旧的板块路径。
+# 旧位置在 schema 里保留同名隐藏副本（面板不显示），否则 AstrBot 会在
+# 插件启动前就把用户填好的名单当成多余键删掉。
+MOVED_SECTION_KEYS: dict[str, tuple[str, str]] = {
+    "interact_uins": ("sec_interact", "interact_uins"),
+    "interact_reply_uins": ("sec_interact", "interact_reply_uins"),
+    "interact_reply_require_optin": ("sec_interact", "interact_reply_require_optin"),
+    "greet_users": ("sec_private", "greet_users"),
+    "active_msg_require_optin": ("sec_private", "active_msg_require_optin"),
+    "admin_uins": ("sec_basic", "admin_uins"),
+}
+
 
 def _resolve_plugin_name() -> str:
     """推导插件名，用作数据目录名。
@@ -106,9 +121,9 @@ def _build_index(
     for key, meta in schema.items():
         if not isinstance(meta, dict):
             continue
-        # 隐藏项（旧的扁平键）只用于迁移，不作为主索引
+        # 隐藏项（旧的扁平键与内部标记）只用于迁移，不作为主索引
         if meta.get("condition"):
-            if key != MIGRATION_FLAG:
+            if key not in (MIGRATION_FLAG, AUDIENCE_MOVED_FLAG):
                 legacy.append(key)
             default = _leaf_default(meta)
             if default is not _MISSING:
@@ -118,6 +133,13 @@ def _build_index(
         if meta.get("type") == "object" and isinstance(meta.get("items"), dict):
             for name, sub in meta["items"].items():
                 if not isinstance(sub, dict):
+                    continue
+                # 板块里的隐藏项（例如从别的板块搬走时留下的同名副本）只提供默认值，
+                # 不占用配置路径——真正生效的是新板块里的那一份。
+                if sub.get("condition"):
+                    default = _leaf_default(sub)
+                    if default is not _MISSING:
+                        defaults.setdefault(name, default)
                     continue
                 paths[name] = (key, name)
                 default = _leaf_default(sub)
@@ -149,7 +171,13 @@ def _get_path(config: Any, path: tuple[str, ...]) -> Any:
 
 
 def _set_path(config: Any, path: tuple[str, ...], value: Any) -> None:
-    """按路径写嵌套配置，中间缺失的层级自动补空字典。"""
+    """按路径写嵌套配置，中间缺失的层级自动补空字典。
+
+    Args:
+        config: 配置字典。
+        path: 层级路径。
+        value: 要写入的值。
+    """
     node = config
     for part in path[:-1]:
         child = node.get(part)
@@ -158,6 +186,22 @@ def _set_path(config: Any, path: tuple[str, ...], value: Any) -> None:
             node[part] = child
         node = child
     node[path[-1]] = value
+
+
+def _delete_path(config: Any, path: tuple[str, ...]) -> None:
+    """按路径删掉一个配置项（层级不存在时什么都不做）。
+
+    Args:
+        config: 配置字典。
+        path: 层级路径。
+    """
+    node: Any = config
+    for part in path[:-1]:
+        node = node.get(part) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            return
+    if isinstance(node, dict):
+        node.pop(path[-1], None)
 
 
 class PluginConfig:
@@ -173,6 +217,7 @@ class PluginConfig:
         history_file: 发布历史文件路径。
         timezone: AstrBot 配置的时区，缺省为 Asia/Shanghai。
         migrated_keys: 本次启动从旧扁平结构搬到板块下的配置项名。
+        moved_keys: 本次启动从别的板块搬进「名单与权限」的配置项名。
     """
 
     def __init__(self, raw: AstrBotConfig, context: Context) -> None:
@@ -188,6 +233,7 @@ class PluginConfig:
         self.history_file = self.data_dir / "publish_history.json"
         self.draft_file = self.data_dir / "draft.json"
         self.migrated_keys: list[str] = self.migrate_flat_config()
+        self.moved_keys: list[str] = self.migrate_moved_sections()
 
         tz = context.get_config().get("timezone")
         try:
@@ -242,6 +288,50 @@ class PluginConfig:
             logger.warning(f"迁移后的配置保存失败: {e}")
         if moved:
             logger.info(f"已把 {len(moved)} 项旧配置迁移到新的板块结构（原值保持不变）")
+        return moved
+
+    # ------------------------------------------------------------------
+    # 名单类配置搬板块（2.11.0）：把散在各板块的名单统一到「名单与权限」
+    # ------------------------------------------------------------------
+
+    def migrate_moved_sections(self) -> list[str]:
+        """把已经搬到「名单与权限」板块的键，从旧板块位置搬过去（只做一次）。
+
+        为什么需要这一步：AstrBot 加载插件配置时会按 schema 对齐用户配置
+        （``check_config_integrity`` 会删掉 schema 里没有的键并立即存盘），
+        旧位置若彻底从 schema 里消失，用户已经填好的名单会在插件启动前就被删掉。
+        因此旧位置保留了一份同名隐藏副本（面板不显示），由这里把值搬到新板块，
+        然后删掉旧位置的值；完成后打标记，避免下次启动把默认值又搬一遍。
+
+        Returns:
+            本次搬移的配置项名列表；无需迁移时为空。
+        """
+        raw = self.raw
+        if not isinstance(raw, dict) or not MOVED_SECTION_KEYS:
+            return []
+        if raw.get(AUDIENCE_MOVED_FLAG):
+            return []
+
+        moved: list[str] = []
+        for key, old_path in MOVED_SECTION_KEYS.items():
+            new_path = PATHS.get(key)
+            if new_path is None:
+                continue
+            value = _get_path(raw, old_path)
+            if value is not _MISSING and value is not None:
+                _set_path(raw, new_path, value)
+                moved.append(key)
+            _delete_path(raw, old_path)
+
+        raw[AUDIENCE_MOVED_FLAG] = True
+        try:
+            raw.save_config()
+        except Exception as e:
+            logger.warning(f"搬移名单配置后的保存失败: {e}")
+        if moved:
+            logger.info(
+                f"已把 {len(moved)} 项名单配置搬到「名单与权限」板块（原值保持不变）"
+            )
         return moved
 
     @staticmethod

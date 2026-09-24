@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-770%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-775%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -604,8 +604,11 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 配置在 AstrBot 面板「插件配置」里修改。面板已按板块分组，**板块标题与顺序与本文一致**；
 各板块内部统一按「开关 → 对象与时间 → 模型提供商 → 内容与提示词 → 数量与限制 → 通知」排列。
+**所有名单类配置（互动对象、特权名单、主动消息对象、确认与通知对象）都集中在
+「名单与权限」板块**，按功能分组排列，不再散落在各功能板块里。
 
 > 从旧版本升级：面板结构变了，但**原有配置值会自动迁移到对应板块**，无需重新填写。
+> 名单类配置也会从原来的板块搬进「名单与权限」，**已填的 QQ 号一个都不会丢**。
 > 自动发布时间也会被继承：旧版填的「每天一次」时间会转成对应的时间点
 > （例如 `30 00 * * *` → `00:30`），带星期/月份限定的写法仍由 `publish_cron` 生效——
 > **升级后发布时间不会被改成别的时间**。
@@ -614,22 +617,33 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `admin_uins` | `[]` | 插件内管理员 QQ 号；填了就用它作为草稿/通知接收人，留空回退 AstrBot 的 `admins_id`（见上文「管理员识别」） |
 | `notify_enabled` | `true` | 是否发送发布结果通知 |
 | `notify_umo` | 空 | 通知发到哪个会话，格式 `平台ID:消息类型:会话ID`；留空则只发给管理员私聊 |
 | `notify_render_image` | `false` | 通知与草稿附带一张渲染好的回执图 |
 | `notify_render_network` | `false` | 回执图是否走 AstrBot 的 t2i 端点；默认关 = 本地渲染，内容不出本机 |
 | `history_limit` | `200` | 本地保留发布记录条数 |
 
+### 名单与权限
+
+**所有名单都集中在这里**，按功能分组；同意类名单由用户自己在私聊里用 `/私聊开` 维护
+（属于运行时数据，面板里只放开关，人数用 `/空间状态` 查看）。
+
+| 字段 | 默认 | 说明 |
+| :--- | :--- | :--- |
+| `interact_uins` | `[]` | **说说互动对象**（读说说 / 点赞 / 评论）：要读谁的空间就填谁的 QQ 号。留空则巡检不做任何事；只有「特权名单」里的人或接受过主动消息的人才会被真正点赞 / 评论 |
+| `interact_reply_uins` | `[]` | **评论回复特权名单**：名单内的人无需任何同意即可被自动评论与回复（含他的说说，以及他在自己说说下的评论与子回复） |
+| `interact_reply_require_optin` | `true` | **互动需要「特权名单或已同意」**：开启时只有特权名单里的人、或接受过主动消息的人才会被自动评论 / 回复；关闭后退回「谁都可以互动」 |
+| `greet_users` | `[]` | **主动消息对象**（早安 / 晚安 / 节日 / 闲聊）：仅当「主动消息需要用户同意」关闭时生效 |
+| `active_msg_require_optin` | `true` | **主动消息需要用户同意**：开启时只发给用 `/私聊开` 接受过的人；用户还可用 `/私聊关` 单独关掉某一项 |
+| `admin_uins` | `[]` | **确认与通知对象（插件管理员）**：填了就用它作为草稿 / 通知接收人，留空回退 AstrBot 的 `admins_id`（见上文「管理员识别」） |
+
 ### 私聊问候
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `active_msg_require_optin` | `true` | 主动消息需要用户同意：**开启时只有用 `/私聊开` 明确接受过的用户才会收到**早安、晚安、日常闲聊与节日祝福；未接受的人被跳过并计入「因未接受主动消息跳过」 |
 | `greet_enabled` | `false` | 早安 / 晚安总开关，也可用 `/空间问候 on` 打开 |
 | `holiday_enabled` | `false` | 节日祝福总开关（默认关闭，见上文「节日祝福」） |
 | `chat_open_enabled` | `false` | 主动闲聊总开关（默认关闭，见上文「日常闲聊」），也可用 `/空间闲聊 on` 打开 |
-| `greet_users` | `[]` | 早安 / 晚安的收件人 QQ 号，例如 `["123456"]`；**仅当 `active_msg_require_optin` 关闭时生效** |
 | `greet_morning_cron` | `0 8 * * *` | 早安时间，留空表示不发 |
 | `greet_night_cron` | `0 23 * * *` | 晚安时间，留空表示不发 |
 | `holiday_cron` | `0 9 * * *` | 节日祝福的发送时间；当天不是内置节日则不发送 |
@@ -688,8 +702,7 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
-| `interact_enabled` | `true` | 定时读说说（只读）总开关 |
-| `interact_uins` | `[]` | **关注谁的空间**，填 QQ 号；留空则巡检不做任何事。**只有特权名单里的人、或接受过主动消息的人才会被自动点赞 / 评论**（并集口径） |
+| `interact_enabled` | `true` | 定时读说说（只读）总开关。**互动对象与权限在「名单与权限」板块**（`interact_uins`、`interact_reply_uins`、`interact_reply_require_optin`） |
 | `interact_cron` / `interact_jitter` | `0 21 * * *` / `600` | 巡检时间与抖动 |
 | `interact_days` | `3` | **时间窗口**：每个好友只看最近几天内最新的一条说说。最新一条超出窗口就整体跳过（不点赞、不评论），避免去处理几天前的老说说 |
 | `interact_count` | `3` | 每个对象拉取几条；只用于在时间窗口内挑出最新一条，不会逐条处理 |
@@ -697,8 +710,6 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
 | `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复；默认巡检到就直接回复 |
-| `interact_reply_uins` | `[]` | **特权名单**：手动填 QQ 号，例如 `["123456"]`。名单内的人**无需任何同意**即可被自动评论与回复（含他的说说、以及他在自己说说下的评论与子回复）；名单外的人用过 `/私聊开` 后同样会被回复；两者都不是则不互动 |
-| `interact_reply_require_optin` | `true` | **是否启用「特权名单或已同意」检查**（默认开启）：只有特权名单里的人、或接受过主动消息的人才会被自动评论与回复，两者都不是就跳过；关闭后退回「谁都可以互动」。同时管住好友互动的自动点赞 / 评论 |
 | `interact_reply_cron` | `0,30 12-13,20-23 * * *` | **评论回复的巡检时段与间隔**：默认只在中午 12:00–14:00 与晚上 20:00–24:00 每 30 分钟巡检一轮，实际触发点为 12:00 / 12:30 / 13:00 / 13:30 与 20:00 / 20:30 / 21:00 / 21:30 / 22:00 / 22:30 / 23:00 / 23:30（合计 12 轮/天）；最后一轮 23:30，此后到次日 12:00 之间不巡检，**时段外的评论要等到下一个时段**（例如 23:40 的评论次日 12:00 才处理）。QQ空间没有评论推送通道，评论只能靠定时轮询发现；巡检越频繁越及时，但请求越多越可能触发风控与登录态失效；支持 `HH:MM` 或 5 段 Cron，可自行调整时段与间隔 |
 | `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒（默认最多 2 分钟），避免卡在同一秒；最坏延迟 = 时段内的巡检间隔 + 抖动，跨时段则等到下一个时段 |
 | `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |

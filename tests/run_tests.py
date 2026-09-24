@@ -747,10 +747,12 @@ async def main() -> int:
         str(sorted(raw_config.keys())[:6]),
     )
     check(
-        "配置项能报出所属板块",
+        "配置项能报出所属板块（名单类统一在「名单与权限」）",
         cfg.section_of.get("publish_cron") == "空间说说"
-        and cfg.section_of.get("greet_users") == "私聊问候",
-        str(cfg.section_of.get("publish_cron")),
+        and cfg.section_of.get("greet_users") == "名单与权限"
+        and cfg.section_of.get("admin_uins") == "名单与权限",
+        f"{cfg.section_of.get('publish_cron')}/"
+        f"{cfg.section_of.get('greet_users')}/{cfg.section_of.get('admin_uins')}",
     )
 
     content = ContentGenerator(cfg, AIClient(cfg, FakeContext(onebot)), None)
@@ -3394,10 +3396,11 @@ async def main() -> int:
     }
     titles = [str(meta.get("description")) for meta in visible_sections.values()]
     check(
-        "面板分成 7 个板块且顺序固定",
+        "面板分成 8 个板块且顺序固定（名单与权限排在第二）",
         titles
         == [
             "基础设置",
+            "名单与权限",
             "私聊问候",
             "空间说说",
             "说说互动",
@@ -3432,7 +3435,7 @@ async def main() -> int:
     ]
     check(
         "旧扁平键以隐藏项保留（迁移用，不出现在面板）",
-        len(hidden) == 65 and "_flat_keys_migrated" in hidden,
+        len(hidden) == 66 and "_flat_keys_migrated" in hidden,
         f"隐藏项 {len(hidden)} 个",
     )
 
@@ -3442,10 +3445,10 @@ async def main() -> int:
     legacy_cfg = PluginConfig(legacy_raw, FakeContext(onebot))
     check(
         "旧扁平配置被搬到对应板块",
-        legacy_raw["sec_private"]["greet_users"] == ["10001"]
+        legacy_raw["sec_audience"]["greet_users"] == ["10001"]
         and legacy_raw["sec_post"]["publish_cron"] == "0 6 * * *"
         and legacy_raw["sec_post"]["content_source"] == "llm",
-        str(legacy_raw["sec_private"]),
+        str(legacy_raw["sec_audience"]),
     )
     check(
         "迁移后旧键删除并打上标记",
@@ -3463,6 +3466,60 @@ async def main() -> int:
         "再次启动不会用旧值覆盖面板里改过的新值",
         again.publish_cron == "0 7 * * *",
         str(again.publish_cron),
+    )
+
+    # 2.11.0：名单类配置从各板块搬进「名单与权限」，用户已填的名单不能丢
+    moved_raw = StubAstrBotConfig(
+        {
+            "sec_basic": {"admin_uins": ["10001"], "notify_enabled": True},
+            "sec_private": {
+                "greet_users": ["10002"],
+                "active_msg_require_optin": False,
+                "greet_enabled": True,
+            },
+            "sec_interact": {
+                "interact_uins": ["10003"],
+                "interact_reply_uins": ["10004"],
+                "interact_reply_require_optin": False,
+                "interact_enabled": True,
+            },
+        }
+    )
+    moved_cfg = PluginConfig(moved_raw, FakeContext(onebot))
+    audience = moved_raw.get("sec_audience") or {}
+    check(
+        "名单类配置被搬进「名单与权限」板块（值原样保留）",
+        audience.get("admin_uins") == ["10001"]
+        and audience.get("greet_users") == ["10002"]
+        and audience.get("interact_uins") == ["10003"]
+        and audience.get("interact_reply_uins") == ["10004"]
+        and audience.get("active_msg_require_optin") is False
+        and audience.get("interact_reply_require_optin") is False,
+        str(audience),
+    )
+    check(
+        "旧板块位置不再留着这些键（只保留隐藏副本，不出现在面板）",
+        "greet_users" not in (moved_raw.get("sec_private") or {})
+        and "interact_uins" not in (moved_raw.get("sec_interact") or {})
+        and "admin_uins" not in (moved_raw.get("sec_basic") or {})
+        and moved_raw["_audience_keys_moved"] is True,
+        f"{list((moved_raw.get('sec_private') or {}).keys())[:4]}",
+    )
+    check(
+        "搬移后照常读得到，且所属板块报「名单与权限」",
+        moved_cfg.admin_uins == ["10001"]
+        and moved_cfg.greet_users == ["10002"]
+        and moved_cfg.interact_uins == ["10003"]
+        and moved_cfg.active_msg_require_optin is False
+        and moved_cfg.section_of.get("interact_reply_uins") == "名单与权限",
+        f"{moved_cfg.admin_uins}/{moved_cfg.section_of.get('interact_reply_uins')}",
+    )
+    moved_cfg.set("greet_users", ["10009"])
+    moved_again = PluginConfig(moved_raw, FakeContext(onebot))
+    check(
+        "再次启动不会把隐藏副本的默认值搬回来（不会覆盖改过的名单）",
+        moved_again.greet_users == ["10009"],
+        str(moved_again.greet_users),
     )
 
     # 升级兼容：旧 publish_cron 要继承成 publish_times，发布时间不能被静默改掉
@@ -7036,16 +7093,25 @@ async def main() -> int:
         _schema_reply = _json.loads(
             (REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         )
+        _audience_items = _schema_reply["sec_audience"]["items"]
         _interact_items = _schema_reply["sec_interact"]["items"]
         check(
-            "「特权名单」与检查开关都在说说互动板块，且检查默认开启",
-            "interact_reply_uins" in _interact_items
-            and "interact_reply_require_optin" in _interact_items
-            and _interact_items["interact_reply_uins"]["description"] == "特权名单"
-            and _interact_items["interact_reply_require_optin"]["default"] is True
+            "「特权名单」与检查开关在「名单与权限」板块，且检查默认开启",
+            "interact_reply_uins" in _audience_items
+            and "interact_reply_require_optin" in _audience_items
+            and "特权名单" in str(_audience_items["interact_reply_uins"]["description"])
+            and _audience_items["interact_reply_require_optin"]["default"] is True
             and plugin.cfg.interact_reply_uins == [],
-            f"{_interact_items['interact_reply_uins']['description']}/"
-            f"{_interact_items['interact_reply_require_optin']['default']}",
+            f"{_audience_items['interact_reply_uins']['description']}/"
+            f"{_audience_items['interact_reply_require_optin']['default']}",
+        )
+        check(
+            "旧板块里只留隐藏副本（面板不会重复出现同一项）",
+            bool(_interact_items.get("interact_uins", {}).get("condition"))
+            and bool(_interact_items.get("interact_reply_uins", {}).get("condition"))
+            and not _audience_items["interact_uins"].get("condition")
+            and not _audience_items["interact_reply_uins"].get("condition"),
+            str(list(_audience_items)),
         )
 
         keep_active_optin = plugin.cfg.active_msg_require_optin

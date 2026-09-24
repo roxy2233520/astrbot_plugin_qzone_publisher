@@ -1,15 +1,9 @@
 {
   "sec_basic": {
     "description": "基础设置",
-    "hint": "管理员名单、通知方式与本地记录条数",
+    "hint": "通知方式与本地记录条数；名单类配置统一在「名单与权限」板块",
     "type": "object",
     "items": {
-      "admin_uins": {
-        "description": "管理员 QQ 号（插件内）",
-        "hint": "填了就用这里的 QQ 号作为草稿确认、通知的接收人；留空则用 AstrBot 配置里的 admins_id。注意：指令权限始终由 AstrBot 的 admins_id 决定，插件不会绕过它。可用 /空间管理员 查看或修改",
-        "type": "list",
-        "default": []
-      },
       "notify_enabled": {
         "description": "发布后发送通知",
         "type": "bool",
@@ -42,20 +36,66 @@
           "step": 10
         },
         "default": 200
+      },
+      "admin_uins": {
+        "description": "确认与通知对象（插件管理员）",
+        "hint": "填了就用这里的 QQ 号作为草稿确认、通知的接收人；留空则用 AstrBot 配置里的 admins_id。注意：指令权限始终由 AstrBot 的 admins_id 决定，插件不会绕过它。可用 /空间管理员 查看或修改",
+        "type": "list",
+        "default": [],
+        "condition": {
+          "__legacy_flat_key__": true
+        }
       }
     }
   },
-  "sec_private": {
-    "description": "私聊问候",
-    "hint": "定时给指定用户私聊发早安 / 晚安、传统节日祝福与日常闲聊",
+  "sec_audience": {
+    "description": "名单与权限",
+    "hint": "各功能的名单与同意设置集中在这里：谁会被互动、谁的评论回复不受限制、谁的主动消息需要同意。已同意名单由用户自己在私聊里用 /私聊开 维护，属于运行时数据，可用 /空间状态 查看人数",
     "type": "object",
     "items": {
+      "interact_uins": {
+        "description": "说说互动对象（读说说 / 点赞 / 评论）",
+        "hint": "要读谁的空间就填谁的 QQ 号，例如 [\"123456\", \"654321\"]。留空则巡检不做任何事；只有「特权名单」里的人、或接受过主动消息（用过 /私聊开）的人才会被真正点赞 / 评论",
+        "type": "list",
+        "default": []
+      },
+      "interact_reply_uins": {
+        "description": "评论回复特权名单",
+        "hint": "手动填写 QQ 号，例如 [\"123456\", \"654321\"]。名单内的人无需任何设置即可被自动评论与回复（含他的说说、以及他在自己说说下的评论与子回复）；名单外的人用过 /私聊开 后也会被回复；两者都不是则不互动",
+        "type": "list",
+        "default": []
+      },
+      "interact_reply_require_optin": {
+        "description": "互动需要「特权名单或已同意」",
+        "hint": "默认开启：只有特权名单里的人、或接受过主动消息（用过 /私聊开）的人才会被自动评论与回复，两者都不是就跳过；关闭后退回「谁都可以互动」",
+        "type": "bool",
+        "default": true
+      },
+      "greet_users": {
+        "description": "早安 / 晚安对象（仅同意机制关闭时生效）",
+        "hint": "只在「主动消息需要用户同意」（active_msg_require_optin）关闭时生效；开启时改为发给已在 /私聊开 接受过、且没有单独关掉该项的用户",
+        "type": "list",
+        "default": []
+      },
       "active_msg_require_optin": {
         "description": "主动消息需要用户同意",
         "hint": "开启后，只有用 /私聊开 明确接受过的用户才会收到早安、晚安与节日祝福；未接受的人会被跳过，并在结果里计入「因未接受主动消息跳过」",
         "type": "bool",
         "default": true
       },
+      "admin_uins": {
+        "description": "确认与通知对象（插件管理员）",
+        "hint": "填了就用这里的 QQ 号作为草稿确认、通知的接收人；留空则用 AstrBot 配置里的 admins_id。注意：指令权限始终由 AstrBot 的 admins_id 决定，插件不会绕过它。可用 /空间管理员 查看或修改",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "sec_private": {
+    "description": "私聊问候",
+    "hint": "定时给指定用户私聊发早安 / 晚安、传统节日祝福与日常闲聊（名单在「名单与权限」板块）",
+    "type": "object",
+    "items": {
       "greet_enabled": {
         "description": "启用定时问候",
         "hint": "按下面的时间，给 greet_users 里的每个人私聊发送问候；默认关闭",
@@ -73,12 +113,6 @@
         "hint": "在下面的时间窗口内随机挑一个时刻，给一位已同意的用户发一两句轻松的搭话；每天最多几次由「每天最多主动开口几次」决定；默认关闭",
         "type": "bool",
         "default": false
-      },
-      "greet_users": {
-        "description": "早安 / 晚安对象（仅同意机制关闭时生效）",
-        "hint": "只在「主动消息需要用户同意」（active_msg_require_optin）关闭时生效；开启时改为发给已在 /私聊开 接受过、且没有单独关掉该项的用户",
-        "type": "list",
-        "default": []
       },
       "greet_morning_cron": {
         "description": "早安时间",
@@ -257,6 +291,24 @@
           "step": 5
         },
         "default": 40
+      },
+      "greet_users": {
+        "description": "早安 / 晚安对象（仅同意机制关闭时生效）",
+        "hint": "只在「主动消息需要用户同意」（active_msg_require_optin）关闭时生效；开启时改为发给已在 /私聊开 接受过、且没有单独关掉该项的用户",
+        "type": "list",
+        "default": [],
+        "condition": {
+          "__legacy_flat_key__": true
+        }
+      },
+      "active_msg_require_optin": {
+        "description": "主动消息需要用户同意",
+        "hint": "开启后，只有用 /私聊开 明确接受过的用户才会收到早安、晚安与节日祝福；未接受的人会被跳过，并在结果里计入「因未接受主动消息跳过」",
+        "type": "bool",
+        "default": true,
+        "condition": {
+          "__legacy_flat_key__": true
+        }
       }
     }
   },
@@ -502,7 +554,7 @@
   },
   "sec_interact": {
     "description": "说说互动",
-    "hint": "读好友说说并可选点赞 / 评论；回复自己说说下的评论",
+    "hint": "读好友说说并可选点赞 / 评论；回复自己说说下的评论（名单与权限在「名单与权限」板块）",
     "type": "object",
     "items": {
       "interact_enabled": {
@@ -510,12 +562,6 @@
         "hint": "默认只读：只拉取关注对象的最近说说并记录，不点赞不评论。点赞/评论需另外开启下面两项",
         "type": "bool",
         "default": true
-      },
-      "interact_uins": {
-        "description": "关注的 QQ 号列表",
-        "hint": "要读谁的空间就填谁的 QQ 号，例如 [\"123456\", \"654321\"]。留空则巡检不做任何事",
-        "type": "list",
-        "default": []
       },
       "interact_cron": {
         "description": "读说说的巡检时间",
@@ -577,18 +623,6 @@
         "hint": "自己发的说说下面有人评论时，用 AI 生成一句回复。默认关闭；开启后建议保留「回复也先确认」",
         "type": "bool",
         "default": false
-      },
-      "interact_reply_uins": {
-        "description": "特权名单",
-        "hint": "手动填写 QQ 号，例如 [\"123456\", \"654321\"]。名单内的人无需任何设置即可被自动评论与回复（含他的说说、以及他在自己说说下的评论与子回复）；名单外的人用过 /私聊开 后也会被回复；两者都不是则不互动",
-        "type": "list",
-        "default": []
-      },
-      "interact_reply_require_optin": {
-        "description": "启用「特权名单或已同意」检查",
-        "hint": "默认开启：只有特权名单里的人、或接受过主动消息（用过 /私聊开）的人才会被自动评论与回复，两者都不是就跳过；关闭后退回「谁都可以互动」",
-        "type": "bool",
-        "default": true
       },
       "interact_reply_cron": {
         "description": "评论回复的巡检间隔与时段",
@@ -686,6 +720,33 @@
         "hint": "发给下面的 notify_umo",
         "type": "bool",
         "default": false
+      },
+      "interact_uins": {
+        "description": "说说互动对象（读说说 / 点赞 / 评论）",
+        "hint": "要读谁的空间就填谁的 QQ 号，例如 [\"123456\", \"654321\"]。留空则巡检不做任何事；只有「特权名单」里的人、或接受过主动消息（用过 /私聊开）的人才会被真正点赞 / 评论",
+        "type": "list",
+        "default": [],
+        "condition": {
+          "__legacy_flat_key__": true
+        }
+      },
+      "interact_reply_uins": {
+        "description": "评论回复特权名单",
+        "hint": "手动填写 QQ 号，例如 [\"123456\", \"654321\"]。名单内的人无需任何设置即可被自动评论与回复（含他的说说、以及他在自己说说下的评论与子回复）；名单外的人用过 /私聊开 后也会被回复；两者都不是则不互动",
+        "type": "list",
+        "default": [],
+        "condition": {
+          "__legacy_flat_key__": true
+        }
+      },
+      "interact_reply_require_optin": {
+        "description": "互动需要「特权名单或已同意」",
+        "hint": "默认开启：只有特权名单里的人、或接受过主动消息（用过 /私聊开）的人才会被自动评论与回复，两者都不是就跳过；关闭后退回「谁都可以互动」",
+        "type": "bool",
+        "default": true,
+        "condition": {
+          "__legacy_flat_key__": true
+        }
       }
     }
   },
@@ -1636,6 +1697,14 @@
   },
   "_flat_keys_migrated": {
     "description": "（内部）旧版扁平配置是否已迁移到板块结构",
+    "type": "bool",
+    "default": false,
+    "condition": {
+      "__legacy_flat_key__": true
+    }
+  },
+  "_audience_keys_moved": {
+    "description": "（内部）名单类配置是否已搬进「名单与权限」板块",
     "type": "bool",
     "default": false,
     "condition": {
