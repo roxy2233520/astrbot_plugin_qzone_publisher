@@ -999,6 +999,9 @@ async def main() -> int:
     print("\n[10] 插件指令")
     plugin = QzonePublisherPlugin(FakeContext(onebot), raw_config)
     check("插件构造完成", plugin.cfg is not None and plugin.api is not None)
+    # 面板默认开启「特权名单或已同意」检查；本文件 [41] 之前的用例验证的是
+    # 「未启用该检查」时的既有行为，并集口径本身在 [41] 里单独验证。
+    plugin.cfg.set("interact_reply_require_optin", False)
     # 关键：任何指令调用前先把接口指向本地假服务，避免误触真实 QQ空间
     plugin.api.EMOTION_URL = "http://127.0.0.1:8791/publish"
     plugin.api.UPLOAD_IMAGE_URL = "http://127.0.0.1:8791/upload"
@@ -1303,6 +1306,10 @@ async def main() -> int:
             {"choices": [{"message": {"content": "AI生成的内容"}}]}
         )
 
+    # 是否在「说说列表」里也带出自己的回复：真实场景里列表接口有时还没更新，
+    # 而回查详情能看到，用来验证「回查命中但列表里看不到」的宽松判定。
+    feeds_shows_replies = {"on": True}
+
     async def handle_feeds(request):
         feeds_calls.append(dict(request.query))
         # 列表接口同样会带上评论的子回复（list_3），因此这里也补上自己的回复，
@@ -1310,7 +1317,7 @@ async def main() -> int:
         msglist = []
         for post in feeds_payload:
             row = dict(post)
-            if row.get("commentlist"):
+            if row.get("commentlist") and feeds_shows_replies["on"]:
                 row["commentlist"] = _augment_comments(row["commentlist"])
             msglist.append(row)
         return web.json_response({"code": 0, "msglist": msglist})
@@ -7012,106 +7019,226 @@ async def main() -> int:
             (systems[-1] if systems else "")[-200:],
         )
 
-        # 7) 回复对象名单（最高权限）：只回名单里的人，且这些人无视私聊开关
+        # 7) 并集口径：特权名单 ∪ 已接受主动消息（两者都不是则不互动）
         _schema_reply = _json.loads(
             (REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
         )
         _interact_items = _schema_reply["sec_interact"]["items"]
         check(
-            "回复对象名单与「要求接受过主动消息」都在说说互动板块里",
+            "「特权名单」与检查开关都在说说互动板块，且检查默认开启",
             "interact_reply_uins" in _interact_items
             and "interact_reply_require_optin" in _interact_items
-            and plugin.cfg.interact_reply_uins == []
-            and plugin.cfg.interact_reply_require_optin is False,
-            f"{plugin.cfg.interact_reply_uins}/{plugin.cfg.interact_reply_require_optin}",
-        )
-
-        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
-        plugin.cfg.set("interact_reply_uins", ["999999"])
-        plugin.interact._replied = []
-        replies.clear()
-        posted_replies.clear()
-        feeds_payload[:] = [
-            my_post(
-                "S_V1",
-                1,
-                [
-                    comment_item("C_V1A", "名单里的人", uin=999999, name="小明"),
-                    comment_item("C_V1B", "不在名单里的人", uin=888888, name="小红"),
-                ],
-            )
-        ]
-        v1 = await plugin.interact.run_replies_once()
-        check(
-            "填了回复对象名单后只回复名单里的人",
-            v1.replied == 1
-            and len(replies) == 1
-            and replies[-1]["form"].get("commentUin") == "999999",
-            f"{v1.summary()}/{[(item['form'].get('commentId'), item['form'].get('commentUin')) for item in replies]}",
+            and _interact_items["interact_reply_uins"]["description"] == "特权名单"
+            and _interact_items["interact_reply_require_optin"]["default"] is True
+            and plugin.cfg.interact_reply_uins == [],
+            f"{_interact_items['interact_reply_uins']['description']}/"
+            f"{_interact_items['interact_reply_require_optin']['default']}",
         )
 
         keep_active_optin = plugin.cfg.active_msg_require_optin
-        plugin.cfg.set("interact_reply_uins", [])
-        plugin.cfg.set("interact_reply_require_optin", True)
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
         plugin.cfg.set("active_msg_require_optin", True)
+        plugin.cfg.set("interact_reply_require_optin", True)
         plugin.prefs.set_opted_in("10020", False)
         plugin.prefs.set_opted_in("10021", True)
 
-        plugin.interact._replied = []
-        replies.clear()
-        posted_replies.clear()
-        feeds_payload[:] = [
-            my_post(
-                "S_V2", 1, [comment_item("C_V2", "没接受的人", uin=10020, name="小刚")]
+        union_cases = (
+            ("在特权名单、没同意", 10020, ["10020"], 1),
+            ("不在名单、已同意", 10021, [], 1),
+            ("在名单、也已同意", 10021, ["10021"], 1),
+            ("既不在名单、也没同意", 10022, [], 0),
+        )
+        for index, (label, uin, vip, expect) in enumerate(union_cases, start=1):
+            plugin.cfg.set("interact_reply_uins", vip)
+            plugin.interact._replied = []
+            plugin.interact._attempts = {}
+            replies.clear()
+            posted_replies.clear()
+            feeds_payload[:] = [
+                my_post(
+                    f"S_U{index}",
+                    1,
+                    [comment_item(f"C_U{index}", label, uin=uin, name=f"对象{index}")],
+                )
+            ]
+            got = await plugin.interact.run_replies_once()
+            check(
+                f"并集口径：{label} → {'回复' if expect else '不回复'}",
+                got.replied == expect and len(replies) == expect,
+                f"{got.summary()}/POST {len(replies)} 次",
             )
-        ]
-        v2 = await plugin.interact.run_replies_once()
+
+        plugin.cfg.set("interact_reply_uins", ["10020", "10021"])
+        scope = plugin.interact.reply_scope_text()
         check(
-            "开启「要求接受过主动消息」后，未接受的人不被回复",
-            v2.replied == 0 and not replies,
-            f"{v2.summary()}/{replies}",
+            "状态里体现并集口径（特权名单 N 人 ∪ 已同意 M 人）",
+            "特权名单 2 人" in scope
+            and "∪ 已同意" in scope
+            and "两者都不是则不互动" in scope,
+            scope,
+        )
+        out = await collect(plugin.cmd_reply(FakeEvent(), ""))
+        check(
+            "/空间回复 状态里有「回复对象：特权名单 … ∪ 已同意 …」",
+            any("特权名单" in item and "∪ 已同意" in item for item in out),
+            str([item for item in out if "特权名单" in item])[:200],
         )
 
-        plugin.interact._replied = []
-        replies.clear()
-        posted_replies.clear()
-        feeds_payload[:] = [
-            my_post(
-                "S_V3", 1, [comment_item("C_V3", "已接受的人", uin=10021, name="小美")]
-            )
-        ]
-        v3 = await plugin.interact.run_replies_once()
+        # 8) 好友互动也遵守同一口径：只有特权名单里或已同意的人才会被自动评论
+        keep_comment = plugin.cfg.interact_comment
+        keep_uins = plugin.cfg.interact_uins
+        plugin.cfg.set("interact_comment", True)
+        plugin.cfg.set("interact_like", False)
+        plugin.cfg.set("draft_for_comment", False)
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.prefs.set_opted_in("10031", True)
+        plugin.prefs.set_opted_in("10032", False)
+
+        plugin.cfg.set("interact_uins", ["10031"])
+        plugin.interact._seen = []
+        comments.clear()
+        feeds_payload[:] = [friend_post("T_GATE1", 1, uin=10031, name="已同意")]
+        gate_res = await plugin.interact.run_once()
         check(
-            "已接受主动消息的人照常被回复",
-            v3.replied == 1 and len(replies) == 1,
-            f"{v3.summary()}/{replies}",
+            "好友互动：已同意的人会被自动评论",
+            gate_res.commented == 1 and len(comments) == 1,
+            f"{gate_res.summary()}/POST {len(comments)} 次",
         )
 
-        plugin.cfg.set("interact_reply_uins", ["10020"])
-        plugin.interact._replied = []
-        replies.clear()
-        posted_replies.clear()
-        feeds_payload[:] = [
-            my_post(
-                "S_V4",
-                1,
-                [comment_item("C_V4", "名单内的拒绝者", uin=10020, name="小刚")],
-            )
-        ]
-        v4 = await plugin.interact.run_replies_once()
+        plugin.cfg.set("interact_uins", ["10032"])
+        plugin.interact._seen = []
+        comments.clear()
+        feeds_payload[:] = [friend_post("T_GATE2", 1, uin=10032, name="没同意")]
+        gate_res2 = await plugin.interact.run_once()
         check(
-            "回复对象名单内的人无视私聊开关，直接回复",
-            v4.replied == 1
-            and len(replies) == 1
-            and replies[-1]["form"].get("commentUin") == "10020",
-            f"{v4.summary()}/{replies}",
+            "好友互动：既不在名单也没同意的人不点赞也不评论",
+            gate_res2.commented == 0 and gate_res2.gated == 1 and not comments,
+            f"{gate_res2.summary()}/POST {len(comments)} 次",
+        )
+        check(
+            "好友互动汇总写明被名单/同意挡下的人数",
+            "名单/同意" in gate_res2.summary(),
+            gate_res2.summary(),
         )
 
+        plugin.cfg.set("interact_reply_uins", ["10032"])
+        plugin.interact._seen = []
+        comments.clear()
+        gate_res3 = await plugin.interact.run_once()
+        check(
+            "好友互动：特权名单里的人无需同意也会被评论",
+            gate_res3.commented == 1 and len(comments) == 1,
+            f"{gate_res3.summary()}/POST {len(comments)} 次",
+        )
+        plugin.interact._seen = []
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.cfg.set("interact_comment", keep_comment)
+        plugin.cfg.set("interact_uins", keep_uins)
+
+        # 9) 回查放宽 + 尝试记录：同一候选绝不重复发
         plugin.cfg.set("interact_reply_uins", [])
         plugin.cfg.set("interact_reply_require_optin", False)
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_void"
+        plugin.interact._replied = []
+        plugin.interact._attempts = {}
+        replies.clear()
+        posted_replies.clear()
+        # 列表接口这一轮不带我的回复（真实场景里列表可能还没更新），
+        # 但回查详情能看到一条「我的、正文略有差异的」回复
+        feeds_shows_replies["on"] = False
+        posted_replies.append(
+            {
+                "form": {
+                    "commentId": "C_D1",
+                    "content": "我之前发出的那条、正文略有差异",
+                },
+                "query": {},
+                "headers": {},
+            }
+        )
+        feeds_payload[:] = [
+            my_post("S_D1", 1, [comment_item("C_D1", "需要回复的评论", uin=888888)])
+        ]
+        d1 = await plugin.interact.run_replies_once()
+        check(
+            "回查只命中「自己的回复但正文略有差异」时仍判成功、不重复发",
+            d1.replied == 1
+            and not d1.errors
+            and plugin.interact.replied("S_D1", "C_D1"),
+            f"{d1.summary()}/{d1.errors}",
+        )
+        feeds_shows_replies["on"] = True
+
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_void"
+        plugin.interact._replied = []
+        plugin.interact._attempts = {}
+        replies.clear()
+        reply_calls.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post("S_D2", 1, [comment_item("C_D2", "回查查不到的评论", uin=888888)])
+        ]
+        d2a = await plugin.interact.run_replies_once()
+        check(
+            "回查未确认时记为失败并留下尝试记录",
+            d2a.replied == 0
+            and bool(d2a.errors)
+            and bool(plugin.interact.attempt_of("S_D2", "C_D2"))
+            and reply_calls.get("void") == 1,
+            f"{d2a.summary()}/{plugin.interact.attempt_of('S_D2', 'C_D2')}",
+        )
+        check(
+            "尝试记录落盘到 replied_attempts.json",
+            (plugin.cfg.data_dir / "replied_attempts.json").exists(),
+            str(plugin.cfg.data_dir / "replied_attempts.json"),
+        )
+        d2b = await plugin.interact.run_replies_once()
+        check(
+            "尝试未确认的候选下一轮不再重发（POST 仍只有 1 次）",
+            d2b.replied == 0 and reply_calls.get("void") == 1,
+            f"{d2b.summary()}/POST {reply_calls.get('void')} 次",
+        )
+        check(
+            "状态里提示有未确认的回复",
+            "24 小时内不会重发" in plugin.interact.attempts_text()
+            and plugin.interact.pending_attempts == 1,
+            plugin.interact.attempts_text(),
+        )
+
+        plugin.interact._attempts["S_D2_C_D2"] = {
+            "time": int(time.time()) - 25 * 3600,
+            "reason": "回拨时间用于验证 24 小时重试",
+        }
+        plugin.interact.save_attempts()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        replies.clear()
+        posted_replies.clear()
+        d2c = await plugin.interact.run_replies_once()
+        check(
+            "超过 24 小时后允许重试一次（这次确认成功并清掉尝试记录）",
+            d2c.replied == 1
+            and len(replies) == 1
+            and plugin.interact.replied("S_D2", "C_D2")
+            and not plugin.interact.attempt_pending("S_D2", "C_D2"),
+            f"{d2c.summary()}/POST {len(replies)} 次/{plugin.interact._attempts}",
+        )
+        info_lines.clear()
+        d2d = await plugin.interact.run_replies_once()
+        check(
+            "确认成功后再巡检写明「跳过（已回复）」",
+            d2d.replied == 0 and any("跳过（已回复）" in item for item in info_lines),
+            str(info_lines)[-200:],
+        )
+        check(
+            "本轮日志逐条写清处置结论（已回复 / 失败 / 已尝试未确认）",
+            any("已回复（回查命中）" in item for item in info_lines)
+            or any("跳过（已回复）" in item for item in info_lines),
+            str([item for item in info_lines if "/" in item])[-260:],
+        )
+        plugin.interact._attempts = {}
         plugin.cfg.set("active_msg_require_optin", keep_active_optin)
 
-        # 8) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        # 10) 请求头与 comment() 完全一致（不传 h5 专用请求头）
         plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
         comments.clear()
         replies.clear()

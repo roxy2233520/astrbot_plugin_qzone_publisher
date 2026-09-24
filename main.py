@@ -111,7 +111,8 @@ class QzonePublisherPlugin(Star):
             self.ai,
             self.api,
             self.drafts,
-            reply_optin_checker=self._reply_allowed,
+            reply_optin_checker=self._opted_in_allowed,
+            opted_in_counter=self._opted_in_count,
         )
         self.render = ReceiptRenderer(self.cfg)
         # 最近一次与某个 QQ 的真实私聊会话地址（umo），问候优先用它，避免地址拼错
@@ -637,23 +638,26 @@ class QzonePublisherPlugin(Star):
             return True
         return self.prefs.allowed(qq, feature)
 
-    def _reply_allowed(self, qq: str) -> bool:
-        """判断该 QQ 是否满足「回复评论前要求接受过主动消息」。
+    def _opted_in_allowed(self, qq: str) -> bool:
+        """判断该 QQ 是否「接受过主动消息」（并集口径里的一半）。
 
-        只在「回复对象名单」留空、且开启了 `interact_reply_require_optin` 时才真正检查；
-        名单里的人属于最高权限，一律返回 True（直接回复）。
+        与特权名单取并集的那一半：名单里的人由 ``InteractService.allowed_uin``
+        直接放行，不走这里。全局 ``active_msg_require_optin`` 关闭时，
+        同意机制本身不生效（没人被问过），此时一律允许。
 
         Args:
-            qq: 评论者的 QQ 号。
+            qq: 目标 QQ 号。
 
         Returns:
-            允许回复时返回 True。
+            允许互动时返回 True。
         """
-        if not bool(self.cfg.interact_reply_require_optin):
-            return True
         if not bool(self.cfg.active_msg_require_optin):
             return True
         return self.prefs.allowed(qq, "reply")
+
+    def _opted_in_count(self) -> int:
+        """已接受主动消息的人数（用于状态里的「∪ 已同意 M 人」）。"""
+        return int(self.prefs.stats().get("accepted", 0))
 
     def _feature_targets(self, feature: str) -> list[str]:
         """取某个主动消息功能的收件人（早安 / 晚安 / 节日祝福共用一份口径）。
@@ -1724,6 +1728,9 @@ class QzonePublisherPlugin(Star):
                 f"｜窗口 {self.interact.reply_days} 天",
             )
         )
+        task_lines.append(kv("回复对象", self.interact.reply_scope_text()))
+        if self.interact.pending_attempts:
+            task_lines.append(kv("未确认回复", self.interact.attempts_text()))
 
         # 区块 4：草稿确认
         draft_lines = [
@@ -2145,6 +2152,8 @@ class QzonePublisherPlugin(Star):
                     "；同一条说说每轮最多回 1 条，多余的在下一轮继续",
                 ),
                 kv("今日已回", f"{self.interact.replied_today} 条"),
+                kv("回复对象", self.interact.reply_scope_text()),
+                kv("未确认", self.interact.attempts_text()),
                 kv("下次巡检", self.reply_task.next_run_time),
                 kv(
                     "说明",

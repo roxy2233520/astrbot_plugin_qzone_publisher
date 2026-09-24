@@ -435,11 +435,15 @@ class QzoneAPI(QzoneHttpClient):
     ) -> tuple[bool, str]:
         """回查说说详情，确认自己的回复是否真的出现在该评论下。
 
+        判定放宽到「只要这条评论（或子回复）下有我的回复就算成功」，
+        正文是否完全一致只写进日志：文本可能因清洗、截断或空间侧改写而不同，
+        以此判失败会造成重复回复。
+
         Args:
             own_uin: 自己的 QQ 号。
             tid: 说说 ID。
             comment_tid: 被回复评论的 ID。
-            content: 本次发出的回复正文。
+            content: 本次发出的回复正文（仅用于日志比对）。
 
         Returns:
             二元组 (是否确认成功, 给日志看的一句说明)。
@@ -452,21 +456,12 @@ class QzoneAPI(QzoneHttpClient):
             return False, f"回查失败（{resp.message or resp.code}）"
 
         comments = QzoneParser.parse_comments(resp.data)
-        matched = QzoneParser.find_own_reply(comments, comment_tid, own_uin, content)
-        if matched is not None:
-            return (
-                True,
-                f"在该评论的子回复里找到本次回复（tid={matched.tid or '未知'}）",
-            )
-        target = next(
-            (item for item in comments if str(item.tid) == str(comment_tid)), None
+        matched, note = QzoneParser.find_own_reply(
+            comments, comment_tid, own_uin, content
         )
-        if target is not None:
-            return (
-                False,
-                f"该评论下没有找到本次回复（已取到 {len(target.replies)} 条子回复）",
-            )
-        return False, f"没有找到该评论（本次取到 {len(comments)} 条评论）"
+        if matched is not None:
+            return True, f"回查命中：{note}"
+        return False, f"回查未命中：{note}"
 
     async def get_detail(self, tid: str) -> ApiResponse:
         """取一条说说的详情，用于拿列表接口没带全的评论明细。

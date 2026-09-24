@@ -437,31 +437,59 @@ class QzoneParser:
         comments: list[FeedComment],
         comment_tid: str,
         own_uin: int,
-        content: str,
-    ) -> FeedComment | None:
-        """在评论明细里查找「我自己刚发出的那条回复」。
+        content: str = "",
+    ) -> tuple[FeedComment | None, str]:
+        """在评论明细里查找「我在这条评论（或子回复）下的回复」。
 
-        优先在目标评论的 ``list_3``（子回复）里找；如果评论 id 没能对上
-        （列表接口与详情接口的评论 id 偶尔不同源），再退化为在所有评论的子回复里找。
+        **判定刻意放宽**：只要发现一条来自我的回复就算命中，不再要求正文完全一致。
+        正文可能因为清洗、截断或空间侧改写而与发出时不同，纠结文本会导致
+        「其实已经发出去了」被判成失败，于是下一轮重复回复。正文比对结果
+        只作为附加信息返回给日志。
+
+        查找顺序（逐级退化，前一级命中就返回）：
+
+        1. 归属精确：目标评论存在，且我的回复的 ``parent_tid`` 等于目标 tid；
+        2. 目标评论存在：该评论的 ``list_3`` 里有我的回复；
+        3. 评论 id 没能对上（列表与详情不同源）：整条说说里任何一条我的回复。
 
         Args:
             comments: 回查拿到的评论明细。
-            comment_tid: 被回复评论的 id。
+            comment_tid: 被回复评论（或子回复）的 id。
             own_uin: 自己的 QQ 号。
-            content: 本次发出的回复正文。
+            content: 本次发出的回复正文，仅用于日志比对。
 
         Returns:
-            命中的子回复；没找到时返回 None。
+            二元组 (命中的子回复或 None, 命中方式的说明)。找不到时说明里写未命中原因。
         """
+        if not own_uin:
+            return None, "未提供自己的 QQ 号，无法判断"
         target = next(
             (item for item in comments if str(item.tid) == str(comment_tid)), None
         )
-        scope = [target] if target is not None else comments
-        for comment in scope:
+        candidates: list[tuple[FeedComment, str]] = []
+        if target is not None:
+            for sub in target.replies:
+                if sub.uin != own_uin:
+                    continue
+                if str(sub.parent_tid).strip() == str(comment_tid):
+                    candidates.append((sub, "归属精确"))
+            for sub in target.replies:
+                if sub.uin == own_uin:
+                    candidates.append((sub, "该评论下找到我的回复"))
+        for comment in comments:
             for sub in comment.replies:
-                if sub.uin == own_uin and cls.reply_text_matches(sub.content, content):
-                    return sub
-        return None
+                if sub.uin == own_uin:
+                    candidates.append((sub, "整条说说里找到我的回复"))
+
+        for sub, tier in candidates:
+            same = cls.reply_text_matches(sub.content, content)
+            return (
+                sub,
+                f"{tier}（tid={sub.tid or '未知'}，正文{'一致' if same else '略有差异'}）",
+            )
+        if target is not None:
+            return None, f"该评论下没有我的回复（子回复 {len(target.replies)} 条）"
+        return None, f"没有找到该评论（本次取到 {len(comments)} 条评论）"
 
     @staticmethod
     def parse_upload_result(payload: dict[str, Any]) -> tuple[str, str]:

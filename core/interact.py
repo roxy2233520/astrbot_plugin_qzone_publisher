@@ -41,6 +41,10 @@ from .qzone import FeedComment, FeedPost, QzoneAPI, QzoneParser
 from .ui import kv
 
 _SEEN_LIMIT = 1000
+# 「已尝试未确认」记录的保留条数
+_ATTEMPT_LIMIT = 200
+# 同一候选在回查未确认后，多久才允许再试一次（秒）
+_ATTEMPT_RETRY_SECONDS = 24 * 3600
 # 放进提示词的说说正文截断长度
 _BRIEF_LIMIT = 80
 # 回复提示词的默认任务描述（与面板里的默认值保持一致）
@@ -62,6 +66,7 @@ class InteractResult:
         drafted: 转入草稿箱的条数。
         skipped: 跳过条数（自己发的 / 已处理过）。
         stale: 最近一条超出时间窗口、整体跳过的好友数。
+        gated: 不在特权名单里、也没接受过主动消息，因而跳过互动的人数。
         errors: 出错信息。
     """
 
@@ -71,6 +76,7 @@ class InteractResult:
     drafted: int = 0
     skipped: int = 0
     stale: int = 0
+    gated: int = 0
     errors: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -83,6 +89,10 @@ class InteractResult:
             parts.append(kv("转草稿", f"{self.drafted} 条"))
         if self.stale:
             parts.append(kv("时间窗口", f"{self.stale} 人最近一条超出时间窗口"))
+        if self.gated:
+            parts.append(
+                kv("名单/同意", f"{self.gated} 人不在特权名单里也没接受主动消息")
+            )
         text = "\n".join(parts)
         if self.errors:
             text += "\n" + "\n".join(kv("失败", item) for item in self.errors[:5])
@@ -131,6 +141,7 @@ class InteractService:
         api: QzoneAPI,
         drafts: DraftBox,
         reply_optin_checker: Callable[[str], bool] | None = None,
+        opted_in_counter: Callable[[], int] | None = None,
     ) -> None:
         """初始化服务。
 
@@ -140,14 +151,15 @@ class InteractService:
             api: QQ空间接口。
             drafts: 草稿箱。
             reply_optin_checker: 可选的 ``(qq) -> bool``，判断对方是否接受过主动消息；
-                只在「回复对象名单」留空、且开启了「回复前要求对方接受过主动消息」
-                时才使用；名单里的人不受它约束。
+                与特权名单取并集（``allowed_uin``）。
+            opted_in_counter: 可选的 ``() -> int``，用于在状态里显示已同意人数。
         """
         self.cfg = config
         self.ai = ai
         self.api = api
         self.drafts = drafts
         self._reply_optin = reply_optin_checker
+        self._opted_in_counter = opted_in_counter
         self.file = Path(config.data_dir) / "interacted_tids.json"
         self._seen: list[str] = []
         self.load()
@@ -158,6 +170,10 @@ class InteractService:
         self.reply_count_file = Path(config.data_dir) / "reply_counts.json"
         self._reply_counts: dict[str, int] = {}
         self.load_reply_counts()
+        # 「已尝试但没确认」的回复：同一条候选在 24 小时内不再重发，避免重复回复
+        self.attempt_file = Path(config.data_dir) / "replied_attempts.json"
+        self._attempts: dict[str, dict] = {}
+        self.load_attempts()
         # 回复巡检轮次：仅用于日志，让用户能看出它在跑
         self.reply_round = 0
 
@@ -328,7 +344,7 @@ class InteractService:
         *,
         force: bool,
     ) -> None:
-        """处理单条说说：去重 -> 点赞 -> 评论/转草稿。"""
+        """处理单条说说：去重 -> 名单/同意检查 -> 点赞 -> 评论/转草稿。"""
         result.checked += 1
 
         if bool(self.cfg.interact_skip_self) and self_uin and post.uin == self_uin:
@@ -337,6 +353,17 @@ class InteractService:
 
         if not force and self.seen(post):
             result.skipped += 1
+            return
+
+        # 并集口径同样管住好友互动这条路径：只有特权名单里的人、或接受过主动消息的人，
+        # 才会自动点赞 / 评论他的说说；两者都不是就只读不打扰（不写去重记录，
+        # 等他以后 /私聊开 或进名单后还能补上）。
+        if not self.allowed_uin(post.uin):
+            result.gated += 1
+            logger.info(
+                f"[interact] {post.name or post.uin}（{post.uin}）既不在特权名单里、"
+                "也没接受过主动消息，跳过点赞与评论"
+            )
             return
 
         if bool(self.cfg.interact_like):
@@ -457,54 +484,67 @@ class InteractService:
         return ""
 
     @property
-    def reply_targets(self) -> list[str]:
-        """「回复对象名单」里的 QQ 号（最高权限名单）。
+    def vip_uins(self) -> list[str]:
+        """特权名单（配置项 ``interact_reply_uins``，面板里叫「特权名单」）。
 
-        留空表示回复所有人（默认行为）；填了就只有名单里的人会被回复，
-        并且这些人的评论无视私聊开关，直接回复。
+        名单里的人无需任何同意即可被自动评论 / 回复：既包括他的说说，
+        也包括他在自己说说下的评论与子回复。
         """
         values = self.cfg.interact_reply_uins or []
         return [str(item).strip() for item in values if str(item).strip()]
 
-    def reply_target_allowed(self, uin: int) -> bool:
-        """这个 QQ 是否在可回复范围内。
-
-        Args:
-            uin: 评论者的 QQ 号。
-
-        Returns:
-            名单为空时一律 True；否则只放行名单里的 QQ。
-        """
-        targets = self.reply_targets
-        if not targets:
-            return True
-        return str(uin) in targets
-
     @property
-    def reply_requires_optin(self) -> bool:
-        """是否要求对方接受过主动消息（只在名单留空时生效）。
+    def require_allowed(self) -> bool:
+        """是否启用「必须在特权名单里、或接受过主动消息」这项检查。
 
-        名单里的人属于「最高权限」：不管有没有用过 ``/私聊开`` 都会被回复，
-        因此名单非空时这一项不参与判断。
+        关闭时退回旧行为（谁都可以互动），用于排查或临时放开。
         """
-        if self.reply_targets:
-            return False
         return bool(self.cfg.interact_reply_require_optin)
 
-    def reply_optin_ok(self, uin: int) -> bool:
-        """对方是否满足「回复前要求接受过主动消息」。
+    def is_vip(self, uin: int | str) -> bool:
+        """该 QQ 是否在特权名单里（字符串精确相等）。"""
+        return str(uin).strip() in self.vip_uins
+
+    def allowed_uin(self, uin: int | str) -> bool:
+        """**并集**口径：特权名单 ∪ 已接受主动消息。
+
+        - 在特权名单里：无需任何同意，直接放行；
+        - 不在名单但已接受主动消息（用过 ``/私聊开``）：放行；
+        - 两者都不是：不放行（不评论他的说说，也不回复他的评论）。
 
         Args:
-            uin: 评论者的 QQ 号。
+            uin: 目标 QQ 号。
 
         Returns:
-            不需要检查、或对方接受过时返回 True。
+            允许互动时返回 True。
         """
-        if not self.reply_requires_optin:
+        if not self.require_allowed:
+            return True
+        if self.is_vip(uin):
             return True
         if self._reply_optin is None:
-            return True
+            return False
         return bool(self._reply_optin(str(uin)))
+
+    @property
+    def opted_in_count(self) -> int:
+        """已接受主动消息的人数（用于状态展示）。"""
+        if self._opted_in_counter is None:
+            return 0
+        try:
+            return int(self._opted_in_counter())
+        except Exception as e:  # pragma: no cover - 统计失败不影响主流程
+            logger.debug(f"统计已同意人数失败: {e}")
+            return 0
+
+    def reply_scope_text(self) -> str:
+        """给状态与指令用的「谁能被互动」说明。"""
+        if not self.require_allowed:
+            return "未启用名单检查（所有评论者都可回复）"
+        return (
+            f"特权名单 {len(self.vip_uins)} 人 ∪ 已同意 {self.opted_in_count} 人"
+            "（两者都不是则不互动）"
+        )
 
     @staticmethod
     def reply_candidates(comment: FeedComment) -> list[FeedComment]:
@@ -604,6 +644,95 @@ class InteractService:
     def replied_count(self) -> int:
         """累计已回复的评论条数。"""
         return len(self._replied)
+
+    # ------------------------------------------------------------------
+    # 「已尝试但没确认」的回复（防重复的关键一步）
+    # ------------------------------------------------------------------
+
+    def load_attempts(self) -> None:
+        """加载「已尝试未确认」记录。"""
+        self._attempts = {}
+        if not self.attempt_file.exists():
+            return
+        try:
+            raw = json.loads(self.attempt_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"回复尝试记录读取失败，已忽略: {e}")
+            return
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    self._attempts[str(key)] = value
+
+    def save_attempts(self) -> None:
+        """原子写入「已尝试未确认」记录，只保留最近 200 条。"""
+        try:
+            self.attempt_file.parent.mkdir(parents=True, exist_ok=True)
+            items = sorted(
+                self._attempts.items(),
+                key=lambda pair: int(pair[1].get("time") or 0),
+            )[-_ATTEMPT_LIMIT:]
+            tmp = self.attempt_file.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(dict(items), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self.attempt_file)
+        except Exception as e:
+            logger.error(f"回复尝试记录写入失败: {e}")
+
+    def attempt_of(self, post_tid: str, comment_tid: str) -> dict:
+        """取该候选的「已尝试未确认」记录（没有则返回空字典）。"""
+        value = self._attempts.get(self._reply_key(post_tid, comment_tid))
+        return value if isinstance(value, dict) else {}
+
+    def attempt_pending(self, post_tid: str, comment_tid: str) -> bool:
+        """该候选是否处在「已尝试未确认、24 小时内不再重发」的状态。"""
+        record = self.attempt_of(post_tid, comment_tid)
+        if not record:
+            return False
+        try:
+            when = int(record.get("time") or 0)
+        except (TypeError, ValueError):
+            when = 0
+        return (int(time.time()) - when) < _ATTEMPT_RETRY_SECONDS
+
+    def mark_attempt(self, post_tid: str, comment_tid: str, reason: str) -> None:
+        """记下「发出去但回查没确认」的一次尝试，24 小时内不再重发。"""
+        self._attempts[self._reply_key(post_tid, comment_tid)] = {
+            "time": int(time.time()),
+            "reason": str(reason or "")[:200],
+        }
+        self.save_attempts()
+
+    def clear_attempt(self, post_tid: str, comment_tid: str) -> None:
+        """确认成功后清掉尝试记录（去重记录已经能挡住重复）。"""
+        if self._attempts.pop(self._reply_key(post_tid, comment_tid), None):
+            self.save_attempts()
+
+    @property
+    def pending_attempts(self) -> int:
+        """当前仍在 24 小时观察期内、未确认的回复条数。"""
+        now = int(time.time())
+        count = 0
+        for record in self._attempts.values():
+            try:
+                when = int(record.get("time") or 0)
+            except (TypeError, ValueError):
+                when = 0
+            if (now - when) < _ATTEMPT_RETRY_SECONDS:
+                count += 1
+        return count
+
+    def attempts_text(self) -> str:
+        """给状态与指令用的「未确认回复」说明。"""
+        pending = self.pending_attempts
+        if not pending:
+            return "无未确认的回复"
+        return (
+            f"有 {pending} 条回复发出后没回查确认，24 小时内不会重发，"
+            "可稍后到空间里人工确认"
+        )
 
     # ------------------------------------------------------------------
     # 每日回复条数（今日已回几条）
@@ -783,21 +912,22 @@ class InteractService:
                 result.checked += 1
                 if candidate.uin == self_uin:
                     result.skipped += 1
+                    self._log_verdict(post.tid, candidate.tid, "跳过（自己发的）")
                     continue
-                # 回复对象名单（最高权限）：填了名单就只回这些人，且他们无视私聊开关
-                if not self.reply_target_allowed(candidate.uin):
-                    result.skipped += 1
-                    continue
-                if not self.reply_optin_ok(candidate.uin):
+                # 并集口径：必须在特权名单里，或接受过主动消息，否则不互动
+                if not self.allowed_uin(candidate.uin):
                     result.skipped += 1
                     note = (
-                        f"{candidate.display_name()}（{candidate.uin}）还没接受主动消息，"
-                        "本轮跳过回复（可把 TA 填进「回复对象名单」直接回复）"
+                        f"{candidate.display_name()}（{candidate.uin}）既不在特权名单里、"
+                        "也没接受过主动消息，本轮不回复（可用 /私聊开 或填入特权名单）"
                     )
-                    logger.info(f"[reply] {post.tid} 下的{note}")
+                    self._log_verdict(
+                        post.tid, candidate.tid, "跳过（不在特权名单且未同意）"
+                    )
                     continue
                 if not candidate.content.strip():
                     result.skipped += 1
+                    self._log_verdict(post.tid, candidate.tid, "跳过（评论没有正文）")
                     continue
                 # 评论 id 不可用时先挡下来：拿错 id 去请求只会白打一次请求
                 problem = self.comment_id_problem(post.tid, candidate.tid)
@@ -806,25 +936,47 @@ class InteractService:
                     note = problem
                     logger.warning(f"[reply] {post.tid} 下的{problem}")
                     continue
+                # 三重保险：去重记录 -> 回查里已有的我的回复 -> 已尝试未确认
                 if self.replied(post.tid, candidate.tid):
                     result.skipped += 1
+                    self._log_verdict(post.tid, candidate.tid, "跳过（已回复）")
                     continue
                 # 只判断「这一条」是否已经回过：线程里别处有我的回复不影响它
                 if self.has_own_reply(thread, candidate, self_uin):
                     result.skipped += 1
+                    note = f"{post.tid} 下的评论 {candidate.tid} 已经有我的回复，跳过"
+                    self._log_verdict(post.tid, candidate.tid, "跳过（已有我的回复）")
+                    continue
+                if self.attempt_pending(post.tid, candidate.tid):
+                    result.skipped += 1
                     note = (
-                        f"{post.tid} 下的评论 {candidate.tid} 已经有我的回复，本轮跳过"
+                        f"{post.tid} 下的评论 {candidate.tid} 上一轮发出后没回查确认，"
+                        "24 小时内不再重发"
                     )
-                    logger.info(f"[reply] {note}")
+                    self._log_verdict(
+                        post.tid, candidate.tid, "跳过（已尝试未确认，24 小时内不重发）"
+                    )
                     continue
 
                 try:
                     await self._reply_to_comment(post, thread, candidate, result)
                 except Exception as e:
                     result.errors.append(f"{post.tid}/{candidate.tid}: {e}")
+                    self._log_verdict(post.tid, candidate.tid, "失败（保留尝试记录）")
                 # 同一条说说每轮最多回一条
                 return f"{post.tid} 下已回复一条（同一条说说每轮最多回一条）"
         return note
+
+    @staticmethod
+    def _log_verdict(post_tid: str, comment_tid: str, verdict: str) -> None:
+        """写一行「这条候选本轮怎么处置」，让重复发没发一眼可见。
+
+        Args:
+            post_tid: 说说 tid。
+            comment_tid: 候选（评论或子回复）tid。
+            verdict: 处置结论。
+        """
+        logger.info(f"[reply] {post_tid}/{comment_tid}：{verdict}")
 
     def _log_round(self, result: ReplyResult, *, reason: str = "") -> None:
         """写一行本轮巡检日志（无论有没有新评论都写）。
@@ -883,7 +1035,9 @@ class InteractService:
         """生成一条回复并直接发出。
 
         ``api.reply()`` 成功即代表**已回查确认**自己的回复出现在该评论下，
-        因此只有这时才写去重记录与今日计数。
+        因此只有这时才写去重记录与今日计数；如果发出去但回查没确认，
+        就写一条「已尝试未确认」记录，24 小时内不再对这条候选重发——
+        这是防止「同一条评论被重复回复」的关键一步。
 
         Args:
             post: 评论所在的说说。
@@ -898,14 +1052,17 @@ class InteractService:
             post.uin, post.tid, comment.tid, comment.uin, content
         )
         if not resp.ok:
-            result.errors.append(
-                f"回复评论 {comment.tid} 失败: {resp.message or resp.code}"
-            )
+            reason = str(resp.message or resp.code)
+            self.mark_attempt(post.tid, comment.tid, reason)
+            result.errors.append(f"回复评论 {comment.tid} 失败: {reason}")
+            self._log_verdict(post.tid, comment.tid, "失败（保留尝试记录）")
             return
 
         result.replied += 1
         self.mark_replied(post.tid, comment.tid)
+        self.clear_attempt(post.tid, comment.tid)
         self.count_reply()
+        self._log_verdict(post.tid, comment.tid, "已回复（回查命中）")
         logger.info(
             f"已回复 {comment.display_name()} 在 {post.tid} 下的评论（回查已确认）"
         )
