@@ -1142,8 +1142,20 @@ class InteractService:
         """
         content = await self._generate_reply(post, thread, target.comment)
 
-        # 回复一律直接发出：不生成草稿、也不需要用户确认
-        resp = await self.api.reply(post.uin, post.tid, target.tid, target.uin, content)
+        # 回复一律直接发出：不生成草稿、也不需要用户确认。
+        # 空间没有真正的嵌套回复：回复子回复时 commentId 必须填**线程顶层评论的 tid**，
+        # 新回复会作为同一条父评论下的新子回复落地；填子回复自己的 tid 会被拒
+        # （实测返回一小段页面且线程里没有新回复）。
+        # commentUin 用被回复那一条的作者，这样对方能收到提醒；
+        # 去重仍按候选层级（target.key，例如 P_c1_r2）记录，不受这里影响。
+        resp = await self.api.reply(
+            post.uin,
+            post.tid,
+            target.tid,
+            target.uin,
+            content,
+            root_tid=target.path[0],
+        )
         if not resp.ok:
             reason = str(resp.message or resp.code)
             self.mark_attempt(post.tid, target, reason)

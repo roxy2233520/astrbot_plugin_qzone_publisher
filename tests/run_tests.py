@@ -1357,7 +1357,27 @@ async def main() -> int:
     # 因此回复成功与否只能靠回查详情确认；这里就用这份记录生成回查结果。
     posted_replies: list[dict] = []
 
+    def _top_level_comment_tids() -> set[str]:
+        """当前假数据里所有**顶层评论**的 tid。"""
+        rows = list(detail_comments or [])
+        if not rows:
+            for post in feeds_payload:
+                rows.extend(post.get("commentlist") or [])
+        return {str(item.get("tid") or "") for item in rows if isinstance(item, dict)}
+
     def _remember_reply(form: dict, query: dict, headers: dict) -> None:
+        """记下这次回复——但只在 commentId 是顶层评论 tid 时才算「落到了空间」。
+
+        实测：空间没有真正的嵌套回复，回复子回复时 commentId 必须填线程顶层评论的
+        tid；填子回复自己的 tid 会被拒（返回一小段页面、线程里不会多出回复）。
+        这里按同样的规则模拟，防止旧写法在自测里「看起来也能成功」。
+        """
+        comment_id = str(form.get("commentId") or "")
+        if comment_id not in _top_level_comment_tids():
+            reply_calls["rejected_comment_id"] = (
+                reply_calls.get("rejected_comment_id", 0) + 1
+            )
+            return
         entry = {"form": form, "query": query, "headers": headers}
         replies.append(entry)
         posted_replies.append(entry)
@@ -1371,15 +1391,13 @@ async def main() -> int:
     def _own_replies_for(row_tid: str, subs: list[dict]) -> list[dict]:
         """回查时补在评论下的「我的回复」。
 
-        被回复的对象可能是这条评论本身，也可能是它下面的某条子回复，
-        两种情况都要把「我的回复」挂进这条评论的 ``list_3``。
+        真实结构里，回复子回复的新回复会挂在**顶层评论**的 ``list_3`` 里
+        （子回复之间是平级的），所以这里只按顶层评论 tid 匹配 commentId。
         """
         items = []
         for entry in posted_replies:
             target = str(entry["form"].get("commentId") or "")
-            if target != str(row_tid) and not any(
-                str(sub.get("tid")) == target for sub in subs
-            ):
+            if target != str(row_tid):
                 continue
             items.append(
                 {
@@ -1389,7 +1407,7 @@ async def main() -> int:
                     "content": str(entry["form"].get("content") or ""),
                     # 允许测试指定时间戳（默认「就是现在」），用于验证「只认 POST 之后新增的回复」
                     "createTime": int(entry.get("createTime") or now_ts),
-                    "parent_tid": target,
+                    "parent_tid": str(entry["form"].get("_parent_tid") or target),
                 }
             )
         return items
@@ -6844,8 +6862,8 @@ async def main() -> int:
             f"{r4.summary()}/{replies}",
         )
         check(
-            "回复子回复时 commentId 与 commentUin 用子回复自己的",
-            replies[-1]["form"].get("commentId") == "C_R4_SUB"
+            "回复子回复时 commentId 用线程顶层评论 tid、commentUin 用子回复作者",
+            replies[-1]["form"].get("commentId") == "C_R4"
             and replies[-1]["form"].get("commentUin") == "777777",
             str(replies[-1]["form"])[:200],
         )
@@ -6893,8 +6911,12 @@ async def main() -> int:
             "线程里已有我的回复时，对方新发的子回复仍会被回复",
             t1.replied == 1
             and len(replies) == 1
-            and replies[-1]["form"].get("commentId") == "C_T1_NEW",
-            f"{t1.summary()}/{replies}",
+            and replies[-1]["form"].get("commentId") == "C_T1"
+            and replies[-1]["form"].get("commentUin") == "777777"
+            and plugin.interact.replied(
+                "S_T1", reply_target("S_T1", "C_T1_NEW", path=("C_T1", "C_T1_NEW"))
+            ),
+            f"{t1.summary()}/{plugin.interact._replied}",
         )
 
         # 已经回过的那一条候选（精确到层级路径）不再回复，且不会带出别的请求
@@ -6974,9 +6996,11 @@ async def main() -> int:
         ]
         t3 = await plugin.interact.run_replies_once()
         check(
-            "同一线程多个未回复候选时最新优先",
-            len(replies) == 1 and replies[-1]["form"].get("commentId") == "C_T3_NEW",
-            f"{t3.summary()}/{[item['form'].get('commentId') for item in replies]}",
+            "同一线程多个未回复候选时最新优先（按被回复那一条的作者判断）",
+            len(replies) == 1
+            and replies[-1]["form"].get("commentId") == "C_T3"
+            and replies[-1]["form"].get("commentUin") == "666666",
+            f"{t3.summary()}/{replies[-1]['form'].get('commentUin') if replies else '无'}",
         )
 
         # 6) 生成回复时把整段交流交给 AI（不是只看最后一句）
@@ -7471,15 +7495,122 @@ async def main() -> int:
             str(plugin.interact._replied),
         )
 
-        # 11) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        # 11) 空间没有嵌套回复：回复子回复时 commentId 用线程顶层评论 tid
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.cfg.set("interact_reply_require_optin", False)
+        plugin.interact._replied = []
+        plugin.interact._attempts = {}
+        replies.clear()
+        reply_calls.clear()
+        posted_replies.clear()
+        detail_comments.clear()
+        feeds_shows_replies["on"] = False
+        feeds_payload[:] = [
+            my_post(
+                "P_ROOT",
+                1,
+                [
+                    comment_item(
+                        "7",
+                        "用户的评论",
+                        uin=888888,
+                        name="用户A",
+                        createTime=now_ts - 1200,
+                        list_3=[
+                            comment_item(
+                                "9",
+                                "我的回复",
+                                uin=SELF_UIN,
+                                name="我自己",
+                                parent_tid="7",
+                                createTime=now_ts - 900,
+                            ),
+                            comment_item(
+                                "2",
+                                "他又回了我的回复",
+                                uin=888888,
+                                name="用户A",
+                                parent_tid="9",
+                                createTime=now_ts - 60,
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ]
+        root_res = await plugin.interact.run_replies_once()
+        check(
+            "回复子回复：commentId 用线程顶层评论 tid、commentUin 用子回复作者",
+            root_res.replied == 1
+            and len(replies) == 1
+            and replies[-1]["form"].get("commentId") == "7"
+            and replies[-1]["form"].get("commentUin") == "888888",
+            f"{root_res.summary()}/{replies[-1]['form'] if replies else '无请求'}",
+        )
+        check(
+            "回查按根线程定位（新回复落在根评论 list_3 里）→ 判成功并写候选层级 key",
+            "P_ROOT_c7_r2" in plugin.interact._replied
+            and "P_ROOT_c7" not in plugin.interact._replied,
+            str(plugin.interact._replied),
+        )
+        check(
+            "去重仍按候选层级，不改成按根评论",
+            plugin.interact.replied(
+                "P_ROOT", reply_target("P_ROOT", "2", path=("7", "2"))
+            )
+            and not plugin.interact.replied(
+                "P_ROOT", reply_target("P_ROOT", "7", path=("7",))
+            ),
+            str(plugin.interact._replied),
+        )
+
+        # 旧写法（commentId 用子回复自己的 tid）要被判失败，防止回退
+        detail_comments[:] = [
+            comment_item(
+                "7",
+                "用户的评论",
+                uin=888888,
+                createTime=now_ts - 1200,
+                list_3=[
+                    comment_item(
+                        "2",
+                        "他又回了我的回复",
+                        uin=888888,
+                        parent_tid="9",
+                        createTime=now_ts - 60,
+                    )
+                ],
+            )
+        ]
+        reply_calls.clear()
+        posted_replies.clear()
+        old_way = await plugin.api.reply(
+            SELF_UIN, "P_ROOT", "2", 888888, "旧写法的回复", root_tid="2"
+        )
+        check(
+            "commentId 误用子回复 tid（旧写法）→ 判失败，不误判成功",
+            (not old_way.ok)
+            and reply_calls.get("rejected_comment_id") == 1
+            and old_way.code == _const2.QZONE_CODE_REPLY_UNCONFIRMED,
+            f"{old_way.ok}/{old_way.code}/{reply_calls}",
+        )
+        detail_comments.clear()
+        feeds_shows_replies["on"] = True
+
+        # 12) 请求头与 comment() 完全一致（不传 h5 专用请求头）
         plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
         comments.clear()
         replies.clear()
         posted_replies.clear()
+        detail_comments[:] = [
+            comment_item("CID_HDR", "请求头对比用的评论", uin=10001, name="对比对象")
+        ]
         await plugin.api.comment(SELF_UIN, "S_HDR", "请求头对比用评论")
         await plugin.api.reply(SELF_UIN, "S_HDR", "CID_HDR", 10001, "请求头对比用回复")
         comment_headers = comments[-1]["headers"] if comments else {}
         reply_headers = replies[-1]["headers"] if replies else {}
+        detail_comments.clear()
 
         def _picked_headers(raw: dict) -> dict:
             lowered = {str(key).lower(): str(value) for key, value in raw.items()}

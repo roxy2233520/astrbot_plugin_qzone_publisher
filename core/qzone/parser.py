@@ -435,39 +435,41 @@ class QzoneParser:
     def find_own_reply(
         cls,
         comments: list[FeedComment],
-        comment_tid: str,
+        root_tid: str,
         own_uin: int,
         content: str = "",
         since: int = 0,
+        target_tid: str = "",
     ) -> tuple[FeedComment | None, str]:
-        """回查：在这次 POST 之后，该候选下是否出现了我的回复。
+        """回查：在这次 POST 之后，该线程里是否出现了我的回复。
 
         **以 POST 时刻为锚**：只认 ``create_time >= since`` 的回复
         （``since`` 取发出请求前的时间戳再往前留 120 秒余量），
-        因此放在 ``list_3`` 里的历史回复不会被当成本次成功——这正是此前
-        「回复其实没发出却判成功」的来源。正文是否一致只写进日志。
+        因此早就存在的历史回复不会被当成本次成功。正文是否一致只写进日志。
 
-        查找范围限定在**该候选所在的那条评论线程**（含更深层的子回复），
-        不再退化成「整条说说里任何一条我的回复」。空间给父评论与子回复各自
-        独立编号，所以定位线程时要按 tid 在整棵树里找，而不是只比顶层评论。
+        定位方式与空间的真实结构一致：空间**没有真正的嵌套回复**，回复子回复时
+        新回复会落在**顶层评论**的 ``list_3`` 里，所以这里按 ``root_tid``
+        （线程的顶层评论 tid）定位线程，再在线程的整棵子树里找我的回复。
+        ``target_tid`` 只用来优先挑选「明确指向被回复那一条」的回复。
 
         Args:
             comments: 回查拿到的评论明细。
-            comment_tid: 被回复评论（或子回复）的 id。
+            root_tid: 线程的顶层评论 tid（发出去时作为 commentId 的那个值）。
             own_uin: 自己的 QQ 号。
             content: 本次发出的回复正文，仅用于日志比对。
             since: 认为「新」的最早时间戳；0 表示不作时间限制（仅用于兼容调用）。
+            target_tid: 被回复的候选 tid，用于优先匹配归属。
 
         Returns:
             二元组 (命中的子回复或 None, 命中方式的说明)。找不到时说明里写未命中原因。
         """
         if not own_uin:
             return None, "未提供自己的 QQ 号，无法判断"
-        target = str(comment_tid or "").strip()
-        thread = next(
-            (item for item in comments if item.contains_tid(target)),
-            None,
-        )
+        root = str(root_tid or "").strip()
+        thread = next((item for item in comments if item.tid == root), None)
+        if thread is None:
+            # 顶层评论 id 没直接对上时，退一步按「这棵树里出现过这个 id」来找
+            thread = next((item for item in comments if item.contains_tid(root)), None)
         if thread is None:
             return (
                 None,
@@ -486,7 +488,8 @@ class QzoneParser:
                 f"（子回复 {len(thread.all_replies())} 条）",
             )
 
-        exact = [item for item in replies if str(item.parent_tid).strip() == target]
+        wanted = str(target_tid or "").strip()
+        exact = [item for item in replies if str(item.parent_tid).strip() == wanted]
         hit = exact[0] if exact else replies[0]
         tier = "归属精确" if exact else "同线程内新增"
         same = cls.reply_text_matches(hit.content, content)

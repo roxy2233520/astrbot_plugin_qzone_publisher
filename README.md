@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-775%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-779%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -491,15 +491,19 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
   并单独列一段「我之前已经说过的话」），最后明确指出本次要回复的是哪一条。
   提示词里要求接着往下说：不要只针对最后一句孤立作答，也不要重复自己说过的意思。
 - 只回复文字评论：纯图片、纯表情（剥离表情标记后为空）以及自己发的评论都会被跳过。
-- **评论下的子回复同样是待回复对象**：别人在这条评论下追加的回复会单独处理，
-  回复它时 `commentId` 用那条子回复自己的 id；自己写的子回复不会回复。
+- **评论下的子回复同样是待回复对象**：别人在这条评论下追加的回复会单独处理；
+  自己写的子回复不会回复。**空间不存在真正的嵌套回复**（子回复之间是平级的），
+  所以回复子回复时插件会把回复**发到该线程的顶层评论下**——即 `commentId` 用
+  线程顶层评论的 tid、`commentUin` 用被回复那一条的作者（这样对方能收到提醒），
+  并按**子回复层级**去重。实测填子回复自己的 tid 会被空间拒绝（线程里不会多出回复）。
 - **一律直接回复**：巡检到新评论就直接发出，不产生草稿、也不需要确认（旧版本「回复先走草稿」的选项已移除）。
 - 同一条评论（或同一层级的同一条子回复）只回复一次，记录在
   `<数据目录>/replied_comments.json`（键带层级，见上）；每日回复条数记在
   `<数据目录>/reply_counts.json`（`/空间回复` 里的「今日已回」）。
-- **未确认的回复不会重复发**：回复请求发出后**回查确认**——只认「该候选所在线程里、
+- **未确认的回复不会重复发**：回复请求发出后**回查确认**——按**线程顶层评论**
+  定位（回复子回复时新回复也落在根评论的 `list_3` 里），只认「线程里
   **本次新增**（时间不早于发出请求前 120 秒）的、来自我的回复」，
-  放在 `list_3` 里的历史回复不会被当成本次成功（正文一致与否只写进日志）；
+  早就存在的历史回复不会被当成本次成功（正文一致与否只写进日志）；
   如果回查没确认（例如接口真的没发出、或详情还没刷新），会写一条
   `<数据目录>/replied_attempts.json` 尝试记录（同样带层级），
   **24 小时内不再对这条候选发起回复**（超过 24 小时才允许再试一次），

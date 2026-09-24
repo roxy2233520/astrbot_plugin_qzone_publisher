@@ -322,32 +322,38 @@ class QzoneAPI(QzoneHttpClient):
         comment_tid: str,
         comment_uin: int | str,
         content: str,
+        root_tid: str = "",
     ) -> ApiResponse:
-        """回复自己说说下的一条评论，并以回查评论详情确认是否真的发出去了。
+        """回复自己说说下的一条评论（或子回复），并以回查评论详情确认是否真发出去了。
 
-        实测结论：这个接口**成功时也不返回 JSON，而是一段 HTML 框架页**
-        （``document.domain="…"; cb=frameElement.callback;``），因此响应体既不能
-        用来判定成功，也不能用来判定登录失效。这里改为「发出请求 + 回查确认」：
+        实测结论：
 
-        1. POST 回复接口（请求头与 ``comment()`` 完全一致，不传 h5 专用头）；
-        2. 回查 ``emotion_cgi_msgdetail_v6``（``need_comment=1``、
-           ``need_private_comment=1``），在该候选所在的评论线程里查找
-           **本次新增**（``create_time`` 不早于发出请求前 120 秒）的、来自我的回复；
-        3. 找到即判定成功，调用方据此写去重记录；找不到即判定失败，
-           但**不会**因为「响应是 HTML」就判定为登录失效，也不会重取登录态。
+        - 这个接口**成功时也不返回 JSON，而是一段 HTML 框架页**
+          （``document.domain="…"; cb=frameElement.callback;``），因此响应体既不能
+          用来判定成功，也不能用来判定登录失效；这里改为「发出请求 + 回查确认」；
+        - 空间**没有真正的嵌套回复**：回复一条子回复时，``commentId`` 必须填
+          **该线程的顶层评论 tid**，新回复会作为同一条父评论下的新子回复落地；
+          填子回复自己的 tid 会被拒（返回一小段页面、线程里没有新回复）。
+
+        因此参数构造规则是：``commentId`` = 线程根（顶层评论）tid，
+        ``commentUin`` = 被回复那一条的作者 uin（这样对方能收到提醒）；
+        去重仍由调用方按「候选层级」记录（``P_c1_r2``），不受这里影响。
 
         Args:
             uin: 说说作者（自己）的 QQ 号。
             tid: 说说 ID。
-            comment_tid: 被回复评论（或子回复）的 ID。
-            comment_uin: 被回复评论的作者 QQ 号。
+            comment_tid: 被回复的候选（评论或子回复）的 ID，仅用于日志与回查偏好。
+            comment_uin: 被回复那一条的作者 QQ 号。
             content: 回复正文。
+            root_tid: 该线程的顶层评论 tid（实际作为 ``commentId`` 发送）；
+                留空时退化为 ``comment_tid``（顶层评论候选本来就是这样）。
 
         Returns:
             统一响应对象；成功表示「已回查确认自己的回复确实在评论下」。
         """
         ctx = await self.session.get_ctx()
         topic_id = f"{uin}_{tid}__1"
+        root = str(root_tid or comment_tid or "").strip()
         started = int(time.time())
         raw = await self.request(
             "POST",
@@ -366,7 +372,7 @@ class QzoneAPI(QzoneHttpClient):
                 "format": "fs",
                 "ref": "feeds",
                 "content": content,
-                "commentId": comment_tid,
+                "commentId": root,
                 "commentUin": comment_uin,
                 "richval": "",
                 "richtype": "",
@@ -381,15 +387,24 @@ class QzoneAPI(QzoneHttpClient):
         meta = raw.get(QZONE_INTERNAL_META_KEY)
         snippet = str(meta.get("snippet") or "") if isinstance(meta, dict) else ""
         post_note = self._reply_post_note(resp)
+        where = (
+            f"｜commentId={root}｜commentUin={comment_uin}"
+            f"｜被回复={comment_tid}"
+            + ("" if root == str(comment_tid).strip() else "（子回复，落到顶层评论下）")
+        )
 
         found, confirm_note = await self._confirm_reply(
-            ctx.uin, tid, comment_tid, content, since=started - _CONFIRM_SLACK
+            ctx.uin,
+            tid,
+            root,
+            content,
+            since=started - _CONFIRM_SLACK,
+            target_tid=comment_tid,
         )
         if found:
             logger.info(
                 f"回复评论已确认: url={self.REPLY_URL}｜topicId={topic_id}"
-                f"｜commentId={comment_tid}｜commentUin={comment_uin}"
-                f"｜接口={post_note}｜回查结果={confirm_note}"
+                f"{where}｜接口={post_note}｜回查结果={confirm_note}"
             )
             return ApiResponse(
                 ok=True,
@@ -403,8 +418,7 @@ class QzoneAPI(QzoneHttpClient):
         denied = resp.code == QZONE_CODE_FORBIDDEN
         logger.error(
             f"回复评论失败: url={self.REPLY_URL}｜topicId={topic_id}"
-            f"｜commentId={comment_tid}｜commentUin={comment_uin}"
-            f"｜原因={post_note}｜回查结果={confirm_note}｜响应片段: {snippet}"
+            f"{where}｜原因={post_note}｜回查结果={confirm_note}｜响应片段: {snippet}"
         )
         return ApiResponse(
             ok=False,
@@ -438,24 +452,26 @@ class QzoneAPI(QzoneHttpClient):
         self,
         own_uin: int,
         tid: str,
-        comment_tid: str,
+        root_tid: str,
         content: str,
         *,
         since: int = 0,
+        target_tid: str = "",
     ) -> tuple[bool, str]:
-        """回查说说详情，确认自己的回复是否真的出现在该候选下。
+        """回查说说详情，确认自己的回复是否真的出现在该线程里。
 
-        判定放宽到「只要这条候选所在的线程里、**本次新增**了我的回复就算成功」，
-        正文是否完全一致只写进日志：文本可能因清洗、截断或空间侧改写而不同，
-        以此判失败会造成重复回复。``since`` 是发出请求前的时间戳（再留一点余量），
-        用来把「本次新增」和「早就存在的历史回复」区分开——历史回复不能算成功。
+        空间没有真正的嵌套回复：回复子回复时新回复会落在**顶层评论**的
+        ``list_3`` 里，所以这里按**根评论 tid** 定位线程，再在线程内按
+        ``create_time >= since`` 找本次新增的我的回复（``target_tid`` 只用于
+        优先匹配「明确指向被回复那一条」的回复，正文一致与否只写进日志）。
 
         Args:
             own_uin: 自己的 QQ 号。
             tid: 说说 ID。
-            comment_tid: 被回复评论（或子回复）的 ID。
+            root_tid: 线程的顶层评论 tid（作为 commentId 发出去的那个值）。
             content: 本次发出的回复正文（仅用于日志比对）。
             since: 认为「新」的最早时间戳。
+            target_tid: 被回复的候选 tid，用于在回查结果里优先挑出指向它的回复。
 
         Returns:
             二元组 (是否确认成功, 给日志看的一句说明)。
@@ -469,7 +485,12 @@ class QzoneAPI(QzoneHttpClient):
 
         comments = QzoneParser.parse_comments(resp.data)
         matched, note = QzoneParser.find_own_reply(
-            comments, comment_tid, own_uin, content, since=since
+            comments,
+            root_tid,
+            own_uin,
+            content,
+            since=since,
+            target_tid=target_tid,
         )
         if matched is not None:
             return True, f"回查命中：{note}"
