@@ -438,58 +438,84 @@ class QzoneParser:
         comment_tid: str,
         own_uin: int,
         content: str = "",
+        since: int = 0,
     ) -> tuple[FeedComment | None, str]:
-        """在评论明细里查找「我在这条评论（或子回复）下的回复」。
+        """回查：在这次 POST 之后，该候选下是否出现了我的回复。
 
-        **判定刻意放宽**：只要发现一条来自我的回复就算命中，不再要求正文完全一致。
-        正文可能因为清洗、截断或空间侧改写而与发出时不同，纠结文本会导致
-        「其实已经发出去了」被判成失败，于是下一轮重复回复。正文比对结果
-        只作为附加信息返回给日志。
+        **以 POST 时刻为锚**：只认 ``create_time >= since`` 的回复
+        （``since`` 取发出请求前的时间戳再往前留 120 秒余量），
+        因此放在 ``list_3`` 里的历史回复不会被当成本次成功——这正是此前
+        「回复其实没发出却判成功」的来源。正文是否一致只写进日志。
 
-        查找顺序（逐级退化，前一级命中就返回）：
-
-        1. 归属精确：目标评论存在，且我的回复的 ``parent_tid`` 等于目标 tid；
-        2. 目标评论存在：该评论的 ``list_3`` 里有我的回复；
-        3. 评论 id 没能对上（列表与详情不同源）：整条说说里任何一条我的回复。
+        查找范围限定在**该候选所在的那条评论线程**（含更深层的子回复），
+        不再退化成「整条说说里任何一条我的回复」。空间给父评论与子回复各自
+        独立编号，所以定位线程时要按 tid 在整棵树里找，而不是只比顶层评论。
 
         Args:
             comments: 回查拿到的评论明细。
             comment_tid: 被回复评论（或子回复）的 id。
             own_uin: 自己的 QQ 号。
             content: 本次发出的回复正文，仅用于日志比对。
+            since: 认为「新」的最早时间戳；0 表示不作时间限制（仅用于兼容调用）。
 
         Returns:
             二元组 (命中的子回复或 None, 命中方式的说明)。找不到时说明里写未命中原因。
         """
         if not own_uin:
             return None, "未提供自己的 QQ 号，无法判断"
-        target = next(
-            (item for item in comments if str(item.tid) == str(comment_tid)), None
+        target = str(comment_tid or "").strip()
+        thread = next(
+            (item for item in comments if item.contains_tid(target)),
+            None,
         )
-        candidates: list[tuple[FeedComment, str]] = []
-        if target is not None:
-            for sub in target.replies:
-                if sub.uin != own_uin:
-                    continue
-                if str(sub.parent_tid).strip() == str(comment_tid):
-                    candidates.append((sub, "归属精确"))
-            for sub in target.replies:
-                if sub.uin == own_uin:
-                    candidates.append((sub, "该评论下找到我的回复"))
-        for comment in comments:
-            for sub in comment.replies:
-                if sub.uin == own_uin:
-                    candidates.append((sub, "整条说说里找到我的回复"))
-
-        for sub, tier in candidates:
-            same = cls.reply_text_matches(sub.content, content)
+        if thread is None:
             return (
-                sub,
-                f"{tier}（tid={sub.tid or '未知'}，正文{'一致' if same else '略有差异'}）",
+                None,
+                f"回查里没有这条评论所在的线程（本次取到 {len(comments)} 条评论）",
             )
-        if target is not None:
-            return None, f"该评论下没有我的回复（子回复 {len(target.replies)} 条）"
-        return None, f"没有找到该评论（本次取到 {len(comments)} 条评论）"
+
+        replies = [
+            reply
+            for reply in thread.all_replies()
+            if reply.uin == own_uin and cls._is_fresh(reply, since)
+        ]
+        if not replies:
+            return (
+                None,
+                f"线程 {thread.tid} 下没有本次新增的我的回复"
+                f"（子回复 {len(thread.all_replies())} 条）",
+            )
+
+        exact = [item for item in replies if str(item.parent_tid).strip() == target]
+        hit = exact[0] if exact else replies[0]
+        tier = "归属精确" if exact else "同线程内新增"
+        same = cls.reply_text_matches(hit.content, content)
+        return (
+            hit,
+            f"{tier}（tid={hit.tid or '未知'}，"
+            f"正文{'一致' if same else '略有差异'}，"
+            f"时间戳 {hit.create_time or '未知'}）",
+        )
+
+    @staticmethod
+    def _is_fresh(reply: FeedComment, since: int) -> bool:
+        """这条回复是不是「本次新出现的」。
+
+        有创建时间时按 ``since`` 卡；接口没给时间（0）时视为新——
+        宁可认为发出去了，也不要因为判失败而在下一轮重复回复。
+
+        Args:
+            reply: 待判断的回复。
+            since: 最早可接受的时间戳。
+
+        Returns:
+            认为属于本次新增时返回 True。
+        """
+        if not since:
+            return True
+        if reply.create_time <= 0:
+            return True
+        return reply.create_time >= since
 
     @staticmethod
     def parse_upload_result(payload: dict[str, Any]) -> tuple[str, str]:

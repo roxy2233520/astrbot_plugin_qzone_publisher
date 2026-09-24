@@ -100,6 +100,60 @@ class InteractResult:
 
 
 @dataclass(slots=True)
+class ReplyTarget:
+    """一条待回复的候选（评论或子回复），身份带层级。
+
+    空间给父评论与子回复**各自独立编号**（都从 1 开始），所以只用 tid 数字做身份
+    会互相冲突（父评论 tid=1 与子回复 tid=1）。这里用「说说 tid + 层级路径」表示：
+
+    Attributes:
+        comment: 对应的评论对象。
+        path: 从顶层评论到自己的 tid 路径，例如 ``("1",)`` 或 ``("1", "2")``。
+        post_tid: 所属说说的 tid。
+        parent_comment: 上一层节点；顶层评论时为 None。
+    """
+
+    comment: FeedComment
+    path: tuple[str, ...]
+    post_tid: str
+    parent_comment: FeedComment | None = None
+
+    @property
+    def level(self) -> int:
+        """层级：0 为顶层评论，1 为一级子回复，依此类推。"""
+        return max(len(self.path) - 1, 0)
+
+    @property
+    def key(self) -> str:
+        """去重 / 尝试记录用的 key，形如 ``P_c1``、``P_c1_r2``、``P_c1_r2_r3``。"""
+        parts = [f"{self.post_tid}_c{self.path[0]}"]
+        parts.extend(f"_r{tid}" for tid in self.path[1:])
+        return "".join(parts)
+
+    @property
+    def label(self) -> str:
+        """日志里的短标识，形如 ``c1`` 或 ``c1/r2``。"""
+        head = f"c{self.path[0]}"
+        if self.level == 0:
+            return head
+        return head + "".join(f"/r{tid}" for tid in self.path[1:])
+
+    @property
+    def tid(self) -> str:
+        """被回复对象的 tid（发送时作为 commentId）。"""
+        return self.comment.tid
+
+    @property
+    def uin(self) -> int:
+        """被回复对象的作者 QQ 号。"""
+        return self.comment.uin
+
+    def display_name(self) -> str:
+        """展示用名称。"""
+        return self.comment.display_name()
+
+
+@dataclass(slots=True)
 class ReplyResult:
     """一次「回复自己说说下评论」巡检的汇总。
 
@@ -547,40 +601,61 @@ class InteractService:
         )
 
     @staticmethod
-    def reply_candidates(comment: FeedComment) -> list[FeedComment]:
-        """一条评论下所有可回复的对象，**最新优先**。
+    def reply_candidates(thread: FeedComment, post_tid: str) -> list[ReplyTarget]:
+        """一条评论下所有可回复的对象（**带层级**），最新的在前。
 
-        候选 = 父评论 + 它下面的每个子回复（接口的 ``list_3``）。按 ``create_time``
-        倒序排列，保证「对方刚回的那条」优先被处理；没有时间（0）的排在最后
-        （``sorted`` 是稳定排序，时间相同的仍保持接口顺序）。
+        空间给父评论与子回复**各自独立编号**（都从 1 开始），所以候选身份不能只看
+        tid 数字，必须带上层级路径：
+
+        - 顶层评论：``{说说tid}_c{评论tid}``，日志标识 ``c1``；
+        - 一级子回复：``{说说tid}_c{父评论tid}_r{子回复tid}``，日志标识 ``c1/r2``；
+        - 更深一层（回复的回复）：继续拼 ``_r{tid}``。
+
+        按 ``create_time`` 倒序排列，保证「对方刚回的那条」优先被处理；
+        没有时间（0）的排在最后（``sorted`` 是稳定排序，时间相同的保持原顺序）。
 
         Args:
-            comment: 顶层评论。
+            thread: 顶层评论（含各层子回复）。
+            post_tid: 说说 tid，拼进 key 与标识。
 
         Returns:
-            候选列表，最新的在前。
+            ReplyTarget 列表，最新的在前。
         """
+        targets = [ReplyTarget(comment=thread, path=(thread.tid,), post_tid=post_tid)]
+        for reply in thread.replies:
+            targets.extend(InteractService._targets_of(reply, (thread.tid,), post_tid))
         return sorted(
-            [comment, *comment.replies],
-            key=lambda item: item.create_time,
+            targets,
+            key=lambda item: item.comment.create_time,
             reverse=True,
         )
 
     @staticmethod
-    def has_own_reply(
-        thread: FeedComment, candidate: FeedComment, self_uin: int
-    ) -> bool:
+    def _targets_of(
+        node: FeedComment, ancestors: tuple[str, ...], post_tid: str
+    ) -> list[ReplyTarget]:
+        """递归展开一个节点及其更深层的子回复。"""
+        path = (*ancestors, node.tid)
+        targets = [ReplyTarget(comment=node, path=path, post_tid=post_tid)]
+        for child in node.replies:
+            targets.extend(InteractService._targets_of(child, path, post_tid))
+        return targets
+
+    @staticmethod
+    def has_own_reply(thread: FeedComment, target: ReplyTarget, self_uin: int) -> bool:
         """**这条候选**下面是否已经有一条我发出的、针对它的回复。
 
-        精确到「具体哪一条」，不整条线程一起跳过：只有在我的回复明确指向这条候选
-        （``parent_tid`` 等于候选 tid）时才算已回复。子回复没带 ``parent_tid`` 时，
-        解析层会把它填成父评论的 tid——那正好表示「我回的是父评论」，
-        因此对父评论候选成立，对子回复候选不成立（这时只靠去重记录判断，
-        不会扩大到整条线程）。
+        规则刻意收紧，禁止跨层级比较（父评论 tid 与子回复 tid 可能同为 ``1``）：
+
+        - 只认「我的回复的 ``parent_tid`` 等于该候选的 tid」这一条结构化证据；
+        - 该回复还必须出现在**时间上不早于候选本身**（不可能回复一条还没出现的评论），
+          否则同一 tid 的父评论旧回复会把新子回复误杀；
+        - 不再使用「这条评论的 ``list_3`` 里有我的回复」这种宽松依据，
+          归属判定不了时只靠精确 key（``replied_comments.json``）。
 
         Args:
-            thread: 顶层评论。
-            candidate: 本次准备回复的对象。
+            thread: 顶层评论（含各层子回复）。
+            target: 本次准备回复的候选。
             self_uin: 自己的 QQ 号。
 
         Returns:
@@ -588,20 +663,37 @@ class InteractService:
         """
         if not self_uin:
             return False
-        candidate_tid = str(candidate.tid or "").strip()
+        candidate_tid = str(target.comment.tid or "").strip()
         if not candidate_tid:
             return False
-        for sub in thread.replies:
-            if sub.uin != self_uin:
+        for reply in thread.all_replies():
+            if reply.uin != self_uin:
                 continue
-            if str(sub.parent_tid).strip() == candidate_tid:
-                return True
+            if str(reply.parent_tid).strip() != candidate_tid:
+                continue
+            created = target.comment.create_time
+            if created > 0 and reply.create_time > 0 and reply.create_time < created:
+                # 我的回复比这条候选还早：它回的是同名 tid 的另一个层级
+                continue
+            return True
         return False
 
     @staticmethod
-    def _reply_key(post_tid: str, comment_tid: str) -> str:
-        """回复去重键：说说 tid + 评论 tid。"""
-        return f"{post_tid}_{comment_tid}"
+    def reply_key(post_tid: str, target: ReplyTarget) -> str:
+        """回复去重键：说说 tid + 层级路径（``P_c1`` / ``P_c1_r2`` / ``P_c1_r2_r3``）。"""
+        return target.key
+
+    @staticmethod
+    def _legacy_keys(post_tid: str, target: ReplyTarget) -> list[str]:
+        """老版本写下的去重键（没有层级信息），只用于兼容读取。
+
+        老键形如 ``{说说tid}_{tid}``，无法区分层级。为避免「父评论与子回复同号」
+        这种正是本次要修的问题，**只在顶层评论候选上认同老键**；
+        子回复候选一律以新键为准。
+        """
+        if target.level != 0:
+            return []
+        return [f"{post_tid}_{target.comment.tid}"]
 
     def load_replied(self) -> None:
         """加载已回复评论记录。"""
@@ -629,15 +721,16 @@ class InteractService:
         except Exception as e:
             logger.error(f"回复去重记录写入失败: {e}")
 
-    def replied(self, post_tid: str, comment_tid: str) -> bool:
-        """该条评论是否已经回复过。"""
-        return self._reply_key(post_tid, comment_tid) in self._replied
+    def replied(self, post_tid: str, target: ReplyTarget) -> bool:
+        """该候选是否已经回复过（新键 + 老键兼容，见 ``_legacy_keys``）。"""
+        if target.key in self._replied:
+            return True
+        return any(key in self._replied for key in self._legacy_keys(post_tid, target))
 
-    def mark_replied(self, post_tid: str, comment_tid: str) -> None:
-        """把评论标记为已回复并落盘（回复真正发出后调用）。"""
-        key = self._reply_key(post_tid, comment_tid)
-        if key not in self._replied:
-            self._replied.append(key)
+    def mark_replied(self, post_tid: str, target: ReplyTarget) -> None:
+        """把该候选标记为已回复并落盘（回查确认后调用，写入的是带层级的新键）。"""
+        if target.key not in self._replied:
+            self._replied.append(target.key)
         self.save_replied()
 
     @property
@@ -681,14 +774,14 @@ class InteractService:
         except Exception as e:
             logger.error(f"回复尝试记录写入失败: {e}")
 
-    def attempt_of(self, post_tid: str, comment_tid: str) -> dict:
+    def attempt_of(self, post_tid: str, target: ReplyTarget) -> dict:
         """取该候选的「已尝试未确认」记录（没有则返回空字典）。"""
-        value = self._attempts.get(self._reply_key(post_tid, comment_tid))
+        value = self._attempts.get(target.key)
         return value if isinstance(value, dict) else {}
 
-    def attempt_pending(self, post_tid: str, comment_tid: str) -> bool:
+    def attempt_pending(self, post_tid: str, target: ReplyTarget) -> bool:
         """该候选是否处在「已尝试未确认、24 小时内不再重发」的状态。"""
-        record = self.attempt_of(post_tid, comment_tid)
+        record = self.attempt_of(post_tid, target)
         if not record:
             return False
         try:
@@ -697,17 +790,18 @@ class InteractService:
             when = 0
         return (int(time.time()) - when) < _ATTEMPT_RETRY_SECONDS
 
-    def mark_attempt(self, post_tid: str, comment_tid: str, reason: str) -> None:
+    def mark_attempt(self, post_tid: str, target: ReplyTarget, reason: str) -> None:
         """记下「发出去但回查没确认」的一次尝试，24 小时内不再重发。"""
-        self._attempts[self._reply_key(post_tid, comment_tid)] = {
+        self._attempts[target.key] = {
             "time": int(time.time()),
             "reason": str(reason or "")[:200],
+            "label": target.label,
         }
         self.save_attempts()
 
-    def clear_attempt(self, post_tid: str, comment_tid: str) -> None:
+    def clear_attempt(self, post_tid: str, target: ReplyTarget) -> None:
         """确认成功后清掉尝试记录（去重记录已经能挡住重复）。"""
-        if self._attempts.pop(self._reply_key(post_tid, comment_tid), None):
+        if self._attempts.pop(target.key, None):
             self.save_attempts()
 
     @property
@@ -905,78 +999,79 @@ class InteractService:
         """
         note = ""
         for thread in comments:
-            for candidate in self.reply_candidates(thread):
+            for target in self.reply_candidates(thread, post.tid):
                 if result.replied >= limit:
                     return note
 
                 result.checked += 1
-                if candidate.uin == self_uin:
+                if target.uin == self_uin:
                     result.skipped += 1
-                    self._log_verdict(post.tid, candidate.tid, "跳过（自己发的）")
+                    self._log_verdict(post.tid, target, "跳过（自己发的）")
                     continue
                 # 并集口径：必须在特权名单里，或接受过主动消息，否则不互动
-                if not self.allowed_uin(candidate.uin):
+                if not self.allowed_uin(target.uin):
                     result.skipped += 1
                     note = (
-                        f"{candidate.display_name()}（{candidate.uin}）既不在特权名单里、"
+                        f"{target.display_name()}（{target.uin}）既不在特权名单里、"
                         "也没接受过主动消息，本轮不回复（可用 /私聊开 或填入特权名单）"
                     )
-                    self._log_verdict(
-                        post.tid, candidate.tid, "跳过（不在特权名单且未同意）"
-                    )
+                    self._log_verdict(post.tid, target, "跳过（不在特权名单且未同意）")
                     continue
-                if not candidate.content.strip():
+                if not target.comment.content.strip():
                     result.skipped += 1
-                    self._log_verdict(post.tid, candidate.tid, "跳过（评论没有正文）")
+                    self._log_verdict(post.tid, target, "跳过（评论没有正文）")
                     continue
                 # 评论 id 不可用时先挡下来：拿错 id 去请求只会白打一次请求
-                problem = self.comment_id_problem(post.tid, candidate.tid)
+                problem = self.comment_id_problem(post.tid, target.tid)
                 if problem:
                     result.skipped += 1
                     note = problem
                     logger.warning(f"[reply] {post.tid} 下的{problem}")
                     continue
-                # 三重保险：去重记录 -> 回查里已有的我的回复 -> 已尝试未确认
-                if self.replied(post.tid, candidate.tid):
+                # 三重保险：带层级的去重记录 -> 结构化归属 -> 已尝试未确认
+                if self.replied(post.tid, target):
                     result.skipped += 1
-                    self._log_verdict(post.tid, candidate.tid, "跳过（已回复）")
+                    self._log_verdict(post.tid, target, "跳过（已回复）")
                     continue
-                # 只判断「这一条」是否已经回过：线程里别处有我的回复不影响它
-                if self.has_own_reply(thread, candidate, self_uin):
+                # 只认「我的回复明确指向这一条」：父评论与子回复同号也不会互相误判
+                if self.has_own_reply(thread, target, self_uin):
                     result.skipped += 1
-                    note = f"{post.tid} 下的评论 {candidate.tid} 已经有我的回复，跳过"
-                    self._log_verdict(post.tid, candidate.tid, "跳过（已有我的回复）")
+                    note = f"{post.tid} 下的 {target.label} 已经有我的回复，跳过"
+                    self._log_verdict(post.tid, target, "跳过（已有我的回复）")
                     continue
-                if self.attempt_pending(post.tid, candidate.tid):
+                if self.attempt_pending(post.tid, target):
                     result.skipped += 1
                     note = (
-                        f"{post.tid} 下的评论 {candidate.tid} 上一轮发出后没回查确认，"
+                        f"{post.tid} 下的 {target.label} 上一轮发出后没回查确认，"
                         "24 小时内不再重发"
                     )
                     self._log_verdict(
-                        post.tid, candidate.tid, "跳过（已尝试未确认，24 小时内不重发）"
+                        post.tid, target, "跳过（已尝试未确认，24 小时内不重发）"
                     )
                     continue
 
                 try:
-                    await self._reply_to_comment(post, thread, candidate, result)
+                    await self._reply_to_comment(post, thread, target, result)
                 except Exception as e:
-                    result.errors.append(f"{post.tid}/{candidate.tid}: {e}")
-                    self._log_verdict(post.tid, candidate.tid, "失败（保留尝试记录）")
+                    result.errors.append(f"{post.tid}/{target.label}: {e}")
+                    self._log_verdict(post.tid, target, "失败（保留尝试记录）")
                 # 同一条说说每轮最多回一条
                 return f"{post.tid} 下已回复一条（同一条说说每轮最多回一条）"
         return note
 
     @staticmethod
-    def _log_verdict(post_tid: str, comment_tid: str, verdict: str) -> None:
+    def _log_verdict(post_tid: str, target: ReplyTarget, verdict: str) -> None:
         """写一行「这条候选本轮怎么处置」，让重复发没发一眼可见。
+
+        候选标识带层级（``c1`` / ``c1/r2``），空间里父评论与子回复各自从 1 编号，
+        不带层级会出现两条都叫 ``1`` 的候选分不清。
 
         Args:
             post_tid: 说说 tid。
-            comment_tid: 候选（评论或子回复）tid。
+            target: 候选（带层级）。
             verdict: 处置结论。
         """
-        logger.info(f"[reply] {post_tid}/{comment_tid}：{verdict}")
+        logger.info(f"[reply] {post_tid}/{target.label}：{verdict}")
 
     def _log_round(self, result: ReplyResult, *, reason: str = "") -> None:
         """写一行本轮巡检日志（无论有没有新评论都写）。
@@ -1029,12 +1124,12 @@ class InteractService:
         self,
         post: FeedPost,
         thread: FeedComment,
-        comment: FeedComment,
+        target: ReplyTarget,
         result: ReplyResult,
     ) -> None:
         """生成一条回复并直接发出。
 
-        ``api.reply()`` 成功即代表**已回查确认**自己的回复出现在该评论下，
+        ``api.reply()`` 成功即代表**已回查确认**自己的回复出现在该候选下，
         因此只有这时才写去重记录与今日计数；如果发出去但回查没确认，
         就写一条「已尝试未确认」记录，24 小时内不再对这条候选重发——
         这是防止「同一条评论被重复回复」的关键一步。
@@ -1042,29 +1137,28 @@ class InteractService:
         Args:
             post: 评论所在的说说。
             thread: 这条候选所属的顶层评论（用来把整段交流交给 AI）。
-            comment: 本次要回复的那一条（可能是父评论，也可能是别人的子回复）。
+            target: 本次要回复的那一条（带层级：父评论或某层子回复）。
             result: 本轮汇总，用于累计结果与错误。
         """
-        content = await self._generate_reply(post, thread, comment)
+        content = await self._generate_reply(post, thread, target.comment)
 
         # 回复一律直接发出：不生成草稿、也不需要用户确认
-        resp = await self.api.reply(
-            post.uin, post.tid, comment.tid, comment.uin, content
-        )
+        resp = await self.api.reply(post.uin, post.tid, target.tid, target.uin, content)
         if not resp.ok:
             reason = str(resp.message or resp.code)
-            self.mark_attempt(post.tid, comment.tid, reason)
-            result.errors.append(f"回复评论 {comment.tid} 失败: {reason}")
-            self._log_verdict(post.tid, comment.tid, "失败（保留尝试记录）")
+            self.mark_attempt(post.tid, target, reason)
+            result.errors.append(f"回复评论 {target.label} 失败: {reason}")
+            self._log_verdict(post.tid, target, "失败（保留尝试记录）")
             return
 
         result.replied += 1
-        self.mark_replied(post.tid, comment.tid)
-        self.clear_attempt(post.tid, comment.tid)
+        self.mark_replied(post.tid, target)
+        self.clear_attempt(post.tid, target)
         self.count_reply()
-        self._log_verdict(post.tid, comment.tid, "已回复（回查命中）")
+        self._log_verdict(post.tid, target, "已回复（回查命中）")
         logger.info(
-            f"已回复 {comment.display_name()} 在 {post.tid} 下的评论（回查已确认）"
+            f"已回复 {target.display_name()} 在 {post.tid} 下的 {target.label}"
+            "（回查已确认）"
         )
 
     @staticmethod

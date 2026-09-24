@@ -26,6 +26,9 @@ from .constants import (
 from .model import USER_AGENT, ApiResponse
 from .parser import QzoneParser
 
+# 回查时判定「本次新增」的时间余量（秒）：空间的时间戳精度与服务端延迟都留一点余地
+_CONFIRM_SLACK = 120
+
 
 class QzoneAPI(QzoneHttpClient):
     """QQ空间接口集合。"""
@@ -328,15 +331,15 @@ class QzoneAPI(QzoneHttpClient):
 
         1. POST 回复接口（请求头与 ``comment()`` 完全一致，不传 h5 专用头）；
         2. 回查 ``emotion_cgi_msgdetail_v6``（``need_comment=1``、
-           ``need_private_comment=1``），在被回复评论的子回复（``list_3``）里
-           查找 ``uin`` 是自己、正文等于本次回复的那一条；
+           ``need_private_comment=1``），在该候选所在的评论线程里查找
+           **本次新增**（``create_time`` 不早于发出请求前 120 秒）的、来自我的回复；
         3. 找到即判定成功，调用方据此写去重记录；找不到即判定失败，
            但**不会**因为「响应是 HTML」就判定为登录失效，也不会重取登录态。
 
         Args:
             uin: 说说作者（自己）的 QQ 号。
             tid: 说说 ID。
-            comment_tid: 被回复评论的 ID。
+            comment_tid: 被回复评论（或子回复）的 ID。
             comment_uin: 被回复评论的作者 QQ 号。
             content: 回复正文。
 
@@ -345,6 +348,7 @@ class QzoneAPI(QzoneHttpClient):
         """
         ctx = await self.session.get_ctx()
         topic_id = f"{uin}_{tid}__1"
+        started = int(time.time())
         raw = await self.request(
             "POST",
             self.REPLY_URL,
@@ -379,7 +383,7 @@ class QzoneAPI(QzoneHttpClient):
         post_note = self._reply_post_note(resp)
 
         found, confirm_note = await self._confirm_reply(
-            ctx.uin, tid, comment_tid, content
+            ctx.uin, tid, comment_tid, content, since=started - _CONFIRM_SLACK
         )
         if found:
             logger.info(
@@ -431,19 +435,27 @@ class QzoneAPI(QzoneHttpClient):
         return str(resp.message or resp.code)
 
     async def _confirm_reply(
-        self, own_uin: int, tid: str, comment_tid: str, content: str
+        self,
+        own_uin: int,
+        tid: str,
+        comment_tid: str,
+        content: str,
+        *,
+        since: int = 0,
     ) -> tuple[bool, str]:
-        """回查说说详情，确认自己的回复是否真的出现在该评论下。
+        """回查说说详情，确认自己的回复是否真的出现在该候选下。
 
-        判定放宽到「只要这条评论（或子回复）下有我的回复就算成功」，
+        判定放宽到「只要这条候选所在的线程里、**本次新增**了我的回复就算成功」，
         正文是否完全一致只写进日志：文本可能因清洗、截断或空间侧改写而不同，
-        以此判失败会造成重复回复。
+        以此判失败会造成重复回复。``since`` 是发出请求前的时间戳（再留一点余量），
+        用来把「本次新增」和「早就存在的历史回复」区分开——历史回复不能算成功。
 
         Args:
             own_uin: 自己的 QQ 号。
             tid: 说说 ID。
-            comment_tid: 被回复评论的 ID。
+            comment_tid: 被回复评论（或子回复）的 ID。
             content: 本次发出的回复正文（仅用于日志比对）。
+            since: 认为「新」的最早时间戳。
 
         Returns:
             二元组 (是否确认成功, 给日志看的一句说明)。
@@ -457,7 +469,7 @@ class QzoneAPI(QzoneHttpClient):
 
         comments = QzoneParser.parse_comments(resp.data)
         matched, note = QzoneParser.find_own_reply(
-            comments, comment_tid, own_uin, content
+            comments, comment_tid, own_uin, content, since=since
         )
         if matched is not None:
             return True, f"回查命中：{note}"

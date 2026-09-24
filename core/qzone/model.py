@@ -13,6 +13,8 @@ USER_AGENT = (
 
 # QQ空间正文里的内置表情标记，展示前需要剥掉
 _EM_TAG = re.compile(r"\[em\].*?\[/em\]")
+# 子回复递归解析的最大层级（回复的回复的回复…），防止异常数据里无限套娃
+_MAX_REPLY_DEPTH = 4
 
 
 def strip_em_tags(text: str) -> str:
@@ -170,14 +172,15 @@ class FeedComment:
     replies: list["FeedComment"] = field(default_factory=list)
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "FeedComment":
+    def from_raw(cls, raw: dict[str, Any], *, depth: int = 0) -> "FeedComment":
         """由接口返回的单条评论构造，字段缺失时留空而不报错。
 
         Args:
             raw: commentlist 里的一项。
+            depth: 当前层级（0 为顶层评论），用于限制递归深度。
 
         Returns:
-            构造好的 FeedComment（含 ``list_3`` 里的子回复）。
+            构造好的 FeedComment（含 ``list_3`` 里的子回复，逐层保留）。
         """
         tid = str(raw.get("tid") or raw.get("commentid") or "").strip()
         comment = cls(
@@ -189,48 +192,74 @@ class FeedComment:
             parent_tid=str(raw.get("parent_tid") or "").strip(),
         )
         comment.replies = cls._parse_replies(
-            raw.get("list_3") or raw.get("list"), parent_tid=tid
+            raw.get("list_3") or raw.get("list"),
+            parent_tid=tid,
+            depth=depth + 1,
         )
         return comment
 
     @classmethod
     def _parse_replies(
-        cls, items: object, *, parent_tid: str = ""
+        cls, items: object, *, parent_tid: str = "", depth: int = 1
     ) -> list["FeedComment"]:
-        """解析一条评论下的子回复。
+        """解析一层子回复，并递归保留更深层（回复的回复）。
 
         子回复字段名以 ``list_3`` 为主（空间评论对象的写法），个别返回用
-        ``list``，因此两者都接受。子回复缺 id 时同样保留：判断「这条评论下
-        是否已经有我的回复」只需要 uin 与正文；真要回复它时再按评论 id 规则处理。
+        ``list``，因此两者都接受。子回复缺 id 时同样保留；接口没给
+        ``parent_tid`` 时填成父节点的 tid（表示「回的是上一个节点」）。
+        空间给父评论与子回复**各自独立编号**（都从 1 开始），因此层级信息
+        必须靠这棵树来表达，不能只比较 tid 数字。
 
         Args:
             items: 评论项里的 ``list_3``（或 ``list``）。
-            parent_tid: 父评论的 tid，写进子回复的 ``parent_tid``。
+            parent_tid: 父节点的 tid，写进子回复的 ``parent_tid``。
+            depth: 当前层级，超过 ``_MAX_REPLY_DEPTH`` 时不再往深里解析。
 
         Returns:
             子回复列表；结构不对时返回空列表。
         """
-        if not isinstance(items, list):
+        if not isinstance(items, list) or depth > _MAX_REPLY_DEPTH:
             return []
         replies: list[FeedComment] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            replies.append(
-                cls(
-                    uin=_as_int(item.get("uin")),
-                    tid=str(item.get("tid") or item.get("commentid") or "").strip(),
-                    nickname=str(
-                        item.get("name") or item.get("nickname") or ""
-                    ).strip(),
-                    content=strip_em_tags(str(item.get("content") or "")),
-                    create_time=_as_int(
-                        item.get("create_time") or item.get("createTime")
-                    ),
-                    parent_tid=str(item.get("parent_tid") or "").strip() or parent_tid,
-                )
+            child = cls(
+                uin=_as_int(item.get("uin")),
+                tid=str(item.get("tid") or item.get("commentid") or "").strip(),
+                nickname=str(item.get("name") or item.get("nickname") or "").strip(),
+                content=strip_em_tags(str(item.get("content") or "")),
+                create_time=_as_int(item.get("create_time") or item.get("createTime")),
+                parent_tid=str(item.get("parent_tid") or "").strip() or parent_tid,
             )
+            child.replies = cls._parse_replies(
+                item.get("list_3") or item.get("list"),
+                parent_tid=child.tid or parent_tid,
+                depth=depth + 1,
+            )
+            replies.append(child)
         return replies
+
+    def all_replies(self) -> list["FeedComment"]:
+        """该评论下**所有层级**的子回复（深度优先展开）。
+
+        Returns:
+            子回复列表，按接口顺序（先一层，再下一层的后代）。
+        """
+        found: list[FeedComment] = []
+        for child in self.replies:
+            found.append(child)
+            found.extend(child.all_replies())
+        return found
+
+    def contains_tid(self, tid: str) -> bool:
+        """这棵子树里（含自己）是否出现某个 tid。"""
+        target = str(tid or "").strip()
+        if not target:
+            return False
+        if self.tid == target:
+            return True
+        return any(child.contains_tid(target) for child in self.replies)
 
     @staticmethod
     def parse_many(items: object) -> "list[FeedComment]":

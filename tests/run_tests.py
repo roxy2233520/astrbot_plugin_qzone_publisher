@@ -527,6 +527,7 @@ async def main() -> int:
     _draft = _imp("core.draft")
     Draft, DraftBox = _draft.Draft, _draft.DraftBox
     InteractService = _imp("core.interact").InteractService
+    ReplyTarget = _imp("core.interact").ReplyTarget
     GreetingService = _imp("core.greet").GreetingService
     _life = _imp("core.life")
     LifeManager = _life.LifeManager
@@ -535,6 +536,7 @@ async def main() -> int:
     AIClient = _imp("core.llm").AIClient
     _qzone = _imp("core.qzone")
     FeedPost = _qzone.FeedPost
+    FeedComment = _qzone.FeedComment
     QzoneAPI = _qzone.QzoneAPI
     QzoneSession = _qzone.QzoneSession
     _qzone_model = _imp("core.qzone.model")
@@ -1006,6 +1008,14 @@ async def main() -> int:
     plugin.api.EMOTION_URL = "http://127.0.0.1:8791/publish"
     plugin.api.UPLOAD_IMAGE_URL = "http://127.0.0.1:8791/upload"
 
+    def reply_target(post_tid: str, tid: str, *, path: tuple[str, ...] | None = None):
+        """构造测试用的候选（默认顶层评论；传 path 可构造子回复候选）。"""
+        return ReplyTarget(
+            comment=FeedComment(uin=0, tid=tid),
+            path=path or (tid,),
+            post_tid=post_tid,
+        )
+
     out = await collect(plugin.cmd_publish(FakeEvent(), "指令发布测试"))
     check(
         "指令回复包含成功与 tid",
@@ -1375,7 +1385,8 @@ async def main() -> int:
                     "name": "我自己",
                     "tid": f"R{len(items) + 1}_{target}",
                     "content": str(entry["form"].get("content") or ""),
-                    "createTime": now_ts,
+                    # 允许测试指定时间戳（默认「就是现在」），用于验证「只认 POST 之后新增的回复」
+                    "createTime": int(entry.get("createTime") or now_ts),
                     "parent_tid": target,
                 }
             )
@@ -3683,7 +3694,7 @@ async def main() -> int:
     )
     check(
         "回复去重记录落盘",
-        plugin.interact.replied("S2", "C2")
+        plugin.interact.replied("S2", reply_target("S2", "C2"))
         and plugin.interact.replied_count == 1
         and (plugin.cfg.data_dir / "replied_comments.json").exists(),
         str(plugin.interact.replied_count),
@@ -3736,7 +3747,8 @@ async def main() -> int:
     )
     check(
         "回复发出后即记入去重与今日计数",
-        plugin.interact.replied("S6", "C6") and plugin.interact.replied_today >= 1,
+        plugin.interact.replied("S6", reply_target("S6", "C6"))
+        and plugin.interact.replied_today >= 1,
         f"{plugin.interact.replied_count}/{plugin.interact.replied_today}",
     )
 
@@ -6670,7 +6682,7 @@ async def main() -> int:
         )
         check(
             "确认成功后写入去重记录",
-            plugin.interact.replied("S_R1", "C_R1")
+            plugin.interact.replied("S_R1", reply_target("S_R1", "C_R1"))
             and (plugin.cfg.data_dir / "replied_comments.json").exists(),
             str(plugin.interact._replied),
         )
@@ -6727,7 +6739,7 @@ async def main() -> int:
         )
         check(
             "未确认的回复不写入去重记录",
-            not plugin.interact.replied("S_R3", "C_R3"),
+            not plugin.interact.replied("S_R3", reply_target("S_R3", "C_R3")),
             str(plugin.interact._replied),
         )
         check(
@@ -6749,7 +6761,7 @@ async def main() -> int:
         posted_replies.clear()
         replies.clear()
         detail_comments.clear()
-        plugin.interact._replied = ["S_R4_C_R4"]
+        plugin.interact._replied = ["S_R4_cC_R4"]
         feeds_payload[:] = [
             my_post(
                 "S_R4",
@@ -6828,8 +6840,8 @@ async def main() -> int:
             f"{t1.summary()}/{replies}",
         )
 
-        # 已经回过的那一条候选（精确到 tid）不再回复，且不会带出别的请求
-        plugin.interact._replied = ["S_T2_C_T2_NEW"]
+        # 已经回过的那一条候选（精确到层级路径）不再回复，且不会带出别的请求
+        plugin.interact._replied = ["S_T2_cC_T2_rC_T2_NEW"]
         replies.clear()
         posted_replies.clear()
         feeds_payload[:] = [
@@ -6841,6 +6853,7 @@ async def main() -> int:
                         "C_T2",
                         "父评论",
                         uin=888888,
+                        createTime=now_ts - 1200,
                         list_3=[
                             comment_item(
                                 "C_T2_MINE",
@@ -6870,7 +6883,7 @@ async def main() -> int:
         )
 
         # 多个未回复候选时最新优先
-        plugin.interact._replied = ["S_T3_C_T3"]
+        plugin.interact._replied = ["S_T3_cC_T3"]
         replies.clear()
         posted_replies.clear()
         feeds_payload[:] = [
@@ -7164,7 +7177,7 @@ async def main() -> int:
             "回查只命中「自己的回复但正文略有差异」时仍判成功、不重复发",
             d1.replied == 1
             and not d1.errors
-            and plugin.interact.replied("S_D1", "C_D1"),
+            and plugin.interact.replied("S_D1", reply_target("S_D1", "C_D1")),
             f"{d1.summary()}/{d1.errors}",
         )
         feeds_shows_replies["on"] = True
@@ -7183,9 +7196,9 @@ async def main() -> int:
             "回查未确认时记为失败并留下尝试记录",
             d2a.replied == 0
             and bool(d2a.errors)
-            and bool(plugin.interact.attempt_of("S_D2", "C_D2"))
+            and bool(plugin.interact.attempt_of("S_D2", reply_target("S_D2", "C_D2")))
             and reply_calls.get("void") == 1,
-            f"{d2a.summary()}/{plugin.interact.attempt_of('S_D2', 'C_D2')}",
+            f"{d2a.summary()}/{plugin.interact.attempt_of('S_D2', reply_target('S_D2', 'C_D2'))}",
         )
         check(
             "尝试记录落盘到 replied_attempts.json",
@@ -7205,7 +7218,7 @@ async def main() -> int:
             plugin.interact.attempts_text(),
         )
 
-        plugin.interact._attempts["S_D2_C_D2"] = {
+        plugin.interact._attempts["S_D2_cC_D2"] = {
             "time": int(time.time()) - 25 * 3600,
             "reason": "回拨时间用于验证 24 小时重试",
         }
@@ -7218,8 +7231,10 @@ async def main() -> int:
             "超过 24 小时后允许重试一次（这次确认成功并清掉尝试记录）",
             d2c.replied == 1
             and len(replies) == 1
-            and plugin.interact.replied("S_D2", "C_D2")
-            and not plugin.interact.attempt_pending("S_D2", "C_D2"),
+            and plugin.interact.replied("S_D2", reply_target("S_D2", "C_D2"))
+            and not plugin.interact.attempt_pending(
+                "S_D2", reply_target("S_D2", "C_D2")
+            ),
             f"{d2c.summary()}/POST {len(replies)} 次/{plugin.interact._attempts}",
         )
         info_lines.clear()
@@ -7238,7 +7253,159 @@ async def main() -> int:
         plugin.interact._attempts = {}
         plugin.cfg.set("active_msg_require_optin", keep_active_optin)
 
-        # 10) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        # 10) 层级身份：空间给父评论与子回复各自编号，不能互相误判
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.cfg.set("interact_reply_require_optin", False)
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        plugin.interact._replied = []
+        plugin.interact._attempts = {}
+        replies.clear()
+        posted_replies.clear()
+        feeds_shows_replies["on"] = True
+
+        def nested_post() -> list[dict]:
+            """真实形状：P 下 c1（用户 A，tid=1）→ 我的回复（tid=9，parent_tid=1）
+            → 用户 A 又回了一条（tid=1，parent_tid=9，与父评论同号）。"""
+            return [
+                my_post(
+                    "P_H",
+                    1,
+                    [
+                        comment_item(
+                            "1",
+                            "用户 A 的评论",
+                            uin=888888,
+                            name="用户A",
+                            createTime=now_ts - 1200,
+                            list_3=[
+                                comment_item(
+                                    "9",
+                                    "我的回复",
+                                    uin=SELF_UIN,
+                                    name="我自己",
+                                    parent_tid="1",
+                                    createTime=now_ts - 900,
+                                ),
+                                comment_item(
+                                    "1",
+                                    "用户 A 又回了我的回复",
+                                    uin=888888,
+                                    name="用户A",
+                                    parent_tid="9",
+                                    createTime=now_ts - 60,
+                                ),
+                            ],
+                        )
+                    ],
+                )
+            ]
+
+        feeds_payload[:] = nested_post()
+        info_lines.clear()
+        h1 = await plugin.interact.run_replies_once()
+        check(
+            "父评论与子回复同号（都为 1）时不互相误判：父评论跳过、新子回复被回复",
+            h1.replied == 1
+            and len(replies) == 1
+            and replies[-1]["form"].get("commentId") == "1"
+            and replies[-1]["form"].get("commentUin") == "888888",
+            f"{h1.summary()}/{replies}",
+        )
+        check(
+            "新键带层级（父评论 P_H_c1，子回复 P_H_c1_r1）",
+            "P_H_c1_r1" in plugin.interact._replied
+            and "P_H_c1" not in plugin.interact._replied,
+            str(plugin.interact._replied),
+        )
+        check(
+            "日志里的候选标识带层级（c1/r1，而不是两个 1）",
+            any("P_H/c1/r1：" in item for item in info_lines),
+            str([item for item in info_lines if "P_H" in item])[-200:],
+        )
+
+        replies.clear()
+        info_lines.clear()
+        h2 = await plugin.interact.run_replies_once()
+        check(
+            "回复过的新子回复下一轮不会再回（key 已记录）",
+            h2.replied == 0
+            and not replies
+            and any("跳过（已回复）" in item for item in info_lines),
+            f"{h2.summary()}/POST {len(replies)} 次",
+        )
+        check(
+            "两条同号候选的日志标识互不相同（c1 与 c1/r1）",
+            any("P_H/c1：跳过（已有我的回复）" in item for item in info_lines)
+            and any("P_H/c1/r1：跳过（已回复）" in item for item in info_lines),
+            str([item for item in info_lines if "P_H" in item])[-260:],
+        )
+
+        # 发送后回查只认「POST 之后新增的我的回复」：历史回复不算成功
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_void"
+        plugin.interact._replied = []
+        plugin.interact._attempts = {}
+        replies.clear()
+        reply_calls.clear()
+        posted_replies.clear()
+        feeds_shows_replies["on"] = False
+        posted_replies.append(
+            {
+                "form": {"commentId": "C_H1", "content": "很久以前发出的回复"},
+                "query": {},
+                "headers": {},
+                "createTime": now_ts - 3600,
+            }
+        )
+        feeds_payload[:] = [
+            my_post(
+                "P_H2",
+                1,
+                [
+                    comment_item(
+                        "C_H1", "需要回复的评论", uin=888888, createTime=now_ts - 120
+                    )
+                ],
+            )
+        ]
+        h3 = await plugin.interact.run_replies_once()
+        check(
+            "回查只认 POST 之后新增的回复：历史回复不算成功",
+            h3.replied == 0
+            and bool(h3.errors)
+            and reply_calls.get("void") == 1
+            and bool(plugin.interact.attempt_of("P_H2", reply_target("P_H2", "C_H1"))),
+            f"{h3.summary()}/{plugin.interact.attempt_of('P_H2', reply_target('P_H2', 'C_H1'))}",
+        )
+        feeds_shows_replies["on"] = True
+
+        # 老格式（无层级）的去重记录仍能读；新写入用带层级的新键
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        plugin.interact._replied = ["P_L_7"]
+        plugin.interact._attempts = {}
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "P_L",
+                1,
+                [comment_item("7", "老记录里回过的评论", uin=888888)],
+            )
+        ]
+        l1 = await plugin.interact.run_replies_once()
+        check(
+            "老格式去重键仍能读（顶层评论按老键跳过）",
+            l1.replied == 0 and not replies,
+            f"{l1.summary()}/POST {len(replies)} 次",
+        )
+        plugin.interact._replied = []
+        h4 = await plugin.interact.run_replies_once()
+        check(
+            "新写入用带层级的新键",
+            h4.replied == 1 and plugin.interact._replied == ["P_L_c7"],
+            str(plugin.interact._replied),
+        )
+
+        # 11) 请求头与 comment() 完全一致（不传 h5 专用请求头）
         plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
         comments.clear()
         replies.clear()
