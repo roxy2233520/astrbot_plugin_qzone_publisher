@@ -7012,7 +7012,106 @@ async def main() -> int:
             (systems[-1] if systems else "")[-200:],
         )
 
-        # 7) 请求头与 comment() 完全一致（不传 h5 专用请求头）
+        # 7) 回复对象名单（最高权限）：只回名单里的人，且这些人无视私聊开关
+        _schema_reply = _json.loads(
+            (REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8")
+        )
+        _interact_items = _schema_reply["sec_interact"]["items"]
+        check(
+            "回复对象名单与「要求接受过主动消息」都在说说互动板块里",
+            "interact_reply_uins" in _interact_items
+            and "interact_reply_require_optin" in _interact_items
+            and plugin.cfg.interact_reply_uins == []
+            and plugin.cfg.interact_reply_require_optin is False,
+            f"{plugin.cfg.interact_reply_uins}/{plugin.cfg.interact_reply_require_optin}",
+        )
+
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_h5_page"
+        plugin.cfg.set("interact_reply_uins", ["999999"])
+        plugin.interact._replied = []
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_V1",
+                1,
+                [
+                    comment_item("C_V1A", "名单里的人", uin=999999, name="小明"),
+                    comment_item("C_V1B", "不在名单里的人", uin=888888, name="小红"),
+                ],
+            )
+        ]
+        v1 = await plugin.interact.run_replies_once()
+        check(
+            "填了回复对象名单后只回复名单里的人",
+            v1.replied == 1
+            and len(replies) == 1
+            and replies[-1]["form"].get("commentUin") == "999999",
+            f"{v1.summary()}/{[(item['form'].get('commentId'), item['form'].get('commentUin')) for item in replies]}",
+        )
+
+        keep_active_optin = plugin.cfg.active_msg_require_optin
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.cfg.set("interact_reply_require_optin", True)
+        plugin.cfg.set("active_msg_require_optin", True)
+        plugin.prefs.set_opted_in("10020", False)
+        plugin.prefs.set_opted_in("10021", True)
+
+        plugin.interact._replied = []
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_V2", 1, [comment_item("C_V2", "没接受的人", uin=10020, name="小刚")]
+            )
+        ]
+        v2 = await plugin.interact.run_replies_once()
+        check(
+            "开启「要求接受过主动消息」后，未接受的人不被回复",
+            v2.replied == 0 and not replies,
+            f"{v2.summary()}/{replies}",
+        )
+
+        plugin.interact._replied = []
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_V3", 1, [comment_item("C_V3", "已接受的人", uin=10021, name="小美")]
+            )
+        ]
+        v3 = await plugin.interact.run_replies_once()
+        check(
+            "已接受主动消息的人照常被回复",
+            v3.replied == 1 and len(replies) == 1,
+            f"{v3.summary()}/{replies}",
+        )
+
+        plugin.cfg.set("interact_reply_uins", ["10020"])
+        plugin.interact._replied = []
+        replies.clear()
+        posted_replies.clear()
+        feeds_payload[:] = [
+            my_post(
+                "S_V4",
+                1,
+                [comment_item("C_V4", "名单内的拒绝者", uin=10020, name="小刚")],
+            )
+        ]
+        v4 = await plugin.interact.run_replies_once()
+        check(
+            "回复对象名单内的人无视私聊开关，直接回复",
+            v4.replied == 1
+            and len(replies) == 1
+            and replies[-1]["form"].get("commentUin") == "10020",
+            f"{v4.summary()}/{replies}",
+        )
+
+        plugin.cfg.set("interact_reply_uins", [])
+        plugin.cfg.set("interact_reply_require_optin", False)
+        plugin.cfg.set("active_msg_require_optin", keep_active_optin)
+
+        # 8) 请求头与 comment() 完全一致（不传 h5 专用请求头）
         plugin.api.COMMENT_URL = f"{AI_BASE}/comment"
         comments.clear()
         replies.clear()

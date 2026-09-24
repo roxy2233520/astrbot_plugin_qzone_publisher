@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -129,6 +130,7 @@ class InteractService:
         ai: AIClient,
         api: QzoneAPI,
         drafts: DraftBox,
+        reply_optin_checker: Callable[[str], bool] | None = None,
     ) -> None:
         """初始化服务。
 
@@ -137,11 +139,15 @@ class InteractService:
             ai: AI 客户端。
             api: QQ空间接口。
             drafts: 草稿箱。
+            reply_optin_checker: 可选的 ``(qq) -> bool``，判断对方是否接受过主动消息；
+                只在「回复对象名单」留空、且开启了「回复前要求对方接受过主动消息」
+                时才使用；名单里的人不受它约束。
         """
         self.cfg = config
         self.ai = ai
         self.api = api
         self.drafts = drafts
+        self._reply_optin = reply_optin_checker
         self.file = Path(config.data_dir) / "interacted_tids.json"
         self._seen: list[str] = []
         self.load()
@@ -450,6 +456,56 @@ class InteractService:
             logger.debug(f"评论 id（{value}）为短数字，仍按真实评论 id 使用")
         return ""
 
+    @property
+    def reply_targets(self) -> list[str]:
+        """「回复对象名单」里的 QQ 号（最高权限名单）。
+
+        留空表示回复所有人（默认行为）；填了就只有名单里的人会被回复，
+        并且这些人的评论无视私聊开关，直接回复。
+        """
+        values = self.cfg.interact_reply_uins or []
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    def reply_target_allowed(self, uin: int) -> bool:
+        """这个 QQ 是否在可回复范围内。
+
+        Args:
+            uin: 评论者的 QQ 号。
+
+        Returns:
+            名单为空时一律 True；否则只放行名单里的 QQ。
+        """
+        targets = self.reply_targets
+        if not targets:
+            return True
+        return str(uin) in targets
+
+    @property
+    def reply_requires_optin(self) -> bool:
+        """是否要求对方接受过主动消息（只在名单留空时生效）。
+
+        名单里的人属于「最高权限」：不管有没有用过 ``/私聊开`` 都会被回复，
+        因此名单非空时这一项不参与判断。
+        """
+        if self.reply_targets:
+            return False
+        return bool(self.cfg.interact_reply_require_optin)
+
+    def reply_optin_ok(self, uin: int) -> bool:
+        """对方是否满足「回复前要求接受过主动消息」。
+
+        Args:
+            uin: 评论者的 QQ 号。
+
+        Returns:
+            不需要检查、或对方接受过时返回 True。
+        """
+        if not self.reply_requires_optin:
+            return True
+        if self._reply_optin is None:
+            return True
+        return bool(self._reply_optin(str(uin)))
+
     @staticmethod
     def reply_candidates(comment: FeedComment) -> list[FeedComment]:
         """一条评论下所有可回复的对象，**最新优先**。
@@ -727,6 +783,18 @@ class InteractService:
                 result.checked += 1
                 if candidate.uin == self_uin:
                     result.skipped += 1
+                    continue
+                # 回复对象名单（最高权限）：填了名单就只回这些人，且他们无视私聊开关
+                if not self.reply_target_allowed(candidate.uin):
+                    result.skipped += 1
+                    continue
+                if not self.reply_optin_ok(candidate.uin):
+                    result.skipped += 1
+                    note = (
+                        f"{candidate.display_name()}（{candidate.uin}）还没接受主动消息，"
+                        "本轮跳过回复（可把 TA 填进「回复对象名单」直接回复）"
+                    )
+                    logger.info(f"[reply] {post.tid} 下的{note}")
                     continue
                 if not candidate.content.strip():
                     result.skipped += 1

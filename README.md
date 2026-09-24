@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-743%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-748%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -434,6 +434,9 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 - 未接受的人不会被主动打扰，只会出现在结果汇总的「因未接受主动消息跳过 N 人」里。
 - 管理员手动测试（`/空间问候 morning <QQ>`、`/空间问候 holiday [QQ]`）是**显式指定对象**的动作，
   不受偏好限制，可以直接发给指定的 QQ；`/空间闲聊 now` 没有指定对象，因此仍遵守同意设置。
+- **评论回复不属于主动消息**，默认不受这套同意机制限制（对方先来评论，回复属于应答）：
+  谁在自己的说说下评论就回谁。想收紧或只回指定的人，用「评论回复」里的
+  `interact_reply_uins`（回复对象名单）与 `interact_reply_require_optin`，见下文。
 
 ### 评论回复
 
@@ -487,10 +490,15 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 - 每轮总数由 `interact_reply_max_per_run` 限制（默认 3 条），同一条说说每轮最多回复一条，
   被上限截断的新评论会在下一轮继续处理；回复字数上限为 `interact_reply_max_chars`，
   提示词为 `interact_reply_prompt`（只写风格与要求，整段交流由插件自动附上）。
+- **回复对象可以手动限定**：`interact_reply_uins`（面板里「说说互动」板块，
+  「回复对象名单（最高权限）」）填 QQ 号即只回复这些人，并且他们**无视私聊开关、
+  直接回复**（不需要用过 `/私聊开`）；留空表示回复所有人（默认，也就是谁评论就回谁）。
+  想更严一点可以打开 `interact_reply_require_optin`：只在名单留空时生效，
+  开启后只回复用过 `/私聊开` 的人，名单里的人照旧豁免。
 - **每轮都有日志**：无论有没有新评论，都会写一行
   `[reply] 第 N 轮评论巡检：检查 … 回复 … 跳过 …`；发现新评论却没回复时会写明原因
-  （例如达到每轮上限、已经有我的回复）。用 `/空间回复` 可以查看开关、巡检间隔、
-  时间窗口、回复方式、每轮上限、今日已回与下次巡检。
+  （例如达到每轮上限、已经有我的回复、不在回复对象名单里、对方还没接受主动消息）。
+  用 `/空间回复` 可以查看开关、巡检间隔、时间窗口、回复方式、每轮上限、今日已回与下次巡检。
 - **失败原因分开判定**：返回的是页面（含这段框架页）记作「返回页面」，
   验证 / 风控页单独分类，被判为 403 记作「请求被拒绝」，这三种都**不会**去重取登录态；
   只有确实返回登录页（`ptlogin` / 请先登录）、HTTP 401 或业务码 `-3000`
@@ -668,6 +676,8 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 | `interact_like` | `false` | 自动点赞（默认关） |
 | `interact_comment` | `false` | 自动评论（默认关，AI 生成） |
 | `interact_reply_enabled` | `false` | **回复自己说说下的评论**（默认关）。开启后按上文「评论回复」的规则回复；默认巡检到就直接回复 |
+| `interact_reply_uins` | `[]` | **回复对象名单（最高权限）**：手动填 QQ 号，例如 `["123456"]`；填了就**只回复这些人**的评论，而且他们**无视私聊开关、直接回复**；留空表示回复所有人（默认） |
+| `interact_reply_require_optin` | `false` | **回复前要求对方接受过主动消息**：只在「回复对象名单」留空时生效，开启后只回复用过 `/私聊开` 的人（若全局的 `active_msg_require_optin` 也关着，则这一项不生效）；名单里的人始终无视该项 |
 | `interact_reply_cron` | `0,30 12-13,20-23 * * *` | **评论回复的巡检时段与间隔**：默认只在中午 12:00–14:00 与晚上 20:00–24:00 每 30 分钟巡检一轮，实际触发点为 12:00 / 12:30 / 13:00 / 13:30 与 20:00 / 20:30 / 21:00 / 21:30 / 22:00 / 22:30 / 23:00 / 23:30（合计 12 轮/天）；最后一轮 23:30，此后到次日 12:00 之间不巡检，**时段外的评论要等到下一个时段**（例如 23:40 的评论次日 12:00 才处理）。QQ空间没有评论推送通道，评论只能靠定时轮询发现；巡检越频繁越及时，但请求越多越可能触发风控与登录态失效；支持 `HH:MM` 或 5 段 Cron，可自行调整时段与间隔 |
 | `interact_reply_jitter` | `120` | 评论回复的随机抖动（秒）：每轮触发后随机延后 0~N 秒（默认最多 2 分钟），避免卡在同一秒；最坏延迟 = 时段内的巡检间隔 + 抖动，跨时段则等到下一个时段 |
 | `interact_reply_days` | `7` | **评论回复的时间窗口（天）**：只处理这么多天内自己发布的说说下的评论；比 `interact_days` 更长，旧说说下的新评论同样会被发现 |
