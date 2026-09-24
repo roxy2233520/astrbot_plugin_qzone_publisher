@@ -65,6 +65,9 @@ from .core.ui import (
 from .core.user_prefs import FEATURE_LABELS, UserPrefStore
 from .core.web import WebSearchBridge
 
+# 连续这么多次「响应内容为空」就判为风控信号（按接口 / 操作分别计数，成功一次即清零）
+_RISK_EMPTY_THRESHOLD = 3
+
 _ON_FLAGS = {"on", "开", "开启", "true", "1", "yes"}
 _OFF_FLAGS = {"off", "关", "关闭", "false", "0", "no", "none", "disable"}
 _RENEW_FLAGS = {"renew", "regen", "重写", "重新生成", "重新生成日程"}
@@ -115,6 +118,15 @@ class QzonePublisherPlugin(Star):
             opted_in_counter=self._opted_in_count,
         )
         self.render = ReceiptRenderer(self.cfg)
+        # 风控监控状态：只记录与提醒，**不**暂停任务、不降频、不改配置
+        # 每种原因的最近一次提醒时间（冷却去重）、每种「接口 / 操作」的连续空响应次数
+        self._risk_alerted: dict[str, float] = {}
+        self._risk_empty_counts: dict[str, int] = {}
+        # 最近一次风控事件与今日次数
+        self._risk_last: dict[str, Any] = {}
+        self._risk_today_date = ""
+        self._risk_today_count = 0
+        self.api.set_risk_hook(self._note_risk)
         # 最近一次与某个 QQ 的真实私聊会话地址（umo），问候优先用它，避免地址拼错
         self._private_umos: dict[str, str] = {}
         # 私聊用户偏好：谁接受机器人的主动消息、接受哪些功能
@@ -1284,6 +1296,147 @@ class QzonePublisherPlugin(Star):
         qqs = [str(item).strip() for item in admins if str(item).strip().isdigit()]
         return qqs, "AstrBot 配置 admins_id"
 
+    # ------------------------------------------------------------------
+    # 风控识别与提醒（只提醒，不自动暂停 / 不降频 / 不改配置）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _risk_reason_of(payload: dict[str, Any]) -> str:
+        """把上报事件归纳成给用户看的原因文案。"""
+        kind = str(payload.get("kind") or "")
+        if kind == "forbidden":
+            return "请求被拒绝（403）"
+        if kind == "verify":
+            return "返回验证 / 风控页面"
+        if kind == "login":
+            return "登录态失效（自动重取登录态后仍然失败）"
+        if kind == "empty":
+            return "连续 3 次响应内容为空"
+        return str(payload.get("reason") or "未知原因")
+
+    async def _note_risk(self, payload: dict[str, Any]) -> None:
+        """接收传输层的风控上报：记录、写日志、按需提醒。
+
+        只做「记录 + 提醒」，**不**暂停任务、**不**降频、**不**改配置。
+
+        Args:
+            payload: 传输层上报的事件（kind / operation / path / url / code / snippet）。
+        """
+        kind = str(payload.get("kind") or "")
+        operation = str(payload.get("operation") or "接口请求")
+        path = str(payload.get("path") or "")
+        where = f"{operation}（{path}）" if path else operation
+
+        # 成功一次即清零该「接口 / 操作」的连续空响应计数
+        counter_key = f"{operation}｜{path}"
+        if kind == "ok":
+            self._risk_empty_counts.pop(counter_key, None)
+            return
+
+        if kind == "empty":
+            count = self._risk_empty_counts.get(counter_key, 0) + 1
+            self._risk_empty_counts[counter_key] = count
+            if count < _RISK_EMPTY_THRESHOLD:
+                logger.warning(
+                    f"QQ空间响应内容为空（连续 {count}/{_RISK_EMPTY_THRESHOLD} 次）: "
+                    f"{where}｜url={payload.get('url')}"
+                )
+                return
+
+        reason = self._risk_reason_of(payload)
+        snippet = str(payload.get("snippet") or "")[:200]
+        logger.warning(
+            f"检测到风控信号: 触发={where}｜原因={reason}"
+            f"｜code={payload.get('code')}｜url={payload.get('url')}"
+            f"｜响应片段: {snippet}"
+        )
+
+        self._remember_risk(reason, where)
+        await self._alert_risk(reason, where)
+
+    def _remember_risk(self, reason: str, where: str) -> None:
+        """记录最近一次风控事件与今日次数（与是否发送提醒无关）。"""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        if self._risk_today_date != today:
+            self._risk_today_date = today
+            self._risk_today_count = 0
+        self._risk_today_count += 1
+        self._risk_last = {
+            "time": now,
+            "reason": reason,
+            "where": where,
+            "today": self._risk_today_count,
+        }
+
+    async def _alert_risk(self, reason: str, where: str) -> None:
+        """发一条风控提醒（可能因开关 / 冷却而不发，但状态与日志始终记录）。
+
+        Args:
+            reason: 原因文案，同时作为冷却去重的键（不同原因各自计时）。
+            where: 触发位置（操作与接口名）。
+        """
+        if not bool(self.cfg.risk_alert_enabled):
+            logger.info(
+                f"风控提醒已关闭（risk_alert_enabled=false），本次只记录: {reason}"
+            )
+            return
+        if not bool(self.cfg.notify_enabled):
+            logger.info(
+                f"通知总开关关闭（notify_enabled=false），风控只记录不提醒: {reason}"
+            )
+            return
+
+        cooldown = max(int(self.cfg.risk_alert_cooldown_minutes or 0), 1) * 60
+        now = time.time()
+        last = self._risk_alerted.get(reason)
+        if last is not None and now - last < cooldown:
+            remain = int((cooldown - (now - last)) / 60) + 1
+            logger.info(
+                f"风控提醒在冷却期内（同一原因 {cooldown // 60} 分钟内只提醒一次），"
+                f"约 {remain} 分钟后可再次提醒: {reason}"
+            )
+            return
+
+        self._risk_alerted[reason] = now
+        text = self._risk_alert_text(reason, where)
+        umos = self._admin_umos()
+        sent = await self._notify(text, umos, render=False)
+        logger.info(
+            f"风控提醒发送完成: 原因={reason}｜触发={where}｜成功 {sent} 个会话"
+            f"（管理员私聊 {len(umos)} 个）"
+        )
+
+    def _risk_alert_text(self, reason: str, where: str) -> str:
+        """构造风控提醒文案（统一排版；陈述句，不含问句）。"""
+        last = self._risk_last
+        when = last.get("time")
+        stamp = when.strftime("%m-%d %H:%M") if isinstance(when, datetime) else "未知"
+        section = Section(icon=ICON_WARN, label="风控提醒")
+        section.add(
+            kv("时间", stamp),
+            kv("触发", where),
+            kv("原因", reason),
+            kv("今日风控次数", f"{last.get('today', self._risk_today_count)}"),
+            kv(
+                "建议",
+                f"可先降低频率或暂停相关任务（{quote_command('空间回复 off')}、"
+                "或在面板关闭自动发布）；插件不会自行暂停或降频",
+            ),
+        )
+        return section.text()
+
+    def risk_text(self) -> str:
+        """给状态用的风控摘要：最近一次与今日次数。"""
+        if not self._risk_last:
+            return "未检测到"
+        when = self._risk_last.get("time")
+        stamp = when.strftime("%m-%d %H:%M") if isinstance(when, datetime) else "未知"
+        return (
+            f"最近一次 {stamp}（{self._risk_last.get('reason')}）"
+            f"｜今日 {self._risk_today_count} 次"
+        )
+
     def _admin_umos(self) -> list[str]:
         """拼出管理员私聊 UMO（草稿确认、通知用）。"""
         if not bool(self.cfg.draft_admin):
@@ -1629,6 +1782,7 @@ class QzonePublisherPlugin(Star):
                 f"（来源：{admin_source}）",
             )
         )
+        login_lines.append(kv("风控", self.risk_text()))
         if not admin_qqs:
             login_lines.append(
                 kv(

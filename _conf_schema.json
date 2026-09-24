@@ -908,9 +908,15 @@
   },
   "sec_network": {
     "description": "网络与登录",
-    "hint": "空间登录态、请求超时与 Cookie 兜底",
+    "hint": "空间登录态、请求超时、Cookie 兜底与风控提醒",
     "type": "object",
     "items": {
+      "risk_alert_enabled": {
+        "description": "风控提醒（主动私聊通知）",
+        "hint": "检测到风控（请求被拒绝 403、验证 / 风控页、自动重取登录态后仍失败、连续 3 次响应内容为空）时，立刻私聊提醒管理员；只提醒，插件不会自行暂停任务或降频",
+        "type": "bool",
+        "default": true
+      },
       "cookie": {
         "description": "手动 Cookie（可选）",
         "hint": "留空时自动向 OneBot 平台获取 user.qzone.qq.com 的 Cookie。仅当自动获取失败时填写，需包含 uin、skey、p_skey",
@@ -937,6 +943,17 @@
           "step": 1
         },
         "default": 15
+      },
+      "risk_alert_cooldown_minutes": {
+        "description": "风控提醒冷却（分钟）",
+        "hint": "同一原因在这么长时间内只提醒一次；不同原因各自计时，冷却结束后再次触发会再提醒",
+        "type": "int",
+        "slider": {
+          "min": 1,
+          "max": 240,
+          "step": 1
+        },
+        "default": 30
       }
     }
   },

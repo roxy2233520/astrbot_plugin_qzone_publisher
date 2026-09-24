@@ -3,7 +3,7 @@
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.16%2C%3C5-2E7DF7)](https://github.com/AstrBotDevs/AstrBot)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-779%20passed-2ea44f)](tests/)
+[![Tests](https://img.shields.io/badge/tests-794%20passed-2ea44f)](tests/)
 [![CI](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml/badge.svg)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/roxy2233520/astrbot_plugin_qzone_publisher)](https://github.com/roxy2233520/astrbot_plugin_qzone_publisher/releases)
 
@@ -751,9 +751,35 @@ AI 撰写文案、一体化生活日程、自动读取与点赞评论好友说�
 
 | 字段 | 默认 | 说明 |
 | :--- | :--- | :--- |
+| `risk_alert_enabled` | `true` | **风控提醒**：检测到风控时立刻私聊提醒管理员（只提醒，不自动暂停任务、不降频） |
 | `cookie` | 空 | 手动 Cookie 兜底（需含 `uin`/`skey`/`p_skey`） |
 | `cookie_ttl` | `600` | Cookie 缓存秒数，0=不主动刷新 |
 | `timeout` | `15` | QQ空间请求超时（秒） |
+| `risk_alert_cooldown_minutes` | `30` | 风控提醒冷却（分钟）：同一原因在冷却期内只提醒一次，不同原因各自计时 |
+
+### 风控提醒
+
+QQ空间出现风控时，插件会**主动私聊提醒管理员**，但**不会自行暂停或降低任何任务的频率**——
+是否暂停、是否调低频率由你自己决定（可用 `/空间回复 off`、`/空间自动发` 或在面板里关掉相应开关）。
+
+判为风控信号的情况：
+
+- HTTP 403（请求被拒绝）；
+- 返回验证 / 风控页面；
+- 登录态失效（自动重取登录态并重试一次后仍然失败）；
+- 连续 **3 次**响应内容为空（按接口 / 操作分别计数，中间成功一次即清零）。
+
+提醒与记录的口径：
+
+- 提醒优先发给管理员私聊（`admin_uins`，留空回退 AstrBot 的 `admins_id`），
+  同时遵守 `notify_enabled` 与 `notify_umo`（与发布通知一致）；通知总开关关闭时**只记录不发送**。
+- 同一条原因在 `risk_alert_cooldown_minutes`（默认 30 分钟）内只提醒一次；不同原因各自计时；
+  冷却结束后再次触发会再提醒一次。
+- 提醒内容含时间、触发位置（操作与接口名）、原因、今日风控次数与建议，
+  只陈述事实与可选做法，不含问句，也不会替你执行任何指令。
+- 风控事件会写进日志（warning 级，含接口名、原因码、实际 URL 与响应片段前 200 字）。
+- `/空间状态` 的「登录与接入」区块里有一行「风控」：显示最近一次风控时间与原因、以及今日次数；
+  从未出现时显示「未检测到」。
 
 ---
 

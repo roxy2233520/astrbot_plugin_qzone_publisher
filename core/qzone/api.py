@@ -118,6 +118,7 @@ class QzoneAPI(QzoneHttpClient):
             self.EMOTION_URL,
             params={"g_tk": ctx.gtk, "uin": ctx.uin},
             data=data,
+            operation="发布说说",
         )
         return self._normalize_publish(raw)
 
@@ -154,6 +155,7 @@ class QzoneAPI(QzoneHttpClient):
                 "origin": self.BASE_URL,
             },
             timeout=60,
+            operation="上传图片",
         )
 
         resp = ApiResponse.from_raw(raw, code_key="ret", msg_key="msg")
@@ -198,6 +200,7 @@ class QzoneAPI(QzoneHttpClient):
                     "&mode=4&previewV8=1&style=35&version=8&needDelOpr=true"
                 ),
             },
+            operation="删除说说",
         )
         return ApiResponse.from_raw(raw)
 
@@ -232,6 +235,7 @@ class QzoneAPI(QzoneHttpClient):
                 "need_comment": 1,
                 "need_private_comment": 1,
             },
+            operation="读取说说列表",
         )
         return ApiResponse.from_raw(raw)
 
@@ -265,6 +269,7 @@ class QzoneAPI(QzoneHttpClient):
                 "format": "json",
                 "fupdate": 1,
             },
+            operation="点赞说说",
         )
         return ApiResponse.from_raw(raw)
 
@@ -298,6 +303,7 @@ class QzoneAPI(QzoneHttpClient):
                 "ref": "feeds",
                 "content": content,
             },
+            operation="评论说说",
         )
         return ApiResponse.from_raw(raw)
 
@@ -382,6 +388,7 @@ class QzoneAPI(QzoneHttpClient):
             },
             # 这个接口成功时也回 HTML 页面，页面响应只写 debug 日志，结论交给回查
             page_is_expected=True,
+            operation="回复评论",
         )
         resp = ApiResponse.from_raw(raw)
         meta = raw.get(QZONE_INTERNAL_META_KEY)
@@ -521,6 +528,7 @@ class QzoneAPI(QzoneHttpClient):
                 "need_private_comment": 1,
             },
             headers=self._h5_headers(),
+            operation="读取说说详情",
         )
         return ApiResponse.from_raw(raw)
 

@@ -1547,6 +1547,30 @@ async def main() -> int:
         await _accept_reply(request)
         return web.json_response({"code": 0})
 
+    async def handle_reply_verify(request):
+        """始终返回验证 / 风控页面（-3005），用于风控提醒的用例。"""
+        _bump("verify")
+        return web.Response(
+            text="<!DOCTYPE html><html><body>安全验证</body></html>",
+            content_type="text/html",
+        )
+
+    async def handle_reply_empty(request):
+        """始终返回空响应（连续 3 次应判为风控信号）。"""
+        _bump("empty")
+        return web.Response(text="", content_type="text/html")
+
+    async def handle_reply_unauthorized_always(request):
+        """始终 401：自动重取登录态并重试一次后仍然失败。"""
+        _bump("unauthorized_always")
+        return web.Response(text="", status=401)
+
+    async def handle_reply_flaky(request):
+        """第 1、2、4、5 次返回空响应，第 3 次正常：验证「成功一次即清零」。"""
+        if _bump("flaky") in (1, 2, 4, 5):
+            return web.Response(text="", content_type="text/html")
+        return web.json_response({"code": 0})
+
     app2 = web.Application()
     app2.router.add_post("/v1/chat/completions", handle_ai)
     app2.router.add_get("/feeds", handle_feeds)
@@ -1559,6 +1583,10 @@ async def main() -> int:
     app2.router.add_post("/publish_garbage", handle_publish_garbage)
     app2.router.add_post("/reply_h5_page", handle_reply_h5_page)
     app2.router.add_post("/reply_void", handle_reply_void)
+    app2.router.add_post("/reply_verify", handle_reply_verify)
+    app2.router.add_post("/reply_empty", handle_reply_empty)
+    app2.router.add_post("/reply_flaky", handle_reply_flaky)
+    app2.router.add_post("/reply_unauthorized_always", handle_reply_unauthorized_always)
     app2.router.add_post("/reply_ptlogin", handle_reply_ptlogin)
     app2.router.add_post("/reply_code_3000", handle_reply_code_3000)
     app2.router.add_post("/reply_forbidden", handle_reply_forbidden)
@@ -7782,6 +7810,234 @@ async def main() -> int:
         and both_keys.replies[0].parent_tid == "1",
         str([(item.uin, item.tid, item.parent_tid) for item in both_keys.replies]),
     )
+
+    # ==================================================================
+    print("\n[42] 风控识别与主动提醒")
+
+    def sent_plain_texts() -> list[str]:
+        """把 StarTools.sent 里的消息链拼成纯文本（测试用）。"""
+        texts: list[str] = []
+        for _session, chain in StarTools.sent:
+            texts.append(
+                "".join(str(getattr(item, "text", "")) for item in chain.chain)
+            )
+        return texts
+
+    def sent_targets() -> list[str]:
+        """本次已发送的会话地址列表。"""
+        return [str(item[0]) for item in StarTools.sent]
+
+    # 顺带捕获 warning 日志，用来断言风控事件确实写进了日志
+    warning_lines_risk: list[str] = []
+    _risk_logger = sys.modules["astrbot.api"].logger
+    _real_risk_warning = _risk_logger.warning
+    _risk_logger.warning = lambda *args, **kwargs: warning_lines_risk.append(
+        str(args[0]) if args else ""
+    )
+
+    try:
+        # 让回复巡检任务处于运行状态，用来验证风控不会把它停掉
+        plugin.reply_task.reconfigure(enabled=True)
+        plugin.api.DETAIL_URL = f"{AI_BASE}/detail"
+        detail_comments.clear()
+        posted_replies.clear()
+        feeds_shows_replies["on"] = True
+
+        def risk_snapshot() -> dict:
+            return {
+                "running": plugin.reply_task.running,
+                "cron": plugin.reply_task.cron,
+                "jitter": plugin.reply_task.jitter,
+                "reply_enabled": bool(plugin.cfg.interact_reply_enabled),
+                "auto_publish": bool(plugin.cfg.auto_publish_enabled),
+                "risk_enabled": bool(plugin.cfg.risk_alert_enabled),
+                "cooldown": int(plugin.cfg.risk_alert_cooldown_minutes),
+            }
+
+        before_risk = risk_snapshot()
+
+        def reset_risk_state() -> None:
+            plugin._risk_alerted.clear()
+            plugin._risk_empty_counts.clear()
+            plugin._risk_last = {}
+            plugin._risk_today_date = ""
+            plugin._risk_today_count = 0
+            StarTools.sent.clear()
+
+        # 1) HTTP 403（-3003）
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_forbidden"
+        resp_403 = await plugin.api.reply(
+            SELF_UIN, "S_RISK", "C_RISK", 888888, "测试回复"
+        )
+        texts = sent_plain_texts()
+        check(
+            "403 产生风控事件并发出一次提醒（含时间/触发/原因/建议，且没有问句）",
+            (not resp_403.ok)
+            and len(texts) >= 1
+            and all("风控提醒" in item for item in texts)
+            and "时间：" in texts[0]
+            and "触发：" in texts[0]
+            and "请求被拒绝（403）" in texts[0]
+            and "今日风控次数：" in texts[0]
+            and "建议：" in texts[0]
+            and "？" not in texts[0]
+            and "?" not in texts[0],
+            str(texts)[:220],
+        )
+        check(
+            "风控提醒发给管理员私聊（并遵守 notify_umo）",
+            "aiocqhttp:FriendMessage:10001" in sent_targets()
+            and "aiocqhttp:FriendMessage:123456" in sent_targets(),
+            str(sent_targets()),
+        )
+        check(
+            "风控事件写进 warning 日志（含接口名与响应片段）",
+            any(
+                "检测到风控信号" in item and "reply_forbidden" in item and "403" in item
+                for item in warning_lines_risk
+            ),
+            str(warning_lines_risk[-2:])[:220],
+        )
+
+        # 2) 验证 / 风控页（-3005）
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_verify"
+        resp_verify = await plugin.api.reply(
+            SELF_UIN, "S_RISK", "C_RISK2", 888888, "测试回复"
+        )
+        verify_texts = sent_plain_texts()
+        check(
+            "验证 / 风控页同样触发提醒（原因写明是验证页）",
+            (not resp_verify.ok)
+            and len(verify_texts) >= 1
+            and all("验证" in item for item in verify_texts),
+            str(verify_texts)[:200],
+        )
+
+        # 3) 登录态失效：自动重取登录态并重试一次后仍然失败
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_unauthorized_always"
+        login_error = ""
+        try:
+            await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK3", 888888, "测试回复")
+        except RuntimeError as e:
+            login_error = str(e)
+        login_texts = sent_plain_texts()
+        check(
+            "登录失效重试后仍失败 → 触发提醒（原因写明登录态）",
+            bool(login_error)
+            and len(login_texts) >= 1
+            and all("登录态失效" in item for item in login_texts),
+            f"{login_error[:60]}/{str(login_texts)[:160]}",
+        )
+
+        # 4) 连续空响应：第 3 次才触发，成功一次即清零
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_empty"
+        for _ in range(2):
+            await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK4", 888888, "测试回复")
+        early_texts = sent_plain_texts()
+        check(
+            "空响应 1~2 次不告警（按接口 / 操作分别计数）",
+            not early_texts
+            and plugin._risk_empty_counts.get("回复评论｜reply_empty") == 2,
+            f"{early_texts}/{plugin._risk_empty_counts}",
+        )
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK5", 888888, "测试回复")
+        empty_texts = sent_plain_texts()
+        check(
+            "连续 3 次空响应触发提醒（原因写明响应为空）",
+            len(empty_texts) >= 1
+            and all("响应内容为空" in item for item in empty_texts),
+            str(empty_texts)[:200],
+        )
+
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_flaky"
+        for _ in range(3):
+            await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK6", 888888, "测试回复")
+        for _ in range(2):
+            await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK7", 888888, "测试回复")
+        check(
+            "中间成功一次即清零（空 → 空 → 成功 → 空 → 空，不触发）",
+            not sent_plain_texts()
+            and plugin._risk_empty_counts.get("回复评论｜reply_flaky") == 2,
+            f"{sent_plain_texts()}/{plugin._risk_empty_counts}",
+        )
+
+        # 5) 冷却：同一原因在冷却期内只提醒一次
+        reset_risk_state()
+        plugin.api.REPLY_URL = f"{AI_BASE}/reply_forbidden"
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK8", 888888, "测试回复")
+        first_round = len(StarTools.sent)
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK9", 888888, "测试回复")
+        check(
+            "同一原因在冷却期内不重复提醒",
+            first_round >= 1 and len(StarTools.sent) == first_round,
+            f"首次 {first_round} 条 → 第二次后 {len(StarTools.sent)} 条",
+        )
+        cooldown_seconds = int(plugin.cfg.risk_alert_cooldown_minutes) * 60
+        plugin._risk_alerted["请求被拒绝（403）"] = time.time() - (cooldown_seconds + 5)
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK10", 888888, "测试回复")
+        check(
+            "冷却结束后再次触发会再提醒一次",
+            len(StarTools.sent) > first_round,
+            f"冷却后累计 {len(StarTools.sent)} 条",
+        )
+
+        # 6) 开关：关掉提醒仍然记录状态
+        reset_risk_state()
+        plugin.cfg.set("risk_alert_enabled", False)
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK11", 888888, "测试回复")
+        check(
+            "risk_alert_enabled=false → 不发送提醒，但状态仍记录",
+            not StarTools.sent and "最近一次" in plugin.risk_text(),
+            f"{StarTools.sent}/{plugin.risk_text()}",
+        )
+
+        reset_risk_state()
+        plugin.cfg.set("risk_alert_enabled", True)
+        plugin.cfg.set("notify_enabled", False)
+        await plugin.api.reply(SELF_UIN, "S_RISK", "C_RISK12", 888888, "测试回复")
+        check(
+            "notify_enabled=false → 不发送提醒，但状态仍记录",
+            not StarTools.sent and "最近一次" in plugin.risk_text(),
+            f"{StarTools.sent}/{plugin.risk_text()}",
+        )
+        plugin.cfg.set("notify_enabled", True)
+
+        # 7) 状态里的风控一行
+        out = await collect(plugin.cmd_status(FakeEvent()))
+        risk_lines = [item for item in out if "风控：" in item]
+        check(
+            "/空间状态 显示最近一次风控时间、原因与今日次数",
+            bool(risk_lines)
+            and "最近一次" in risk_lines[0]
+            and "请求被拒绝（403）" in risk_lines[0]
+            and "今日" in risk_lines[0],
+            str(risk_lines)[:200],
+        )
+
+        # 8) 不做任何自动暂停 / 降频 / 改配置
+        after_risk = risk_snapshot()
+        check(
+            "风控不会自动暂停任务、不降频、不改配置（任务仍在运行）",
+            after_risk == before_risk and plugin.reply_task.running,
+            f"{before_risk} / {after_risk}",
+        )
+
+        # 从未出现风控时状态显示「未检测到」
+        plugin._risk_last = {}
+        plugin._risk_today_count = 0
+        plugin._risk_today_date = ""
+        check(
+            "从未出现风控时状态显示「未检测到」",
+            plugin.risk_text() == "未检测到",
+            plugin.risk_text(),
+        )
+    finally:
+        _risk_logger.warning = _real_risk_warning
 
     plugin.publish_task.stop()
     plugin.interact_task.stop()
