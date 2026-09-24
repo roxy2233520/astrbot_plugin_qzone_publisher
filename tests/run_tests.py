@@ -3514,7 +3514,7 @@ async def main() -> int:
         str(again.publish_cron),
     )
 
-    # 2.11.0：名单类配置从各板块搬进「名单与权限」，用户已填的名单不能丢
+    # 2.10.2：名单类配置从各板块搬进「名单与权限」，用户已填的名单不能丢
     moved_raw = StubAstrBotConfig(
         {
             "sec_basic": {"admin_uins": ["10001"], "notify_enabled": True},
